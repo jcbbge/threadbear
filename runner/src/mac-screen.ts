@@ -103,6 +103,21 @@ export class MacScreen {
   private lookAtAccess(): void {
     const { machine, log } = this.deps;
     this.access = this.probe.fullDiskAccess();
+    if (this.access === true && this.state.accessTold) {
+      // Granted since: say so, or the thread goes on saying it's missing
+      // (ganttbookM5, 5 Nov 2026). It archives unless a dialog it told of is
+      // still up, which lookAtDialogs closes out when it goes.
+      if (this.state.threadId) {
+        try {
+          this.deps.host.noticeOverOnMac(this.state.threadId, accessGrantedText(machine), !this.state.dialogsTold);
+        } catch {
+          // Deleted since: nobody to tell.
+        }
+      }
+      delete this.state.accessTold;
+      this.save();
+      return;
+    }
     if (this.access !== false || this.state.accessTold || this.probe.hasApp()) return;
     log.warn('no Full Disk Access on a Mac without the app');
     this.tell(accessText(machine));
@@ -171,6 +186,10 @@ export function goneText(machine: string): string {
 
 export function accessText(machine: string): string {
   return `Threadbear Runner doesn't have Full Disk Access on ${machine}, and nobody's likely to be at its screen. When an agent there touches Desktop, Documents, Downloads or a removable drive, macOS waits for someone to answer a prompt, and that can hold up other apps using the same drive. In System Settings > Privacy & Security > Full Disk Access on ${machine}, turn on Threadbear Runner. Agents there can then read everything your account can.`;
+}
+
+export function accessGrantedText(machine: string): string {
+  return `Threadbear Runner has Full Disk Access on ${machine} now, so folder prompts won't hold up its agents.`;
 }
 
 // Whether a file opens. Undefined when it isn't there, so can't say.

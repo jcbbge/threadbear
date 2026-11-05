@@ -158,6 +158,44 @@ test('a Mac with no Threadbear app and no Full Disk Access is told once, up fron
   assert.equal(notes(t.id).length, 1);
 });
 
+test('granting Full Disk Access says so and archives the notice thread', async () => {
+  const { h, probe, make, look, noticeThreads, notes } = setUp();
+  // ganttbookM5, 5 Nov 2026: told at its first start, granted 80 seconds
+  // later, and the thread went on saying it was missing.
+  probe.app = false;
+  probe.access = false;
+  await look(LOOK_MS, make());
+  const id = noticeThreads()[0].id;
+  probe.access = true;
+  await look(LOOK_MS, make());
+  assert.match(notes(id).at(-1)!, /has Full Disk Access on bruce now/);
+  assert.deepEqual(noticeThreads().map((t) => t.id), [], "nothing's left to do, so it leaves the inbox");
+  assert.equal(h.runner.list(['archived']).find((t) => t.id === id)?.needsYou, false);
+  await look(LOOK_MS, make());
+  assert.equal(notes(id).length, 2, 'said once');
+  probe.access = false;
+  await look(LOOK_MS, make());
+  assert.equal(noticeThreads().length, 1, 'losing it again is told again');
+});
+
+test('granting Full Disk Access keeps the thread while a dialog it told of is still up', async () => {
+  const { probe, look, noticeThreads, notes } = setUp();
+  probe.app = false;
+  probe.access = false;
+  await look();
+  const id = noticeThreads()[0].id;
+  probe.count = 1;
+  await look();
+  await look(TELL_AFTER_MS);
+  probe.access = true;
+  await look();
+  assert.match(notes(id).at(-1)!, /has Full Disk Access/);
+  assert.equal(noticeThreads()[0]?.id, id, 'the dialog still needs answering');
+  probe.count = 0;
+  await look();
+  assert.deepEqual(noticeThreads(), [], 'and goes with it');
+});
+
 test('a Mac with the app, or the access, is not nagged about it', async () => {
   const a = setUp();
   a.probe.app = true;

@@ -1317,7 +1317,11 @@ start and every 2 minutes:
   `~/Library/Application Support/com.apple.TCC/TCC.db`, and closing it. It's
   never read. Without the access macOS refuses at once, with no prompt. A Mac
   without it and without `Threadbear.app` gets one note in the same thread:
-  that's the Mac nobody sits at, and granting it is the actual fix.
+  that's the Mac nobody sits at, and granting it is the actual fix. Once
+  the access is there, a later note says so and archives the thread, on the
+  same terms as a dialog going, and unless a dialog it told of is still up
+  (that one's own note archives it when it goes). Losing it again is told
+  again.
 
 What it knows goes in `runner.status` as `macScreen: { fullDiskAccess?,
 dialogs, dialogsSince? }`, and `tb status` says so. What's been said is kept in

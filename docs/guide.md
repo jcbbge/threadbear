@@ -758,8 +758,10 @@ the thread runs on.
 - **A thread called "... needs someone at its screen".** Threadbear starts one
   when a macOS dialog has been waiting on a Mac for 5 minutes, or when a Mac
   without the Threadbear app doesn't have Full Disk Access yet. Open Screen
-  Sharing to that Mac and answer the dialog. When it's gone, the thread says
-  so and archives itself, unless you've written in it.
+  Sharing to that Mac and answer the dialog, or turn on Threadbear Runner in
+  Full Disk Access there. When the dialog's gone or the access is on, the
+  thread says so within a couple of minutes and archives itself, unless
+  you've written in it.
 
 ## Your phone and a browser
 <!-- slug: phone-and-browser -->
