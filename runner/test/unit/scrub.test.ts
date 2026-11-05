@@ -65,6 +65,16 @@ function files(dir: string, map: Record<string, string>): void {
   }
 }
 
+// Rewrites a file and moves its time on a second. Linux keeps file times to
+// a kernel tick, so a same-size rewrite straight after the first write has
+// the same size and time, and looks unchanged (hive, Ubuntu 22.04, 5 Nov).
+function rewrite(file: string, text: string): void {
+  const before = fs.statSync(file).mtime;
+  fs.writeFileSync(file, text);
+  const after = new Date(before.getTime() + 1000);
+  fs.utimesSync(file, after, after);
+}
+
 test('known values come from secrets/ and thread folders, and mask however they turn up', async () => {
   const root = tmpDir();
   const home = path.join(root, 'home');
@@ -122,7 +132,7 @@ test('looks only at what changed, and not again inside the refresh time', async 
   const known = new KnownValues({ env: {}, home, now: () => now });
   known.noteFolder(repo);
   await known.settled();
-  fs.writeFileSync(path.join(repo, '.env'), `A_SECRET=${second}\n`);
+  rewrite(path.join(repo, '.env'), `A_SECRET=${second}\n`);
   known.refreshIfDue();
   await known.settled();
   assert.ok(known.mask(second).includes(second), 'too soon to look again');
@@ -423,11 +433,11 @@ test('a folder looked at once is not looked at again, and lookSoon brings a look
   known.noteFolder(live);
   await known.settled();
   assert.ok(!known.mask(first).includes(first));
-  fs.writeFileSync(path.join(repo, '.env'), `A_SECRET=${second}\n`);
+  rewrite(path.join(repo, '.env'), `A_SECRET=${second}\n`);
   now += REFRESH_MS + 1;
   await known.refresh();
   assert.ok(known.mask(second).includes(second), 'once means once');
-  fs.writeFileSync(path.join(live, '.env'), `A_SECRET=${second}\n`);
+  rewrite(path.join(live, '.env'), `A_SECRET=${second}\n`);
   known.lookSoon(live);
   await known.settled();
   assert.ok(!known.mask(second).includes(second));
