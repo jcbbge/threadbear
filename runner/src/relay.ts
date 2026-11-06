@@ -29,8 +29,9 @@ import type { Clock, TimerHandle } from './clock.ts';
 import type { Logger } from './log.ts';
 import type { Notification } from './runner.ts';
 import type { RemoteThread, RemoteThreads } from './thread-index.ts';
-import type { Post, Subscribe } from './sync.ts';
-import { ErrorCode, RpcError } from './protocol.ts';
+import fs from 'node:fs';
+import { convexUploader, type Post, type Subscribe, type Upload } from './sync.ts';
+import { ErrorCode, RpcError, type ImageRef } from './protocol.ts';
 import { seal } from './secrets.ts';
 
 export const SCALE = 8;
@@ -118,7 +119,16 @@ export type RelayDeps = {
   subscribed: (threadId: string) => boolean;
   clock: Clock;
   log: Logger;
+  // Pictures pasted on this Mac go to file storage for the other runner to
+  // fetch, as the phone's photos do (tests pass a fake).
+  upload?: Upload;
+  readFile?: (path: string) => Uint8Array;
 };
+
+// What the other runner takes per picture (sync.ts MAX_PHONE_IMAGE_BYTES)
+// and per message (convex/relay.ts MAX_RELAY_IMAGES).
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_IMAGES = 6;
 
 const RUNNING = new Set(['running', 'starting', 'waiting']);
 const TOOL_NAMES: Record<string, string> = { command: 'Bash', read: 'Read', edit: 'Edit', write: 'Write', search: 'Grep', web: 'WebFetch', task: 'Task' };
@@ -490,6 +500,41 @@ export class Relay {
   // ---------------------------------------------------------------- actions
 
   /**
+   * The app's pictures (files this Mac's runner can read) put in file
+   * storage, as storage ids for a send or create command. The other runner
+   * fetches them as it does the phone's photos, and the backend deletes
+   * them once it has (sync:finishCommand).
+   */
+  private async uploadImages(runnerId: string, raw: unknown): Promise<string[]> {
+    if (!Array.isArray(raw) || !raw.length) return [];
+    const runner = this.runner(runnerId);
+    const name = runner?.name ?? 'the other runner';
+    if (runner && !runner.online) throw new RpcError(ErrorCode.other, `${name} is offline, so that can't reach it now.`);
+    if (raw.length > MAX_IMAGES) throw new RpcError(ErrorCode.other, `At most ${MAX_IMAGES} pictures can go to ${name} in one message.`);
+    const src = this.src();
+    const read = this.deps.readFile ?? ((file: string) => fs.readFileSync(file));
+    const upload = this.deps.upload ?? convexUploader();
+    const ids: string[] = [];
+    for (const ref of raw as ImageRef[]) {
+      if (!ref || typeof ref.path !== 'string') throw new RpcError(ErrorCode.other, 'Each picture needs a path.');
+      let bytes: Uint8Array;
+      try {
+        bytes = read(ref.path);
+      } catch (e) {
+        throw new RpcError(ErrorCode.other, `Couldn't read a picture to send to ${name}: ${(e as Error)?.message ?? e}`);
+      }
+      if (bytes.byteLength > MAX_IMAGE_BYTES) throw new RpcError(ErrorCode.other, `A picture over ${MAX_IMAGE_BYTES / 1024 / 1024} MB can't go to ${name}.`);
+      try {
+        const url = (await src.post('mutation', 'relay:imageUploadUrl', { key: src.key })) as string;
+        ids.push(await upload(url, bytes, typeof ref.mediaType === 'string' ? ref.mediaType : 'application/octet-stream'));
+      } catch (e) {
+        throw new RpcError(ErrorCode.other, `Couldn't send a picture to ${name} through Convex: ${(e as Error)?.message ?? e}`);
+      }
+    }
+    return ids;
+  }
+
+  /**
    * Queues a command for the thread's runner and waits until it's taken
    * (or, with `done`, finished). A runner that's offline is said at once
    * rather than left to pick it up whenever it's back.
@@ -565,9 +610,9 @@ export class Relay {
         return { events, inProgress: [] };
       }
       case 'threads.send': {
-        if (Array.isArray(p.images) && p.images.length) this.unsupported(w, 'Sending pictures to another Mac');
         const text = typeof p.text === 'string' ? p.text : '';
-        await this.command(w.runnerId, threadId, 'send', { text, ...(Array.isArray(p.answers) && p.answers.length ? { answers: p.answers } : {}) });
+        const images = await this.uploadImages(w.runnerId, p.images);
+        await this.command(w.runnerId, threadId, 'send', { text, ...(Array.isArray(p.answers) && p.answers.length ? { answers: p.answers } : {}), ...(images.length ? { images } : {}) });
         return { turnId: '' };
       }
       case 'threads.interrupt':
@@ -632,8 +677,8 @@ export class Relay {
 
   /** threads.create with a runnerId that's another runner's: a `create` command, answered with the new thread's id. */
   async create(runnerId: string, p: Record<string, unknown>): Promise<{ thread: Record<string, unknown> }> {
-    if (Array.isArray(p.images) && p.images.length) this.unsupported(undefined, 'Sending pictures to another Mac');
-    const args: Record<string, unknown> = { text: String(p.text ?? '') };
+    const images = await this.uploadImages(runnerId, p.images);
+    const args: Record<string, unknown> = { text: String(p.text ?? ''), ...(images.length ? { images } : {}) };
     for (const k of ['cwd', 'accountId', 'model', 'effort']) if (typeof p[k] === 'string') args[k] = p[k];
     // "Ask before edits": left out, that runner would give it full access.
     // A runner from before step 5 ignores it (full access), as it would a

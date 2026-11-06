@@ -250,11 +250,14 @@ extension AppModel {
     /// reached the draft stays and the banner says why.
     func sendNewThread(on runnerId: String, text: String, draft: Draft) {
         let name = remoteRunners.first { $0.id == runnerId }?.name ?? "that Mac"
-        guard draft.images.isEmpty else {
-            errorMessage = "Pictures can't go to \(name) from this Mac yet."
+        // Through Convex this Mac's runner uploads pictures for that one to
+        // fetch; over the direct link they'd be paths it hasn't got.
+        let images = draft.normalized.images
+        guard images.isEmpty || !directRemoteLink else {
+            errorMessage = "Pictures can't go to \(name) over the direct link yet."
             return
         }
-        ActivityRecorder.shared.sent(threadId: nil, images: 0, answers: 0)
+        ActivityRecorder.shared.sent(threadId: nil, images: images.count, answers: 0)
         creatingThread = true
         Task {
             defer { creatingThread = false }
@@ -262,7 +265,7 @@ extension AppModel {
                 guard let runner = remoteRunners.first(where: { $0.id == runnerId }) else {
                     throw RemoteUnreachable(runnerId: runnerId, runnerName: name, online: false, reason: .unknownRunner)
                 }
-                var request = newThreadRequest(text: text, images: [])
+                var request = newThreadRequest(text: text, images: images)
                 let made0: ThreadSummary
                 if directRemoteLink {
                     made0 = try await remoteClients.client(for: runner).createThread(request)

@@ -10,6 +10,7 @@
 // are read once and kept on the runner, a thread's row is one document, and
 // a command's state is one get by id.
 import { ConvexError, v } from 'convex/values';
+import type { Id } from './_generated/dataModel';
 import { mutation, query } from './_generated/server';
 import { checkRunnerId, forbidden, runnerAuth } from './lib';
 import { docBytes } from './runnerAccess';
@@ -137,7 +138,8 @@ export function commandArgs(kind: Kind, raw: unknown): Record<string, unknown> {
       if (out.archive === true && ['worked', 'didntWork', 'notNeeded'].includes(String(a.verdict))) out.verdict = a.verdict;
       break;
     case 'create':
-      if (str(a.text) === undefined || !str(a.text)!.trim()) throw bad('a new thread needs text');
+      // A picture alone is enough, as from the phone.
+      if (str(a.text) === undefined || (!str(a.text)!.trim() && !(Array.isArray(a.images) && a.images.length))) throw bad('a new thread needs text');
       out = pick(a, ['text', 'cwd', 'accountId', 'model', 'effort']);
       // "Ask before edits" from the composer: left out, the thread gets full access.
       if (a.permissionMode === 'ask' || a.permissionMode === 'full' || a.permissionMode === 'auto') out.permissionMode = a.permissionMode;
@@ -181,7 +183,46 @@ export const queueCommand = mutation({
     } else if (kind !== 'create' && kind !== 'call') {
       throw new ConvexError({ kind: 'badArgs', message: `a ${kind} needs a thread` });
     }
-    return ctx.db.insert('commands', { runnerId, ...(threadId !== undefined ? { threadId } : {}), kind, args: { ...commandArgs(kind, args), from: 'mac' }, state: 'pending', createdAt: Date.now() });
+    const out = commandArgs(kind, args);
+    // Pictures pasted on the Mac, put in file storage with imageUploadUrl:
+    // carried as the phone's photos are (phone.ts commandImages), and
+    // deleted by sync:finishCommand once that runner has its copy.
+    if (kind === 'send' || kind === 'create') Object.assign(out, await relayImages(ctx, (args as { images?: unknown } | undefined)?.images));
+    return ctx.db.insert('commands', { runnerId, ...(threadId !== undefined ? { threadId } : {}), kind, args: { ...out, from: 'mac' }, state: 'pending', createdAt: Date.now() });
+  },
+});
+
+// At most what the phone may send in one message.
+export const MAX_RELAY_IMAGES = 6;
+
+// Storage ids from the main Mac as `{ storageId, url }`, the URL worked out
+// here so a command never names an address of the caller's choosing.
+async function relayImages(ctx: { storage: { getUrl(id: Id<'_storage'>): Promise<string | null> } }, raw: unknown): Promise<{ images?: { storageId: string; url: string }[] }> {
+  if (raw === undefined) return {};
+  if (!Array.isArray(raw) || raw.some((id) => typeof id !== 'string')) throw new ConvexError({ kind: 'badArgs', message: 'images are storage ids' });
+  if (!raw.length) return {};
+  if (raw.length > MAX_RELAY_IMAGES) throw new ConvexError({ kind: 'badArgs', message: `at most ${MAX_RELAY_IMAGES} pictures` });
+  const images = [];
+  for (const storageId of raw as string[]) {
+    let url: string | null = null;
+    try {
+      url = await ctx.storage.getUrl(storageId as Id<'_storage'>);
+    } catch {
+      url = null;
+    }
+    if (!url) throw new ConvexError({ kind: 'notFound', message: 'that picture has gone' });
+    images.push({ storageId, url });
+  }
+  return { images };
+}
+
+/** Where the main Mac POSTs a picture for another runner's thread, before queueCommand names it. */
+export const imageUploadUrl = mutation({
+  args: { key: v.string() },
+  returns: v.string(),
+  handler: async (ctx, { key }) => {
+    await runnerAuth(ctx, key, 'imageUploadUrl');
+    return ctx.storage.generateUploadUrl();
   },
 });
 

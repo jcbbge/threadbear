@@ -80,6 +80,7 @@ test('a tail past what is held asks for the gap; one that overlaps just merges',
 type Call = { kind: string; fn: string; args: Record<string, unknown> };
 function harness(opts: { online?: boolean } = {}) {
   const calls: Call[] = [];
+  const uploads: { url: string; bytes: number; mediaType: string }[] = [];
   const subs = new Map<string, { args: Record<string, unknown>; onUpdate: (v: unknown) => void; closed: boolean }[]>();
   const published: unknown[] = [];
   const subscribed = new Set<string>();
@@ -98,6 +99,7 @@ function harness(opts: { online?: boolean } = {}) {
         if (fn === 'relay:remoteMessages') return { messages: rows, hasMore: false };
         if (fn === 'relay:queueCommand') return `cmd${++commandN}`;
         if (fn === 'relay:remoteAccounts') return [{ runnerId: 'bruce', id: 'claude-main', provider: 'claude', title: 'Claude' }];
+        if (fn === 'relay:imageUploadUrl') return `https://upload/${calls.length}`;
         return null;
       },
       subscribe: (fn, args, onUpdate) => {
@@ -115,8 +117,17 @@ function harness(opts: { online?: boolean } = {}) {
     publish: (n) => published.push(n),
     clock,
     log: nullLogger,
+    readFile: (file) => {
+      if (file === '/big.png') return new Uint8Array(26 * 1024 * 1024);
+      if (file === '/gone.png') throw new Error('ENOENT');
+      return new Uint8Array([1, 2, 3]);
+    },
+    upload: async (url, bytes, mediaType) => {
+      uploads.push({ url, bytes: bytes.byteLength, mediaType });
+      return `storage${uploads.length}`;
+    },
   });
-  return { relay, calls, subs, published, subscribed, clock, remote };
+  return { relay, calls, subs, published, subscribed, clock, remote, uploads };
 }
 
 test('it answers only for threads other runners have, and pages in relay seqs', async () => {
@@ -213,7 +224,28 @@ test('sends, stops and changes go to the thread runner; settings that only work 
   await stop;
   assert.equal(h.calls.at(-1)!.args.kind, 'interrupt');
   await assert.rejects(h.relay.call(T, 'threads.update', { threadId: T, model: 'opus' }), /isn't possible through Convex yet/);
-  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [{ path: '/a.png' }] }), /pictures/);
+});
+
+test('pictures go to file storage first, and the command names them', async () => {
+  const h = harness();
+  const send = h.relay.call(T, 'threads.send', { threadId: T, text: 'look [Picture 1]', images: [{ path: '/a.png', mediaType: 'image/png' }] });
+  await new Promise((r) => setImmediate(r));
+  h.subs.get('relay:commandState')![0]!.onUpdate({ state: 'taken' });
+  await send;
+  assert.deepEqual(h.uploads, [{ url: 'https://upload/1', bytes: 3, mediaType: 'image/png' }]);
+  assert.deepEqual(h.calls.at(-1)!.args.args, { text: 'look [Picture 1]', images: ['storage1'] });
+
+  const made = h.relay.create('bruce', { text: '', images: [{ path: '/b.jpg', mediaType: 'image/jpeg' }, { path: '/c.png', mediaType: 'image/png' }] });
+  await new Promise((r) => setImmediate(r));
+  const q = h.calls.find((c) => c.fn === 'relay:queueCommand' && c.args.kind === 'create')!;
+  assert.deepEqual(q.args.args, { text: '', images: ['storage2', 'storage3'] });
+  h.subs.get('relay:commandState')!.at(-1)!.onUpdate({ state: 'done', threadId: 'new1' });
+  await made;
+
+  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [{ path: '/big.png' }] }), /over 25 MB/);
+  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [{ path: '/gone.png' }] }), /Couldn't read a picture/);
+  const seven = Array.from({ length: 7 }, () => ({ path: '/a.png' }));
+  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: seven }), /At most 6 pictures/);
 });
 
 test('a failed command says why, and an offline runner is said at once', async () => {

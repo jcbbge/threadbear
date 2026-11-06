@@ -3527,7 +3527,15 @@ default).
   than leave a hole. `runner.status` has `relay: { watching, held, reads, bytes }`:
   threads watched now, rows held, and since start the reads (and live
   updates) and the JSON bytes they brought back, to measure what it costs.
-- **Acting.** `threads.send` (text and `answers`; pictures are `-32000`),
+- **Pictures.** A send's or create's `images` (at most 6, each at most
+  25 MB) are read here and each POSTed to an upload URL from
+  `relay:imageUploadUrl` (owner only); the command carries their storage
+  ids, which `relay:queueCommand` turns into `{ storageId, url }` as
+  `phone:send` does, so the other runner fetches them as it does the
+  phone's photos and `sync:finishCommand` deletes them once it has. Over
+  the direct link the app still refuses pictures: they'd be paths that
+  runner hasn't got.
+- **Acting.** `threads.send` (text, `answers` and pictures),
   `threads.interrupt`, `approvals.respond`, `secrets.answer` (sealed to the
   other runner's key from its row, as the phone seals it, so the value
   never reaches the backend in the clear), `threads.markSeen` (only when
@@ -3543,8 +3551,8 @@ default).
   list says is offline is `-32000` at once. Commands from here carry `from:
   "mac"`, so the other runner gives the message no `origin`.
 - **New threads there.** `threads.create` with `runnerId` is a `create`
-  command (text, `cwd`, `accountId`, `model`, `effort`, `permissionMode`;
-  pictures are `-32000`), answered with a summary of the new thread once
+  command (text, `cwd`, `accountId`, `model`, `effort`, `permissionMode`
+  and pictures, as above; with pictures the text may be empty), answered with a summary of the new thread once
   that runner has made it, which this runner then answers for until the
   sidebar list has it. `remoteThreads.logins { runnerId }` gives that runner's
   logins for the pickers, from the backend's `accounts` rows (no pools;
@@ -4140,6 +4148,7 @@ anyone's); "any runner" is any good key. Anything not sorted is owner only.
 | `remoteMessages` | owner only | the same, a page at a time |
 | `remoteThread` | owner only | another runner's thread row, its open approval and card |
 | `queueCommand` | owner only | work for another runner: a thread's command goes to the runner the backend says has it |
+| `imageUploadUrl` | owner only | a picture for another runner's thread, deleted once that runner has fetched it |
 | `commandState` | owner only | |
 | `remoteAccounts` | owner only | another runner's logins |
 

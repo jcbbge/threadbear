@@ -585,7 +585,9 @@ and sends what you do there (messages, approvals, Stop, archive) for that
 Mac to pick up, the way your phone does, so there's no network link between
 the two Macs to set up. You see its messages and a line for each tool it
 used; the tool output, diffs and pictures stay on that Mac for now, and a
-tool row says so. Editing a message, its highlights and patches, and
+tool row says so. Pictures you paste or drop in your message go with it
+(up to 6, 25 MB each), through your Convex storage, which keeps them only
+until that Mac has fetched them. Editing a message, its highlights and patches, and
 changing its login or model are done on that Mac. A Mac that's off shows
 its threads but can't take a message until it's back. Settings > Runners >
 Connect to other machines directly opens them over Tailscale instead, with

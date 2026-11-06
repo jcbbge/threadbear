@@ -186,12 +186,14 @@ struct ComposerView: View {
         return true
     }
 
-    /// Whether pictures can go in this box, saying why not when they can't:
-    /// a picture this Mac's runner keeps would be a path another runner
-    /// hasn't got.
+    /// Whether pictures can go in this box, saying why not when they can't.
+    /// Through Convex, this Mac's runner uploads them for the other runner
+    /// to fetch; over the direct link a picture this Mac's runner keeps
+    /// would be a path the other runner hasn't got.
     private func picturesAllowed() -> Bool {
+        guard app.directRemoteLink else { return true }
         if let name = thread.flatMap(app.runnerName(of:)) ?? (thread == nil ? app.newThreadRunner?.name : nil) {
-            app.errorMessage = "Pictures can't go to \(name) from this Mac yet."
+            app.errorMessage = "Pictures can't go to \(name) over the direct link yet."
             return false
         }
         return true

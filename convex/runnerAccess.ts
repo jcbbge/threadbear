@@ -213,6 +213,7 @@ export const ACCESS: Record<string, Access> = {
   remoteMessages: 'owner',
   remoteThread: 'owner',
   queueCommand: 'owner',
+  imageUploadUrl: 'owner',
   commandState: 'owner',
   remoteAccounts: 'owner',
 };
