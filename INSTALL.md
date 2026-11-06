@@ -154,6 +154,15 @@ Hetzner cloud server with 8 GB. Do this as an ordinary user with sudo, not root.
    does, so keep that checkout pulling theirs: a systemd user timer that runs
    `git -C <checkout> pull --ff-only` every few minutes.
 
+**Without a checkout on the server**, the way T3 Code ships its server:
+after steps 1 to 3 (no Tailscale needed), run
+`runner/scripts/deploy-remote.sh <ssh host>` on the Mac. It builds a release
+from the Mac's checkout, copies it over ssh, runs `npm ci --omit=dev` there,
+and writes `runner.json` (with `followMain` off) and the systemd unit. Then
+run `tb runner add <name> --ssh <host>` once for its key, and the script
+again to start it. Nothing on the server pulls from git: to update it, run
+the script again from the Mac. Its header says how to take it all out.
+
 What's left out on Linux: everything that needs a Mac, such as the iOS
 simulator, Xcode, BrowserBear, ComputerCub and noticing dialogs on the screen.
 Threads that need those belong on the Mac.
