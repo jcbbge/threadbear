@@ -11,6 +11,10 @@ import type { ThreadState } from '../runner.ts';
 import { NO_WAKE_TIME } from '../runner.ts';
 import { parseWhen } from '../when.ts';
 import type { WaitFor } from '../needs.ts';
+import path from 'node:path';
+import { providerName } from '../runner.ts';
+import { LAB_REVIEW_REPLY_CHARS } from './lab-review.ts';
+import { cutSafely, safeEnd } from '../safe-cut.ts';
 
 // How long a thread waiting on others sleeps at most when end_turn gave no
 // snooze, so one that never hears still comes back.
@@ -128,7 +132,7 @@ export const hibernationPart = {
     }
     const now = this.clock.now();
     let until: string | undefined;
-    if (when && when.toLowerCase() !== 'restart') {
+    if (when && !['restart', 'release'].includes(when.toLowerCase())) {
       try {
         until = parseWhen(when, now);
       } catch {
@@ -150,18 +154,31 @@ export const hibernationPart = {
     for (const x of list) if (x.until && this.threads.has(x.threadId)) this.tellActivity({ kind: 'waited-on', threadId: x.threadId });
   },
 
+  // A review of this thread's change has started (runner/lab-review.ts):
+  // it hibernates until the review finishes, as end_turn's waitFor would.
+  waitOnReview(this: Runner, st: ThreadState, reviewId: string): void {
+    this.waitOn(st, [{ id: reviewId }], undefined);
+    const w = st.rec.waitingOn?.find((x) => x.threadId === reviewId);
+    if (w) {
+      w.review = true;
+      this.markDirty(st);
+    }
+  },
+
   // A turn finished with nothing needed and nothing left running: kept with
   // its reply, then any thread waiting on it hears.
   markFinished(this: Runner, st: ThreadState, lastText: string | undefined): void {
+    // A review's findings are the point, so more of them go across.
+    const max = st.rec.reviewOf ? LAB_REVIEW_REPLY_CHARS : WAIT_FOR_REPLY_CHARS;
     let reply = lastText?.trim() ?? '';
     if (!reply) {
       try {
-        reply = this.threadGist(st.rec.id, { recent: 1, chars: WAIT_FOR_REPLY_CHARS }).recent.filter((x) => x.who === 'assistant').at(-1)?.text ?? '';
+        reply = this.threadGist(st.rec.id, { recent: 1, chars: max }).recent.filter((x) => x.who === 'assistant').at(-1)?.text ?? '';
       } catch {
         reply = '';
       }
     }
-    if (reply.length > WAIT_FOR_REPLY_CHARS) reply = reply.slice(0, WAIT_FOR_REPLY_CHARS) + '…';
+    if (reply.length > max) reply = reply.slice(0, safeEnd(reply, max)) + '…';
     st.rec.finished = { at: this.isoNow(), ...(reply ? { reply } : {}) };
     this.markDirty(st);
     this.reconcileWaits();
@@ -207,6 +224,7 @@ export const hibernationPart = {
   },
 
   deliverWaits(this: Runner, st: ThreadState, waits: NonNullable<ThreadState['rec']['waitingOn']>): void {
+    if (waits.length === 1 && waits[0].review) return this.deliverReview(st, waits[0]);
     const parts = waits.map((x) => {
       const head = `"${x.title}" (thread ${x.threadId.slice(0, 8)})`;
       const said = x.done?.how === 'deleted' ? 'was deleted' : x.done?.how === 'archived' ? 'was archived'
@@ -220,6 +238,32 @@ export const hibernationPart = {
     this.armSnoozeTimer();
     this.sendTo(st, text, [], { origin: 'runner', queue: true });
     this.log.info('woke after waiting on threads', { threadId: st.rec.id, on: waits.map((x) => x.threadId) });
+  },
+
+  // A review of this thread's change has finished (or gone): it wakes with
+  // the findings and is asked to fix what holds up. The review thread is
+  // archived, its job done; Mike can still open it from the link.
+  deliverReview(this: Runner, st: ThreadState, w: NonNullable<ThreadState['rec']['waitingOn']>[number]): void {
+    const id8 = w.threadId.slice(0, 8);
+    const reviewer = this.threads.get(w.threadId);
+    const who = reviewer ? providerName(reviewer.rec.provider) : 'The reviewer';
+    let text: string;
+    if (w.done?.how === 'finished' || w.done?.how === 'met') {
+      const edited = reviewer ? [...reviewEdits(this, reviewer)] : [];
+      const findings = w.done.reply?.trim() || '(It gave no reply. read_thread has what it did.)';
+      const edits = edited.length ? `\n\nIt was asked not to edit files but changed ${edited.join(', ')}. Look at those changes before going on, and keep or undo them.` : '';
+      text = `${who} reviewed the change you just made (thread ${id8}). Its findings:\n\n${findings}${edits}\n\n` +
+        'Check each finding against the code: fix what holds up and run the tests again. In your reply, say briefly what it found, what you fixed, and anything you left and why. If it found nothing, say so in a line and finish as you were.';
+    } else {
+      text = `The review of your change (thread ${id8}) ${w.done?.how === 'deleted' ? 'was deleted' : 'was archived'} before it finished, so it wasn't reviewed. Say so in a line in your reply and finish as you were.`;
+    }
+    this.wake(st, { why: `${who} reviewed the change` });
+    this.armSnoozeTimer();
+    this.sendTo(st, text, [], { origin: 'runner', queue: true });
+    this.log.info('woke after a lab review', { threadId: st.rec.id, reviewer: w.threadId });
+    if (reviewer && !reviewer.rt.deleted && !reviewer.rec.archivedAt && !reviewer.rt.turn) {
+      this.update({ threadId: w.threadId, archived: true, archivedBy: 'threadbear' });
+    }
   },
 
   // The waits on this thread for something in particular, for the
@@ -247,11 +291,21 @@ export const hibernationPart = {
     } catch {
       reply = '';
     }
-    w.done = { at: this.isoNow(), how: 'met', ...(reply ? { reply } : {}), ...(why ? { why: why.slice(0, 200) } : {}) };
+    w.done = { at: this.isoNow(), how: 'met', ...(reply ? { reply } : {}), ...(why ? { why: cutSafely(why, 200) } : {}) };
     this.markDirty(st);
     this.log.info('a wait was met', { waiterId, targetId, why });
     this.reconcileWaits();
     return true;
+  },
+
+  // Whether a starting runner (or one taking a thread over from a draining
+  // one) wakes it: hibernating until a restart, or until a new release when
+  // this isn't the one it went to sleep on, or a wake-when whose answer was
+  // lost with the old runner.
+  wakesOnStart(this: Runner, rec: ThreadState['rec']): boolean {
+    if (rec.wakeWhen?.pending) return true;
+    if (!rec.snoozedUntilRestart) return false;
+    return !rec.untilRelease || rec.untilRelease !== this.release;
   },
 
   armSnoozeTimer(this: Runner): void {
@@ -287,11 +341,13 @@ export const hibernationPart = {
       : cause === 'restart'
         ? `Woke up${away}, as the runner restarted.`
         : away ? `Woke up after hibernating for ${awayFor(ms)}.` : 'Woke up from hibernating.';
+    // Starting "Woke up" is what gives it the bear in the app (RowContent.isWakeNote).
     this.emit(st, { type: 'system.note', text });
     rec.woke = { at: new Date(now).toISOString(), ...(since ? { since } : {}) };
     delete rec.snoozedAt;
     delete st.rec.snoozedUntil;
     delete st.rec.snoozedUntilRestart;
+    delete st.rec.untilRelease;
     delete st.rec.wakeWhen;
     delete st.rec.waitingOn;
     st.rec.forceUnread = true;
@@ -308,4 +364,16 @@ function waitsLine(list: { title: string; until?: string }[]): string {
   const one = (x: { title: string; until?: string }) => `"${x.title}" ${x.until ? `does this: ${x.until}` : 'finishes'}`;
   if (list.every((x) => !x.until)) return `${list.map((x) => `"${x.title}"`).join(list.length === 2 ? ' and ' : ', ')} ${list.length === 1 ? 'finishes' : 'finish'}`;
   return list.map(one).join('; ');
+}
+
+// The files a review thread changed, though it was told not to.
+function reviewEdits(runner: Runner, st: ThreadState): Set<string> {
+  const out = new Set<string>();
+  const last = st.rec.lastSeq ?? 0;
+  try {
+    for (const e of runner.store.log(st.rec.id).read(1, last)) if (e.type === 'edit.diff') out.add(path.basename((e as unknown as { path: string }).path));
+  } catch {
+    // Unreadable: said as no edits.
+  }
+  return out;
 }

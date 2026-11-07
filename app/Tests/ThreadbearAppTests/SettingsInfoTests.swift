@@ -12,7 +12,7 @@ final class SettingsInfoTests: XCTestCase {
         return try String(contentsOf: views.appendingPathComponent(name), encoding: .utf8)
     }
 
-    private let files = ["SettingsView.swift", "DevicesSettings.swift", "RunnersSettings.swift"]
+    private let files = ["SettingsView.swift", "DevicesSettings.swift", "RunnersSettings.swift", "KeyboardSettings.swift", "VoiceSettings.swift"]
 
     func testPlainSectionsOnlyHoldAMessage() throws {
         var found: [String] = []

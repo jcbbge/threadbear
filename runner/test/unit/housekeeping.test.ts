@@ -49,9 +49,10 @@ test('a log written by opening it each time is renamed instead', () => {
   assert.equal(capLog(path.join(dir, 'missing.log'), 100), false);
 });
 
-test('tidy clears old pasted images, old trash and long-archived threads\' screenshots', () => {
+test('tidy clears old pasted images, old trash and, with archivedMediaDays, long-archived threads\' pictures', () => {
   const home = tmpDir();
   ensureHome(home);
+  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ archivedMediaDays: 30 }));
   const oldPaste = path.join(paths.inbox(home), 'old.png');
   const newPaste = path.join(paths.inbox(home), 'new.png');
   fs.writeFileSync(oldPaste, 'a');
@@ -82,4 +83,16 @@ test('tidy clears old pasted images, old trash and long-archived threads\' scree
   assert.deepEqual(fs.readdirSync(path.join(lately, 'media')), ['shot.png']);
   assert.deepEqual(fs.readdirSync(path.join(open, 'media')), ['shot.png']);
   assert.deepEqual(done, { logs: 0, inbox: 1, trash: 1, media: 1 });
+});
+
+test("without archivedMediaDays, archived threads' pictures are kept however old", () => {
+  const home = tmpDir();
+  ensureHome(home);
+  const longAgo = thread(home, 'archived-long-ago', new Date(NOW - 400 * DAY).toISOString());
+  const done = tidy({ home, logs: [], now: NOW });
+  assert.deepEqual(fs.readdirSync(path.join(longAgo, 'media')), ['shot.png']);
+  assert.equal(done.media, 0);
+  // Nor with something that isn't a number of days.
+  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ archivedMediaDays: '30' }));
+  assert.equal(tidy({ home, logs: [], now: NOW }).media, 0);
 });

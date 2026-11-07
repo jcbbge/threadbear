@@ -45,10 +45,11 @@ struct RunnersPanel: View {
                         .font(.system(size: zoomed(11), weight: .medium))
                         .foregroundStyle(.tertiary)
                     Spacer(minLength: 0)
-                    Button { app.loadRunners() } label: {
+                    Button { app.refreshRunners() } label: {
                         Image(systemName: "arrow.clockwise").font(.system(size: zoomed(11)))
                     }
                     .buttonStyle(.borderless)
+                    .busy(app.isBusy(BusyKey.refreshRunners))
                     .foregroundStyle(.secondary)
                     .tip("Check the runners again now")
                     Button { aboutShown.toggle() } label: {

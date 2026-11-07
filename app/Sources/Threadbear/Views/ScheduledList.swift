@@ -76,7 +76,10 @@ private struct ScheduleRowView: View {
     let schedule: Schedule
     @State private var hovering = false
 
-    private var showsActions: Bool { hovering || app.hoverOverride == schedule.id }
+    private var running: Bool { app.isBusy(BusyKey.runSchedule(schedule.id)) }
+    /// Stays out while Run now is on its way, so its spinner shows wherever
+    /// it was asked from (the row's menu, or a pointer that's moved on).
+    private var showsActions: Bool { hovering || running || app.hoverOverride == schedule.id }
 
     var body: some View {
         VStack(alignment: .leading, spacing: zoomed(3)) {
@@ -147,8 +150,10 @@ private struct ScheduleRowView: View {
         .iconContextMenu {
             Button("Edit…", systemImage: "pencil") { app.editSchedule(schedule.id) }
             Button("Run now", systemImage: "play") { app.runSchedule(schedule.id) }
+                .disabled(running)
             if !schedule.isFinished {
                 Button(schedule.paused ? "Resume" : "Pause", systemImage: schedule.paused ? "playpause" : "pause") { app.setSchedulePaused(schedule.id, !schedule.paused) }
+                    .disabled(app.isBusy(BusyKey.pauseSchedule(schedule.id)))
             }
             Divider()
             Button("Delete…", systemImage: "trash") { app.deleteSchedule(schedule.id) }
@@ -192,12 +197,14 @@ private struct ScheduleRowView: View {
         HStack(spacing: zoomed(2)) {
             Button { app.runSchedule(schedule.id) } label: { Image(systemName: "paperplane") }
                 .buttonStyle(RowIconButtonStyle())
+                .busy(running)
                 .tip(away.map { "Ask \($0) to run it now" } ?? "Run now")
             if !schedule.isFinished {
                 Button { app.setSchedulePaused(schedule.id, !schedule.paused) } label: {
                     Image(systemName: schedule.paused ? "play" : "pause")
                 }
                 .buttonStyle(RowIconButtonStyle())
+                .disabled(app.isBusy(BusyKey.pauseSchedule(schedule.id)))
                 .tip(schedule.paused ? "Resume" : "Pause")
             }
             Button { app.deleteSchedule(schedule.id) } label: { Image(systemName: "trash") }

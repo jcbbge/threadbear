@@ -22,6 +22,19 @@ File references are where to look.
   If that login goes missing or expires, the Convex panel's Sign in to
   Convex button runs `convex login` again from the runner, which writes
   the same file; you approve it in your browser on auth.convex.dev.
+- **Or a self-hosted backend** (`setup --self-hosted`, docs/self-hosting.md;
+  Convex cloud is the one we recommend): no Convex login or deploy key.
+  Instead two Docker containers, `threadbear-convex` (Convex's open source
+  backend) and `threadbear-convex-dashboard`, from pinned
+  `ghcr.io/convex/*` images, with the data in the Docker volume
+  `threadbear-convex-data`. They listen on this Mac's loopback only
+  (ports 13210, 13211 and 16791), and `tailscale serve` puts them on your
+  tailnet as `https://<this Mac>.<tailnet>.ts.net` ports 3210 (the API),
+  3211 (the website) and 6791 (the dashboard), so nothing is reachable off
+  your tailnet. The backend's admin key is in
+  `secrets/convex-self-hosted.env`, and setup sets `PUSH_RELAY=off` on it,
+  as the push relay only works with Convex cloud. runner.json gets
+  `sync.site`, the website's address.
 - **Apps:** `~/Applications/Threadbear.app` and
   `~/Applications/Threadbear Runner.app`, both built and signed on your Mac.
 - **A LaunchAgent:** `~/Library/LaunchAgents/com.mikerosoft.threadbear.runner.plist`,
@@ -36,7 +49,11 @@ File references are where to look.
   `upstream-signers`, and `sync-sent.json`, hashes of what's already in your
   Convex mirror so a restart sends only what changed, and
   `shared-pools.json`, the last pools your Convex backend had, which every
-  runner shares, so one starts with them while the backend can't be reached). In `secrets/`, `asked/` holds the answers you
+  runner shares, so one starts with them while the backend can't be reached,
+  and `shortcuts.json`, the keyboard shortcuts you've changed in Settings >
+  Keyboard, which the app reads and writes and never sends anywhere, and
+  with the standing instructions experiment on, `instructions.md`, which every
+  agent is given, and `instructions.sig`, which says Settings saved it). In `secrets/`, `asked/` holds the answers you
   type into an agent's secret card, one owner-only file each with a small
   script beside it that prints it for `sudo -A`, removed after 24 hours,
   and `secret-box.key` is the key your phone seals those answers to;
@@ -56,11 +73,18 @@ File references are where to look.
   `~/Library/Caches/Threadbear/update`;
   `~/Library/Caches/Threadbear/remote` (copies of pictures and files from
   threads on your other Macs, at most 512 MB, unused ones go after 30 days);
+  `~/Library/Caches/Threadbear/rich` (pictures of the ```` ```mermaid ```` and
+  ```` ```html ```` blocks in replies, and each one's page for the side pane,
+  newest 900 files kept). They're drawn on this Mac in web views that load
+  nothing from the network: the diagram library, [Pele](https://pele.run/),
+  is bundled with the app (`Resources/Rich/pele.js`, MIT), and a block's
+  page runs no scripts;
   `~/Library/Logs/threadbear-runner.log` and `threadbear-update.log`;
   `~/Library/Logs/Threadbear/hangs` (the last 10 times the app froze: if its
   main thread is stuck for 4 seconds it runs macOS's `sample` on itself, in
-  a sandbox, and
-  nothing else ever reads these); and `~/ThreadbearThreads`, the default
+  a sandbox, and notes the main thread's priority, the Mac's load average
+  and how long since the last keyboard or mouse input (just how long, never
+  what); nothing else ever reads these); and `~/ThreadbearThreads`, the default
   folder for new threads. A folder you open from a link in the side pane
   is listed, and watched for changes only while it's showing, and macOS may
   ask for permission the first time that's somewhere like Documents. The runner also runs `vm_stat` and `sw_vers` on a Mac, or reads `/proc/meminfo` and `/etc/os-release` on Linux, for the memory and system figures in the website's Runners view and the Mac app's runner details (`runner/src/runner-stats.ts`), every 5 minutes and while either is open. It also runs `ps`, and `sample` (in a
@@ -72,8 +96,28 @@ File references are where to look.
   `mac-screen.json` in the data folder
   remembers what it's said about dialogs on the screen (below).
 
+Voice mode is an experiment, off by default: while it's off (`voiceMode`
+in `runner.json`'s `experiments`) there's no button, nothing below happens
+and macOS never asks for the microphone. On, the first time you use it
+(Settings > Voice, or the waveform button beside Send), it downloads Kyutai's pocket-tts (v4.0.1, its
+Apple silicon build, checked against its SHA-256 before it's used) from
+its GitHub release into `~/Library/Application Support/Threadbear/voice/`,
+with its log `serve.log` and a `serve.<app's pid>.pid` (which process to
+stop if the app crashed) beside it. pocket-tts then downloads its English
+model and voices from Hugging Face into `~/.cache/huggingface` (about
+240 MB; another language is another model). macOS asks once for the
+microphone, and may download its own speech recognition files for the
+language (`app/Sources/Threadbear/Voice/`). `~/Library/Logs/Threadbear/voice.log`
+notes what Voice did (which microphone, whether echo cancellation
+started, errors), never what was said, and is started afresh past 256 KB.
+
 ## What runs in the background
 
+- **Landing work** (`runner/src/worktrees.ts`): `tb land` keeps an empty
+  `threadbear-land.lock` in the repo's common git directory. It runs
+  macOS's `lockf` (Linux's `flock`) with a small Node child to hold an OS
+  lock from before rebasing until the check and fast-forward finish.
+  Another landing waits; exiting, including a crash, releases the lock.
 - **The runner** listens on `127.0.0.1:8797` only, and needs a token
   (`runner/src/config.ts`). It starts the official `claude` and `codex`
   CLIs for your threads.
@@ -94,9 +138,34 @@ File references are where to look.
   signature check; only Mike's release tags are signed (below). Turn it
   off for both with `followMain: false` in `runner.json` (ask any thread
   to; it left Settings on 2 Nov).
-- **Mike's releases** (`runner/src/upstream.ts`): every 6 hours it fetches
-  `upstream`'s signed `release/*` tags. It only tells you about them; it
-  never changes your code.
+- **Schedule checks** (`runner/src/schedule-check.ts`, experiment
+  `scheduleChecks`, off by default): a schedule's check command runs in
+  `/bin/sh` before each run, as you, for at most a minute (or up to five,
+  if the schedule says). Each keeps a
+  state file (and a note that a held check was told about, `<id>.held`) in `schedule-checks/` in Threadbear's data folder, and
+  beside it what the check last printed (`<id>.<hash>.kept.json`, readable
+  only by you) until a run carrying it has been sent, and, while a check
+  runs, which runner process is running it (`<id>.running.json`).
+- **Keeping the Mac awake** (`runner/src/keep-awake.ts`, experiment
+  `keepAwake`, off by default): while a thread is working and for 3
+  minutes after, the runner runs macOS's `/usr/bin/caffeinate -i -w
+  <runner pid>`, which stops idle sleep only (the display still sleeps
+  and the screen still locks). While it does, it reads `pmset -g batt`
+  every 2 minutes and lets go on battery below 15%.
+- **Mike's releases** (`runner/src/upstream.ts`): every 6 hours it lists
+  `upstream`'s `release/*` tags, fetches the newest few into a folder of
+  their own (`<home>/runner/upstream-fetch`, deleted after each check),
+  checks each with `ssh-keygen -Y verify` against the pinned key (the
+  signature goes in a temp file under `$TMPDIR` for a moment), and copies
+  the newest that passes into your checkout, as `refs/threadbear/upstream/`. It never changes your code by
+  itself. Every 5 days, when there's one your copy doesn't have, it starts
+  one thread (on your own Claude or Codex login, like any thread) that
+  merges it in a worktree, runs the checks and asks you before it lands
+  (`runner/src/bring-in.ts`). A release Mike marks important starts one
+  straight away. Settings › General › Updates from Mike, or
+  `"releases": { "bringIn": 14 }` (or `"important"`, or `"off"`) in
+  `runner.json`, changes it. It keeps what it last did in
+  `runner/bring-in.json` in the data folder.
 - **CLI updates** (`runner/src/updates/`): every hour it checks for new
   Claude Code and Codex versions and installs them. If you don't point it
   at your own Codex, it installs one into the data folder.
@@ -107,8 +176,15 @@ File references are where to look.
   When a project's notes pass 12,000 characters, the librarian sends them
   the same way to be rewritten shorter, and keeps the old notes in the
   data folder's `project-notes/` (the last 5 for each project).
-- **Housekeeping** (`runner/src/housekeeping.ts`): trims logs and deletes
-  old pasted images, trash and archived threads' media.
+  Mike's publishing runner also sends commit messages to Opus through its
+  Claude pool when preparing a daily release, to write the plain-language release notes.
+  The input includes subjects and bodies of merged commits, including pull requests.
+  If that call fails, the signed release still goes out without notes.
+- **Housekeeping** (`runner/src/housekeeping.ts`): trims logs, deletes
+  week-old copies of pictures pasted into drafts (a sent message keeps its
+  own copy) and deleted threads after 30 days in the trash. Archived
+  threads keep their pictures unless you set `"archivedMediaDays": <days>`
+  in `runner.json`.
 - **Presence** (`runner/src/presence.ts`): reads how long the keyboard and
   mouse have been idle (`ioreg`), so your phone knows whether you're at
   the Mac.
@@ -118,11 +194,23 @@ File references are where to look.
   what they say. `THREADBEAR_MAC_SCREEN=off` stops it.
 - **Patches** (`.threadbear/patches/`): code from a folder runs only after
   you trust that folder (`runner/src/patch-trust.ts`). A folder's Claude
-  Code hooks, other commands and `env` settings in its
-  `.claude/settings*.json`, and its `.mcp.json` servers, are held back the
-  same way (`runner/src/claude-trust.ts`):
-  the runner reads those files and the scripts they name to hash them,
-  and keeps what you trusted in the same `patch-trust.json`.
+  Code hooks, other commands, `env` settings and (in Ask and Auto threads)
+  permission rules in its `.claude/settings*.json`, its `.mcp.json`
+  servers, and hooks in its `.claude/agents`, `skills` and `commands`, are
+  held back the same way (`runner/src/claude-trust.ts`): the runner reads
+  those files and the scripts they reach to hash them, runs `git ls-files`
+  in the folder to find skills in folders under it, and keeps what you
+  trusted in the same `patch-trust.json`.
+- **Voice** (`app/Sources/Threadbear/Voice/VoiceServer.swift`): only
+  while Voice is in use and for 5 minutes after, the app runs
+  `pocket-tts serve` on a free port on 127.0.0.1 (not reachable from other
+  machines), sends it each reply's sentences and plays what comes back.
+  It stops when the app quits. If the app crashed instead, the next launch
+  reads that pid file and stops it, once it's checked that process really is
+  this pocket-tts. While Voice is on, the microphone is on,
+  and what you say is turned into text on this Mac by macOS's own speech
+  recognition (SpeechAnalyzer); the audio isn't saved or sent anywhere.
+  The text goes to the thread as your message.
 - **Menus on macOS 27.2** (`app/Sources/Threadbear/DragSpace.swift`): every
   5 seconds, and before a button opens a menu, the app asks the window
   server which Spaces its own windows are on, and takes them off the drag
@@ -168,9 +256,10 @@ File references are where to look.
 | A Linux server, over ssh | yours | Only when you run `runner/scripts/deploy-remote.sh <host>`: it copies a release of the runner (built from this checkout's HEAD) there, runs `npm ci --omit=dev` there, and writes the runner's `runner.json` (only when it's missing) and a systemd user service, through your own ssh setup (INSTALL.md section 6). |
 | GitHub | Mike's repo | Release tags fetched every 6 hours; the fork at setup |
 | downloads.claude.ai, registry.npmjs.org | Anthropic, npm | CLI version checks and installs; `npm ci` |
-| Anthropic, OpenAI | yours | Your threads, through the official CLIs on your own logins. After a turn fails because the API couldn't be reached, the runner itself opens (and straight away closes) a connection to api.anthropic.com or chatgpt.com on port 443, at most once a minute, until one opens and the thread carries on. Nothing is sent over it (`runner/src/net-probe.ts`). |
+| Anthropic, OpenAI | yours | Your threads, through the official CLIs on your own logins. With the `labReview` experiment on (off by default), a thread's code change, with your message and the agent's reply, goes to your other provider's CLI as a review thread, as if you'd started one. After a turn fails because the API couldn't be reached, the runner itself opens (and straight away closes) a connection to api.anthropic.com or chatgpt.com on port 443, at most once a minute, until one opens and the thread carries on. Nothing is sent over it (`runner/src/net-probe.ts`). |
 | Mike's push relay | Mike's | Only when a paired iPhone gets a notification. It's sent from your Convex deployment, not the Mac. The text is encrypted for the phone; the relay sees the device token and thread id (`convex/push.ts`, `docs/push-relay.md`). The first time, your deployment registers with it, giving its own address; the relay keeps that address and checks it by posting a one-time code back to your deployment's `/relay/verify` (`convex/http.ts`). |
 | A Connectors gateway | whoever runs it | Only if one is set in `runner.json` or `~/.claude.json`. Its `/health` every few minutes (and once more at the end of a turn where a call to one of its services failed, to see if it needs signing in), and for a project with a Notion page, a Notion read or two every 5 minutes for its task board (`runner/src/notion-tasks.ts`), signed with the header the `headersHelper` command in that `connectors` entry prints, which it runs for each read |
+| GitHub, Hugging Face | Kyutai's | Only with the `voiceMode` experiment on, the first time Voice is used: the pocket-tts download, then its model and voices. Nothing of yours is sent. |
 | Sentry | Mike's | Nothing from your copy. Only a copy whose `origin` is Mike's own repo reports errors or uploads the app's debug symbols (`runner/src/sentry.ts`, `app/Sources/Threadbear/CrashReporting.swift`, `app/build-app.sh`). The App Store iPhone app sends anonymous crash reports. |
 
 An HTML file opened in the side pane (a mockup or report an agent made,
@@ -182,7 +271,9 @@ outside it. Its web view
 blocks every other load (a WebKit content rule list, which WebKit keeps
 in its own store under `~/Library/WebKit`), sends any connection it would
 still make to a closed port on this Mac (127.0.0.1:9) so no name is
-looked up, runs none of the page's scripts, has WebRTC off, and doesn't
+looked up, runs none of the page's scripts (unless you choose Run them
+over that page, which turns them on for that version of the file only,
+remembered by its SHA-256 in the app's settings), has WebRTC off, and doesn't
 follow links away from it, submit
 forms, open windows or download
 (`app/Sources/Threadbear/Views/LocalPreviewSchemeHandler.swift`,
@@ -227,6 +318,18 @@ an unfamiliar format can get through, and it can't read pictures at all: any
 picture that goes up (ones agents post or pin, and anything in a thread you
 share) goes as it is. Scrubbing also can't undo a leak. A key that shows up in
 a thread has already been to the AI provider, so rotate it.
+
+**Full sync** is off unless a runner's `runner.json` has `"sync": { "full": true }`.
+With it off, tool output, diffs and tool screenshots stay on that runner, and
+nothing below happens. With it on, from then on (older tools aren't sent), that
+runner also sends each finished tool's output, its full input, its diffs and the
+reasoning before it to your deployment, after the same scrubbing, where they're
+kept 30 days. This lets you read them from any device while the runner's off. It's
+the same not-a-guarantee as above, over much more text. A tool whose command or file
+can hold secrets (`.env` files, `env list`, key files: `runner/src/withhold.ts`) sends
+nothing of itself, and a runner without an on-device model relies on these checks
+alone, which `tb status` says. A tool's screenshots stay on the runner unless you tap
+one on the website, which uploads that one for a day.
 
 `runner/scripts/scrub-stored.mjs` runs today's rules over what's already stored,
 and only when you run it. Convex backups and snapshot exports keep their copies.

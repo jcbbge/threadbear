@@ -15,8 +15,8 @@ struct NavigationPlace: Equatable, Sendable {
     var scheduledHome = false
 }
 
-/// Back and forward, like a browser's: ⌘[ and ⌘] in the Go menu, and the
-/// side buttons on a mouse.
+/// Back and forward, like a browser's: ⌘[ and ⌘] in the Go menu, the
+/// side buttons on a mouse, and trackpad swipes (SwipeNavigation).
 extension AppModel {
     var place: NavigationPlace {
         NavigationPlace(mode: sidebarMode, threadId: selection, subagent: subagentSelection, projectId: openProjectId, projectsHome: showsProjectsHome, librarianHome: showsLibrarianHome, scheduledHome: showsScheduledHome)

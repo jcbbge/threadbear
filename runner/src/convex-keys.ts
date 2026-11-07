@@ -282,8 +282,10 @@ const NO_ACCESS = /(don't|do not) have access|not a member|403 Forbidden/i;
 // says so itself if it's wrong, and New deploy key is still there.
 async function checkAdminKey(deploymentUrl: string, adminKey: string): Promise<'ok' | 'bad'> {
   try {
+    // redirect: 'error', as for every request carrying a key (secure-url.ts):
+    // a redirect would hand the key on to wherever it points.
     const res = await fetch(new URL('/api/check_admin_key', deploymentUrl), {
-      headers: { Authorization: `Convex ${adminKey}` }, signal: AbortSignal.timeout(5000) });
+      headers: { Authorization: `Convex ${adminKey}` }, redirect: 'error', signal: AbortSignal.timeout(5000) });
     return res.status === 401 || res.status === 403 ? 'bad' : 'ok';
   } catch {
     return 'ok';

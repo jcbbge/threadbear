@@ -55,11 +55,30 @@ final class RowSwipeController {
     /// a swipe it started even if the pointer's no longer there.
     func setHovered(_ hovering: Bool) {
         hovered = hovering
+        // A scroll that started here: the list took the rest of it, its end
+        // included, so nothing else says it's over. Left as it was, this row
+        // would keep listening with the pointer elsewhere, and take a later
+        // gesture's movements as its own.
+        if !hovering, swipe.phase == .ignoring || swipe.phase == .deciding { swipe.reset() }
         updateMonitor()
     }
 
+    /// The pointer's on the row, so a gesture starting now is the row's to
+    /// look at. Not the same as listening, which runs on to a swipe's end.
+    var isHovered: Bool { hovered }
+
     /// The row listening, for scripted swipes.
     static weak var listening: RowSwipeController?
+
+    /// The gesture ended somewhere the row won't hear about: it never
+    /// archives from this, and goes back into place.
+    func cancelGesture() {
+        guard swipe.phase != .idle else { return }
+        eatingMomentum = false
+        swipe.cancel()
+        springBack()
+        updateMonitor()
+    }
 
     /// The row's gone: stop listening whatever it was doing.
     func stop() {
@@ -98,8 +117,13 @@ final class RowSwipeController {
         // isn't a swipe); a trackpad or Magic Mouse does.
         guard event.hasPreciseScrollingDeltas, !event.phase.isEmpty else { return false }
         if event.phase.contains(.began) {
-            guard hovered, !leaving else { return false }
-            swipe.begin()
+            guard hovered, !leaving else {
+                // A new gesture elsewhere: whatever this row was doing, its
+                // lift went somewhere else (another app, say).
+                if !leaving { cancelGesture() }
+                return false
+            }
+            swipe.begin(rightTaken: SwipeNavigation.shared.takesBack)
             eatingMomentum = false
         }
         if event.phase.contains(.changed) || event.phase.contains(.began) {
@@ -190,12 +214,14 @@ final class RowSwipeController {
 enum RowSwipeEvents {
     enum Phase: Int64 {
         // CGScrollPhase's values.
-        case began = 1, changed = 2, ended = 4
+        case began = 1, changed = 2, ended = 4, cancelled = 8, mayBegin = 128
     }
 
     /// `dx` is the fingers' way, left negative, whichever way the
     /// system's scrolling runs.
-    static func event(dx: Double, phase: Phase) -> NSEvent? {
+    /// `middle`: over the middle of the window (a page swipe), rather
+    /// than the sidebar's rows.
+    static func event(dx: Double, dy: Double = 0, phase: Phase, middle: Bool = false) -> NSEvent? {
         guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: 0, wheel2: 0, wheel3: 0) else { return nil }
         cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         cg.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase.rawValue)
@@ -203,8 +229,14 @@ enum RowSwipeEvents {
         let delta = probe.isDirectionInvertedFromDevice ? dx : -dx
         cg.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: delta)
         cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: delta)
+        // Up and down the way the system scrolls, as across.
+        let vertical = probe.isDirectionInvertedFromDevice ? dy : -dy
+        cg.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: vertical)
+        cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: vertical)
         if let window = NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }) {
-            cg.location = CGPoint(x: window.frame.minX + 100, y: (NSScreen.screens.first?.frame.height ?? 0) - window.frame.maxY + 200)
+            let x = middle ? window.frame.midX : window.frame.minX + 100
+            let down = middle ? window.frame.height / 2 : 200
+            cg.location = CGPoint(x: x, y: (NSScreen.screens.first?.frame.height ?? 0) - window.frame.maxY + down)
         }
         return NSEvent(cgEvent: cg)
     }

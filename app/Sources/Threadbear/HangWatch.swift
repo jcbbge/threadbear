@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import ThreadbearCore
 
@@ -34,6 +35,57 @@ final class HangWatch: @unchecked Sendable {
         /// Seconds until the main thread came back; nil if it never did.
         var recoveredAfter: TimeInterval?
         var reported: Bool?
+        var context: Context?
+
+        /// What goes to Sentry with the frames: symbol names and numbers, no
+        /// user text. Out here so a test can see it, as the send itself is
+        /// only in release builds, and Sentry wants plain JSON values.
+        func extras(frames: [String]) -> [String: Any] {
+            var extras: [String: Any] = [
+                "frames": Array(frames.suffix(60)),
+                "seconds": recoveredAfter.map { Int($0) } ?? "never came back",
+                "build": build ?? "unknown",
+            ]
+            // Records from before these were kept have none.
+            if let priority = context?.mainPriority { extras["mainPriority"] = priority }
+            if let load = context?.loadAverage { extras["loadAverage"] = load }
+            if let idle = context?.idleSeconds { extras["idleSeconds"] = Int(idle) }
+            return extras
+        }
+    }
+
+    /// How the Mac was when the stall was noticed, sent with the report. A
+    /// stall at low priority on an overloaded Mac with nobody there
+    /// (THREADBEAR-1B: 33 s, display off, load 60 to 77) isn't the same bug as
+    /// one under Mike's hands, and afterwards nothing could say what the
+    /// priority had been.
+    struct Context: Codable, Equatable {
+        /// The main thread's scheduling priority at that moment: 46 or so
+        /// normally, 4 when something has clamped it to background (seen
+        /// with the display off; App Nap is the likely reason, not a proven
+        /// one).
+        var mainPriority: Int?
+        var loadAverage: Double?
+        var idleSeconds: Double?
+    }
+
+    static func currentContext(mainThread: mach_port_t) -> Context {
+        var load = [0.0]
+        let gotLoad = getloadavg(&load, 1) == 1
+        return Context(mainPriority: priority(of: mainThread), loadAverage: gotLoad ? load[0] : nil,
+                       // ~0 is kCGAnyInputEventType, which Swift doesn't import.
+                       idleSeconds: CGEventType(rawValue: ~0).map { CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0) })
+    }
+
+    private static func priority(of thread: mach_port_t) -> Int? {
+        var info = thread_extended_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<thread_extended_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_info(thread, thread_flavor_t(THREAD_EXTENDED_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? Int(info.pth_curpri) : nil
     }
 
     nonisolated(unsafe) private static var current: HangWatch?
@@ -57,6 +109,12 @@ final class HangWatch: @unchecked Sendable {
     // All on `queue`.
     private var beatPostedAt: UInt64?
     private var stall: (name: String, startedAt: UInt64)?
+
+    /// Taken at startup, on the main thread (`start`'s callers are). Looking
+    /// it up during a stall would take libpthread's thread-list lock, which
+    /// the stuck thread might be holding, and this queue must never wait on
+    /// anything the main thread could have.
+    private let mainThread = pthread_mach_thread_np(pthread_self())
 
     private init(folder: URL, build: String?) {
         self.folder = folder
@@ -113,6 +171,12 @@ final class HangWatch: @unchecked Sendable {
             try process.run()
         } catch {
             AppLog.write("hang", "couldn't run sample: \(error.localizedDescription)")
+        }
+        // After the sample's away: asking for the idle time goes through the
+        // window server, and whatever that does, the sample is what counts.
+        if var record = read(name) {
+            record.context = Self.currentContext(mainThread: mainThread)
+            write(record, name)
         }
     }
 

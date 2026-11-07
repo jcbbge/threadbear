@@ -62,11 +62,7 @@ enum CrashReporting {
         let event = Event(level: .error)
         event.message = SentryMessage(formatted: "Main thread stuck in \(own ?? frames.last ?? "unknown")")
         event.fingerprint = ["main-thread-hang", own ?? frames.last ?? "unknown"]
-        event.extra = [
-            "frames": Array(frames.suffix(60)),
-            "seconds": record.recoveredAfter.map { Int($0) } ?? "never came back",
-            "build": record.build ?? "unknown",
-        ]
+        event.extra = record.extras(frames: frames)
         SentrySDK.capture(event: event)
         #endif
     }

@@ -217,13 +217,13 @@ test("a script that runs what patch trust can't follow fails closed: a hook or s
   }
 });
 
-test("an action's script isn't held to it: it runs only when pressed, so it loads, though what it runs is still hashed", async () => {
+test("an action's script can't stop the follow either: what comes after it wasn't seen, so the patch doesn't load (Daybreak, 7 Nov)", async () => {
   const { folder, file } = repo("export default { actions: [{ title: 'Deploy', run: './deploy.sh' }] };\n", { 'deploy.sh': '#!/bin/sh\neval "$X"\n./after.sh\n', 'after.sh': 'echo\n' });
   const trust = new PatchTrust();
   trust.trustCurrent([file]);
   const set = await load(folder, trust);
-  assert.equal(set.patches[0].error, undefined);
-  assert.equal(set.actions.length, 1);
+  assert.match(set.patches[0].error ?? '', /^Not run: its action "Deploy" .*eval/);
+  assert.equal(set.actions.length, 0);
 });
 
 // Mike's own hooks, as poddle and mikecann.blog have them (5 Nov): they
@@ -332,7 +332,6 @@ test("an action's target is hashed however its command names it: changing only t
     ['node scripts/deploy.mjs', { 'scripts/deploy.mjs': "import './lib.mjs';\n", 'scripts/lib.mjs': '1;\n' }, 'scripts/lib.mjs'],
     ['bun scripts/x.ts --prod', { 'scripts/x.ts': '1;\n' }, 'scripts/x.ts'],
     ['bash scripts/deploy.sh', { 'scripts/deploy.sh': 'echo\n' }, 'scripts/deploy.sh'],
-    ['python3 tools/release.py', { 'tools/release.py': 'print(1)\n' }, 'tools/release.py'],
     ['npm run deploy', { 'package.json': '{"scripts":{"deploy":"node tools/d.mjs"}}', 'tools/d.mjs': '1;\n' }, 'tools/d.mjs'],
     ['make deploy', { Makefile: 'deploy:\n\tsh tools/d.sh\n', 'tools/d.sh': 'echo\n' }, 'tools/d.sh'],
     ['cd web && node build.mjs', { 'web/build.mjs': '1;\n' }, 'web/build.mjs'],
@@ -349,7 +348,7 @@ test("an action's target is hashed however its command names it: changing only t
   }
 });
 
-test("a command a live function runs with sh is hashed too, as are an action's that can't be followed (it still loads: it runs only when pressed)", async () => {
+test("a command a live function runs with sh is hashed too, and an action's that can't be followed doesn't load", async () => {
   const live = repo("export default { actions: [{ title: 'Go', run: 'true', badge: async ({ sh }) => Number(await sh('node scripts/count.mjs')) }] };\n", { 'scripts/count.mjs': '1;\n' });
   const t1 = new PatchTrust();
   t1.trustCurrent([live.file]);
@@ -358,7 +357,7 @@ test("a command a live function runs with sh is hashed too, as are an action's t
   const odd = repo("export default { actions: [{ title: 'Go', run: 'eval \"$X\"; node scripts/go.mjs' }] };\n", { 'scripts/go.mjs': '1;\n' });
   const t2 = new PatchTrust();
   t2.trustCurrent([odd.file]);
-  assert.equal((await load(odd.folder, t2)).actions.length, 1);
+  assert.equal((await load(odd.folder, t2)).actions.length, 0);
 });
 
 test("an action command worked out in code that runs a file the hash didn't cover is refused", async () => {

@@ -138,6 +138,24 @@ export function readImageInfo(file: string): ImageInfo | null {
   }
 }
 
+// A video file's type and, when its header has it near the start, its
+// picture size (sniffVideo). For design reviews' clips (reviews.ts).
+export function readVideoInfo(file: string): ImageInfo | null {
+  let fd: number | null = null;
+  try {
+    const st = fs.statSync(file);
+    if (!st.isFile()) return null;
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(Math.min(st.size, 1024 * 1024));
+    fs.readSync(fd, buf, 0, buf.length, 0);
+    return sniffVideo(buf);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
 export function imageRefFor(file: string, fallbackType?: string): ImageRef {
   const info = readImageInfo(file);
   const ref: ImageRef = { path: file, mediaType: info?.mediaType ?? fallbackType ?? 'application/octet-stream' };
@@ -168,7 +186,11 @@ export function saveBase64Image(dir: string, data: string, mediaType: string, hi
 // since the app and the models only take the common web formats.
 export function copyImageInto(dir: string, src: string): ImageRef {
   const info = readImageInfo(src);
-  if (!info) return convertImageInto(dir, src);
+  if (!info) {
+    const why = unreadable(src);
+    if (why) throw new Error(why);
+    return convertImageInto(dir, src);
+  }
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${crypto.randomUUID()}.${extForMediaType(info.mediaType)}`);
   fs.copyFileSync(src, file);
@@ -176,6 +198,32 @@ export function copyImageInto(dir: string, src: string): ImageRef {
   if (info.width) ref.width = info.width;
   if (info.height) ref.height = info.height;
   return ref;
+}
+
+// Why a file can't be read at all, or undefined when it can, so a missing or
+// locked file isn't reported as "Not a supported image". A screenshot's
+// floating thumbnail hands over a temp file that macOS deletes as the drop
+// ends (issue #2).
+function unreadable(src: string): string | undefined {
+  const name = path.basename(src);
+  let fd: number | null = null;
+  try {
+    const st = fs.statSync(src);
+    if (!st.isFile()) return `Not a file: ${name}`;
+    if (st.size === 0) return `${name} is empty`;
+    if (st.size > MAX_IMAGE_BYTES) return `${name} is too big to add (over 100 MB)`;
+    // Open it rather than ask access(): macOS privacy settings can refuse
+    // the open of a file that access() says is readable.
+    fd = fs.openSync(src, 'r');
+    return undefined;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return `The file went away before it could be added: ${name}`;
+    if (code === 'EACCES' || code === 'EPERM') return `Threadbear isn't allowed to read ${name}`;
+    return `Couldn't read ${name}${code ? ` (${code})` : ''}`;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
 }
 
 function convertImageInto(dir: string, src: string): ImageRef {

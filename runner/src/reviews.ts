@@ -1,21 +1,32 @@
-// Validation and text for durable image reviews. Files are copied only after
-// every input has passed validation, so a bad final option leaves no card.
+// Validation and text for durable reviews of pictures, videos and pages.
+// Files are copied only after every input has passed validation, so a bad
+// final option leaves no card.
 import fs from 'node:fs';
 import path from 'node:path';
 import { expandHome } from './config.ts';
-import { readImageInfo } from './media.ts';
+import { readImageInfo, readVideoInfo } from './media.ts';
 import type { DesignReview, ReviewDraft } from './protocol.ts';
 import { ErrorCode, RpcError } from './protocol.ts';
 
 // An option's pictures: `path` and then `shots`, or `shots` alone. One option
 // often has several (its overview, mid-drag, a detail), which agents used to
 // pass as options of their own, A2 and A3, that couldn't be picked (Mike, 4 Nov).
-export type ReviewShotInput = { path: string; title?: string };
-export type ReviewInput = { title: string; note?: string; options: { id: string; title: string; path?: string; shots?: ReviewShotInput[]; url?: string; note?: string; reference?: boolean }[] };
+// kind is worked out here from the file: a picture, a video (MP4 or
+// QuickTime) or an HTML page. The window plays a video and shows a page in
+// place of a still, as agents had to hand Mike stills of clips that only
+// made sense moving (6 Nov 2026).
+export type ReviewShotKind = 'image' | 'video' | 'page';
+export type ReviewShotInput = { path: string; title?: string; kind?: ReviewShotKind };
+export type ReviewInput = { title: string; note?: string; recommended?: string; options: { id: string; title: string; path?: string; shots?: ReviewShotInput[]; url?: string; note?: string; reference?: boolean }[] };
 // What createReview copies: every source file, first shot first.
 export type ReviewOptionSource = { id: string; title: string; note?: string; reference?: boolean; url?: string; shots: ReviewShotInput[] };
 export const maxReviewShots = 8;
 export const maxReviewImages = 40;
+const maxImageBytes = 25 * 1024 * 1024;
+const maxVideoBytes = 200 * 1024 * 1024;
+const maxPageBytes = 5 * 1024 * 1024;
+// All of a review's videos and pages together, as each is copied in.
+export const maxReviewMediaBytes = 500 * 1024 * 1024;
 
 function bad(message: string): never {
   throw new RpcError(ErrorCode.badParams, message);
@@ -27,21 +38,34 @@ function text(v: unknown, name: string, max: number, required = false): string |
   return (v as string).trim();
 }
 
-function imageFile(raw: unknown, cwd: string): string {
-  const file = path.resolve(cwd, expandHome(text(raw, 'image path', 8192, true)!));
+function shotFile(raw: unknown, cwd: string): { path: string; kind: ReviewShotKind; size: number } {
+  const file = path.resolve(cwd, expandHome(text(raw, 'path', 8192, true)!));
+  let size: number;
   try {
     const st = fs.statSync(file);
-    if (!st.isFile() || st.size > 25 * 1024 * 1024) bad(`Image must be a regular file of at most 25 MB: ${file}`);
+    if (!st.isFile()) bad(`Not a regular file: ${file}`);
+    size = st.size;
   } catch (e) {
     if (e instanceof RpcError) throw e;
-    bad(`Image not found: ${file}`);
+    bad(`File not found: ${file}`);
   }
-  const info = readImageInfo(file);
-  if (!info?.width || !info.height) bad(`Not a supported image with readable dimensions: ${file}`);
-  return file;
+  if (/\.html?$/i.test(file)) {
+    if (size > maxPageBytes) bad(`An HTML page must be at most 5 MB: ${file}`);
+    return { path: file, kind: 'page', size };
+  }
+  if (size <= maxImageBytes) {
+    const info = readImageInfo(file);
+    if (info?.width && info.height) return { path: file, kind: 'image', size };
+  }
+  if (readVideoInfo(file)) {
+    if (size > maxVideoBytes) bad(`A video must be at most 200 MB: ${file}`);
+    return { path: file, kind: 'video', size };
+  }
+  if (size > maxImageBytes) bad(`An image must be at most 25 MB: ${file}`);
+  return bad(`Not a picture (PNG, JPEG, GIF, WebP), video (MP4, MOV) or HTML page: ${file}`);
 }
 
-export function reviewInput(raw: unknown, cwd: string): { title: string; note?: string; options: ReviewOptionSource[] } {
+export function reviewInput(raw: unknown, cwd: string): { title: string; note?: string; recommended?: string; options: ReviewOptionSource[] } {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return bad('A review needs a title and options.');
   const p = raw as Record<string, unknown>;
   const title = text(p.title, 'title', 200, true)!;
@@ -49,6 +73,7 @@ export function reviewInput(raw: unknown, cwd: string): { title: string; note?: 
   if (!Array.isArray(p.options) || !p.options.length || p.options.length > 12) return bad('A review needs between 1 and 12 options.');
   const ids = new Set<string>();
   let images = 0;
+  let mediaBytes = 0;
   const options = p.options.map((raw, i) => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return bad(`options[${i}] must be an object.`);
     const o = raw as Record<string, unknown>;
@@ -62,20 +87,34 @@ export function reviewInput(raw: unknown, cwd: string): { title: string; note?: 
     if (url && !/^https?:\/\/\S+$/i.test(url)) bad(`url must be an http or https address: ${url}`);
     if (o.shots !== undefined && !Array.isArray(o.shots)) bad(`shots on ${id} must be a list.`);
     const shots: ReviewShotInput[] = [];
-    if (o.path !== undefined) shots.push({ path: imageFile(o.path, cwd) });
+    const add = (raw: unknown, title?: string) => {
+      const file = shotFile(raw, cwd);
+      if (file.kind !== 'image') mediaBytes += file.size;
+      shots.push({ path: file.path, kind: file.kind, ...(title ? { title } : {}) });
+    };
+    if (o.path !== undefined) add(o.path);
     for (const [j, s] of ((o.shots as unknown[] | undefined) ?? []).entries()) {
       if (!s || typeof s !== 'object' || Array.isArray(s)) bad(`shots[${j}] on ${id} must be an object with a path.`);
       const shot = s as Record<string, unknown>;
-      const shotTitle = text(shot.title, 'shot title', 200);
-      shots.push({ path: imageFile(shot.path, cwd), ...(shotTitle ? { title: shotTitle } : {}) });
+      add(shot.path, text(shot.title, 'shot title', 200));
     }
-    if (!shots.length) bad(`Option ${id} needs an image: a path or shots.`);
+    if (!shots.length) bad(`Option ${id} needs an image, video or page: a path or shots.`);
     if (shots.length > maxReviewShots) bad(`Option ${id} has ${shots.length} images; at most ${maxReviewShots}.`);
     images += shots.length;
     return { id, title, shots, ...(note ? { note } : {}), ...(o.reference === true ? { reference: true } : {}), ...(url ? { url } : {}) };
   });
   if (images > maxReviewImages) bad(`A review can have at most ${maxReviewImages} images in all; this has ${images}.`);
-  return { title, ...(note ? { note } : {}), options };
+  if (mediaBytes > maxReviewMediaBytes) bad(`A review's videos and pages can be at most 500 MB in all; these are ${Math.ceil(mediaBytes / 1024 / 1024)} MB.`);
+  // The agent's own pick, which the window marks "my pick" as an asks card
+  // does (Mike, 7 Nov: agents wrote "I'd pick C" in the middle of the note,
+  // where it was hard to find).
+  const recommended = text(p.recommended, 'recommended', 200) || undefined;
+  if (recommended) {
+    const option = options.find(o => o.id === recommended);
+    if (!option) bad(`recommended must be one of the option ids: ${recommended}`);
+    if (option.reference) bad('recommended cannot be a reference option.');
+  }
+  return { title, ...(note ? { note } : {}), ...(recommended ? { recommended } : {}), options };
 }
 
 export function reviewDraft(review: DesignReview, raw: unknown, answer = false): ReviewDraft {

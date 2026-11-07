@@ -5,6 +5,7 @@ import { internalMutation, internalQuery } from './_generated/server';
 import { hasLiveToken } from './pushTargets';
 import { runnerName } from './sync';
 import { hasLiveKey } from './lib';
+import { nextHealth } from './pushHealth';
 
 // Only phones whose token is still good (pushTargets.ts): revoking deletes
 // a phone's row (tokens.ts), but an expired token's phone, or an old row
@@ -96,6 +97,23 @@ export const clearRelayInstall = internalMutation({
   returns: v.null(),
   handler: async (ctx) => {
     for await (const row of ctx.db.query('relayInstall')) await ctx.db.delete(row._id);
+    return null;
+  },
+});
+
+// After each send (push.ts sendAlert): whether any got through
+// (pushHealth.ts), for the owner runner's heartbeat to report.
+export const pushOutcome = internalMutation({
+  args: { sent: v.number(), failed: v.number(), failure: v.optional(v.string()), via: v.union(v.literal('apple'), v.literal('relay')) },
+  returns: v.null(),
+  handler: async (ctx, o) => {
+    if (o.sent <= 0 && o.failed <= 0) return null;
+    const row = await ctx.db.query('pushHealth').first();
+    // nextHealth builds a fresh row (sent or failed is above 0 here), so
+    // the old row's _id never ends up in it.
+    const next = nextHealth(row ?? {}, o, Date.now());
+    if (row) await ctx.db.replace(row._id, next);
+    else await ctx.db.insert('pushHealth', next);
     return null;
   },
 });

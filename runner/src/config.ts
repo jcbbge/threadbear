@@ -1,10 +1,12 @@
 import fs from 'node:fs';
+import { readSandbox, type SandboxConfig } from './sandbox.ts';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { atomicWriteFileSync } from './fsutil.ts';
 import { RELEASE } from './release.ts';
-import { findGateway, gatewayBase } from './connectors.ts';
+import { gatewayBase, gatewayUrlFrom } from './connectors.ts';
+import { credentialUrlProblem } from './secure-url.ts';
 import { findGatewayClient } from './notion-tasks.ts';
 import { CLI_POLICIES, isEffortLevel, isProvider, type CliPolicy, type EffortLevel, type Provider } from './protocol.ts';
 
@@ -85,6 +87,8 @@ export type Config = {
   tokenTally?: boolean;
   accountNotes: Record<string, string>;
   poolFolders?: Record<string, string[]>;
+  // Folders whose threads run their CLI in a container (sandbox.ts).
+  sandbox?: SandboxConfig;
   // runner.json's pools as written (pools.ts readPools checks each);
   // absent means the built-in ones. pools.save replaces it.
   pools?: unknown[];
@@ -109,7 +113,9 @@ export type Config = {
   // The Convex mirror (src/sync.ts): the project's URL, whether it's on,
   // the name the phone shows for this runner and its id (made once).
   // THREADBEAR_SYNC=off turns it off for tests and dev runners.
-  sync: { enabled: boolean; url?: string; name?: string; runnerId?: string; icon?: string; rpcUrl?: string; pastedPictures?: boolean };
+  // urlRefused: why the configured url isn't used (plain http off this
+  // Mac, secure-url.ts), so sync is off and tb status says why.
+  sync: { enabled: boolean; url?: string; urlRefused?: string; site?: string; name?: string; runnerId?: string; icon?: string; rpcUrl?: string; pastedPictures?: boolean; full?: boolean };
   // The silent on-device secret check (src/secret-check.ts): off unless asked.
   secretCheck?: boolean;
   // Mike's Connectors gateway's base URL (connectors.ts), for the app's
@@ -119,6 +125,9 @@ export type Config = {
   // Authorization header, for reading projects' Notion boards
   // (notion-tasks.ts). Only with connectorsUrl.
   connectorsClient?: { mcpUrl: string; headersHelper: string };
+  // Why a configured gateway URL isn't used (plain http off this Mac,
+  // secure-url.ts): the Connectors panel's off state and the log say it.
+  connectorsRefused?: string;
 };
 
 export type RunnerJson = {
@@ -145,18 +154,34 @@ export type RunnerJson = {
   cliUpdates?: Partial<CliUpdatesConfig>;
   accountNotes?: Record<string, string>;
   poolFolders?: Record<string, string[]>;
+  sandbox?: unknown;
   pools?: unknown[];
   followMain?: boolean;
+  // The ssh host that ./check.sh sends the repo's checks to, so suites and
+  // the app's test windows stay off this Mac (scripts/check-remote.sh), or
+  // checkHosts, several tried in order, which wins (a check.sh from before
+  // the list reads only checkHost). Only check.sh reads them.
+  checkHost?: string;
+  checkHosts?: string[];
   bulletReplies?: boolean;
   oneReply?: boolean;
-  releases?: { publish?: boolean; signingKey?: string };
+  // bringIn: how often a fork's runner starts a thread to bring in Mike's
+  // releases (bring-in.ts): every so many days, 'important' or 'off'.
+  releases?: { publish?: boolean; signingKey?: string; bringIn?: number | 'important' | 'off' };
   models?: { pool?: string | null; privateFolders?: string[] };
   // icon: an SF Symbol for this runner in lists (machine.ts works one out).
   // rpcUrl: how a Mac app reaches this runner over the tailnet (step 6 part 2).
+  // full: true sends tool output to your Convex deployment as well, scrubbed first
+  // (docs/full-convex.md). Off unless you say so.
   // pastedPictures: false keeps pictures you paste off your Convex deployment
   // (docs/on-your-mac.md).
-  sync?: { enabled?: boolean; url?: string; name?: string; runnerId?: string; icon?: string; rpcUrl?: string; pastedPictures?: boolean };
+  sync?: { enabled?: boolean; url?: string; site?: string; name?: string; runnerId?: string; icon?: string; rpcUrl?: string; pastedPictures?: boolean; full?: boolean };
   secretCheck?: { enabled?: boolean };
+  // Days after a thread is archived that housekeeping clears its pictures
+  // (housekeeping.ts). Absent: they're kept. Mike's runners set 30.
+  archivedMediaDays?: number;
+  // Features still being tried out, each off unless it says (experiments.ts).
+  experiments?: Record<string, boolean>;
   // The gateway, when it isn't the `connectors` MCP server in
   // ~/.claude.json; url "" or enabled: false turns the panel's polling off.
   connectors?: { url?: string; enabled?: boolean; headersHelper?: string };
@@ -260,6 +285,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     tokenTally: env.THREADBEAR_TOKEN_TALLY !== 'off',
     accountNotes: stringMap(json.accountNotes) ?? { ...DEFAULT_ACCOUNT_NOTES },
     poolFolders: folderMap(json.poolFolders) ?? { ...DEFAULT_POOL_FOLDERS },
+    ...((sb) => (sb ? { sandbox: sb } : {}))(readSandbox(json.sandbox, expandHome)),
     ...(Array.isArray(json.pools) && json.pools.length ? { pools: json.pools } : {}),
     sync: syncConfig(json.sync, env),
     secretCheck: json.secretCheck?.enabled === true,
@@ -268,21 +294,38 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 }
 
 // THREADBEAR_CONNECTORS_URL wins (empty or "off" turns it off, for tests),
-// then runner.json, then the main login's `connectors` MCP server.
-function connectorsConfig(raw: RunnerJson['connectors'], env: NodeJS.ProcessEnv, claudeJson: string): Pick<Config, 'connectorsUrl' | 'connectorsClient'> {
+// then runner.json, then the main login's `connectors` MCP server. The
+// gateway's calls carry its token, so a URL that isn't https (or plain
+// http to this Mac) leaves it off rather than falling back on the next.
+function connectorsConfig(raw: RunnerJson['connectors'], env: NodeJS.ProcessEnv, claudeJson: string): Pick<Config, 'connectorsUrl' | 'connectorsClient' | 'connectorsRefused'> {
   const fromEnv = env.THREADBEAR_CONNECTORS_URL;
-  const url = fromEnv !== undefined ? (fromEnv.trim() && fromEnv.trim() !== 'off' ? gatewayBase(fromEnv.trim()) : undefined) : findGateway(raw, claudeJson);
+  const found = fromEnv !== undefined ? (fromEnv.trim() && fromEnv.trim() !== 'off' ? { url: fromEnv.trim(), from: 'THREADBEAR_CONNECTORS_URL' } : undefined) : gatewayUrlFrom(raw, claudeJson);
+  if (!found) return {};
+  const problem = credentialUrlProblem(found.url);
+  if (problem) return { connectorsRefused: `${found.from} ${problem}` };
+  const url = gatewayBase(found.url);
   if (!url) return {};
   const client = fromEnv !== undefined ? undefined : findGatewayClient(raw, claudeJson);
   return { connectorsUrl: url, ...(client ? { connectorsClient: client } : {}) };
 }
 
 // THREADBEAR_SYNC=off wins over runner.json; THREADBEAR_SYNC_URL points a
-// test or dev runner at its own deployment.
+// test or dev runner at its own deployment. Every post carries the runner
+// key and thread text, so a URL that isn't https (or plain http to this
+// Mac, a local backend) isn't used: sync stays off and says why, rather
+// than falling back on runner.json's.
 function syncConfig(raw: RunnerJson['sync'], env: NodeJS.ProcessEnv): Config['sync'] {
-  const url = nonEmpty(env.THREADBEAR_SYNC_URL) ?? nonEmpty(raw?.url);
+  const fromEnv = nonEmpty(env.THREADBEAR_SYNC_URL);
+  const url = fromEnv ?? nonEmpty(raw?.url);
   const out: Config['sync'] = { enabled: env.THREADBEAR_SYNC === 'off' ? false : raw?.enabled !== false };
-  if (url) out.url = url;
+  const problem = url ? credentialUrlProblem(url) : undefined;
+  if (problem) out.urlRefused = `${fromEnv ? 'THREADBEAR_SYNC_URL' : 'sync.url in runner.json'} ${problem}`;
+  else if (url) out.url = url;
+  // Where the website is, for a self-hosted backend, which serves it on a
+  // port of its own (docs/self-hosting.md). A cloud deployment leaves it
+  // out: its site is the .convex.site twin of url.
+  const site = nonEmpty(raw?.site);
+  if (site) out.site = site;
   const name = nonEmpty(raw?.name);
   if (name) out.name = name;
   const runnerId = nonEmpty(raw?.runnerId);
@@ -292,6 +335,7 @@ function syncConfig(raw: RunnerJson['sync'], env: NodeJS.ProcessEnv): Config['sy
   const rpcUrl = nonEmpty(raw?.rpcUrl);
   if (rpcUrl) out.rpcUrl = rpcUrl;
   if (raw?.pastedPictures === false) out.pastedPictures = false;
+  if (raw?.full === true) out.full = true;
   return out;
 }
 

@@ -84,19 +84,40 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("Paired with") {
-                LabeledContent("Server", value: model.pairing?.deploymentURL.host() ?? (model.isFake ? "Sample data" : "None"))
+                LabeledContent("Server", value: model.pairing.map { Pairing.serverName($0.deploymentURL) } ?? (model.isFake ? "Sample data" : "None"))
                 if let identity {
                     LabeledContent("Phone", value: identity.name)
                     if let expires = identity.expiresAt {
                         LabeledContent("Token expires", value: expires.formatted(date: .abbreviated, time: .omitted))
                     }
                 }
-                ForEach(model.runners) { runner in
-                    LabeledContent(runner.name, value: runner.isOnline(at: model.now) ? "Online" :
-                                    "Last seen \(RelativeTime.clock(runner.lastSeenAt, now: model.now))")
+                if !model.canChooseRunner {
+                    ForEach(model.runners) { runner in
+                        LabeledContent(runner.name, value: runnerStatus(runner))
+                    }
                 }
             }
-            if model.canChooseNotifications {
+            if model.canChooseRunner {
+                Section {
+                    ForEach(model.runners) { runner in
+                        LabeledContent(runner.name, value: runnerStatus(runner))
+                    }
+                    NavigationLink("Change the order") { RunnerOrderView() }
+                } header: {
+                    Text("Runners")
+                } footer: {
+                    Text("New threads start on the first one that's online.")
+                }
+            }
+            if identity?.pushOff == true {
+                // A self-hosted backend: the push relay only reaches Convex
+                // cloud, so say why nothing comes rather than offer a picker
+                // that does nothing (docs/self-hosting.md).
+                Section("Notifications") {
+                    Label("Your Threadbear backend is self-hosted, so it can't send notifications. Open the app to see what needs you.", systemImage: "bell.slash")
+                        .foregroundStyle(.secondary)
+                }
+            } else if model.canChooseNotifications {
                 Section("Notify me") {
                     Picker("Notify me", selection: Binding(get: { model.notifyMode }, set: { model.setNotifyMode($0) })) {
                         ForEach(NotifyMode.allCases, id: \.self) { Text($0.label).tag($0) }
@@ -105,6 +126,7 @@ struct SettingsView: View {
                     .labelsHidden()
                 }
             }
+            DictationSettingsSection()
             QuickAskSettingsSection()
             if model.isFake {
                 Section {
@@ -127,5 +149,36 @@ struct SettingsView: View {
         .confirmationDialog("Unpair this phone?", isPresented: $confirmUnpair, titleVisibility: .visible) {
             Button("Unpair", role: .destructive) { model.unpair() }
         }
+    }
+
+    private func runnerStatus(_ runner: PhoneRunner) -> String {
+        runner.isOnline(at: model.now) ? "Online" : "Last seen \(RelativeTime.clock(runner.lastSeenAt, now: model.now))"
+    }
+}
+
+/// The runners in Mike's order, to drag about: new threads start on the
+/// first one online (phone:setRunnerOrder). Its own screen because a Form's
+/// rows only show drag handles with the whole list in edit mode.
+struct RunnerOrderView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(model.runners) { runner in
+                    LabeledContent(runner.name, value: runner.isOnline(at: model.now) ? "Online" : "Offline")
+                }
+                .onMove { from, to in
+                    var order = model.runners
+                    order.move(fromOffsets: from, toOffset: to)
+                    model.setRunnerOrder(order)
+                }
+            } footer: {
+                Text("New threads start on the first one that's online. Drag to change the order.")
+            }
+        }
+        .environment(\.editMode, .constant(.active))
+        .navigationTitle("Runner order")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }

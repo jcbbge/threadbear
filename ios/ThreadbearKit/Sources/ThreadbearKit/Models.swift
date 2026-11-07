@@ -241,6 +241,10 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
     @FlexibleDate public var lastActivityAt: Date
     @OptionalFlexibleDate public var snoozedUntil: Date?
     public var snoozedUntilRestart: Bool?
+    /// What it waits for while hibernating, when that's more than a time
+    /// ("\"Convex I/O\" finishes", "the runner updates"; backend API 49). Nil
+    /// for a plain time and from an older runner.
+    public var wakeNote: String?
     /// Back from hibernating by itself and not opened yet: the row says
     /// "Woke up", as the Mac's does.
     public var woke: Woke?
@@ -348,7 +352,7 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
     /// the oldest the phone has. False when the runner doesn't say.
     public func hasEarlier(than oldestSeq: Int?) -> Bool {
         guard let earliestSeq, let oldestSeq else { return false }
-        return oldestSeq > Int(earliestSeq)
+        return Double(oldestSeq) > earliestSeq
     }
 
     /// The last folder name, for a thread in no project: "misc".
@@ -521,9 +525,12 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
     /// On the first row of a turn the agent started by itself: the
     /// sub-agents and jobs whose finishing woke it (backend API 33).
     public var wokeBy: [WokeTask]?
+    /// The reply buttons its text links as `[title](button:<id>)`, as they
+    /// are now (backend API 59, ReplyButtons.swift).
+    public var buttons: [MessageButton]?
     @FlexibleDate public var at: Date
 
-    public init(seq: Int, role: Role, text: String, origin: String? = nil, toolKind: String? = nil, summary: Bool = false, turn: String? = nil, wokeBy: [WokeTask]? = nil, at: Date) {
+    public init(seq: Int, role: Role, text: String, origin: String? = nil, toolKind: String? = nil, summary: Bool = false, turn: String? = nil, wokeBy: [WokeTask]? = nil, buttons: [MessageButton]? = nil, at: Date) {
         self.seq = seq
         self.role = role
         self.text = text
@@ -532,15 +539,19 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
         self.summary = summary
         self.turn = turn
         self.wokeBy = wokeBy
+        self.buttons = buttons
         self._at = FlexibleDate(wrappedValue: at)
     }
 
-    private enum Keys: String, CodingKey { case seq, role, text, origin, toolKind, summary, turn, wokeBy, at }
+    private enum Keys: String, CodingKey { case seq, role, text, origin, toolKind, summary, turn, wokeBy, buttons, at }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         // Convex numbers are float64, so seq comes back as 12.0.
-        seq = Int(try c.decode(Double.self, forKey: .seq))
+        guard let seq = try c.decode(Double.self, forKey: .seq).wholeCount() else {
+            throw DecodingError.dataCorruptedError(forKey: .seq, in: c, debugDescription: "Not a seq")
+        }
+        self.seq = seq
         role = try c.decode(Role.self, forKey: .role)
         text = try c.decode(String.self, forKey: .text)
         origin = try c.decodeIfPresent(String.self, forKey: .origin)
@@ -548,6 +559,7 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
         summary = (try? c.decodeIfPresent(Bool.self, forKey: .summary)).flatMap { $0 } ?? false
         turn = try? c.decodeIfPresent(String.self, forKey: .turn)
         wokeBy = (try? c.decodeIfPresent([WokeTask].self, forKey: .wokeBy)).flatMap { $0 }
+        buttons = (try? c.decodeIfPresent([MessageButton].self, forKey: .buttons)).flatMap { $0 }
         _at = try c.decode(FlexibleDate.self, forKey: .at)
     }
 
@@ -561,6 +573,7 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
         if summary { try c.encode(true, forKey: .summary) }
         try c.encodeIfPresent(turn, forKey: .turn)
         try c.encodeIfPresent(wokeBy, forKey: .wokeBy)
+        try c.encodeIfPresent(buttons, forKey: .buttons)
         try c.encode(_at, forKey: .at)
     }
 }
@@ -724,13 +737,22 @@ public struct PhoneRunner: Codable, Sendable, Hashable, Identifiable {
     public var version: String?
     @FlexibleDate public var lastSeenAt: Date
     public var draining: Bool?
+    /// In the order Mike set (backend API 56), so it can be a new thread's
+    /// automatic choice. A runner he hasn't placed (with no order, every one
+    /// but the main Mac) is only ever picked by hand.
+    public var placed: Bool?
+    /// The main Mac (backend API 56): heartbeating with the owner key. A new
+    /// thread waits for it when none of the placed runners is online.
+    public var main: Bool?
 
-    public init(runnerId: String, name: String, version: String? = nil, lastSeenAt: Date, draining: Bool? = nil) {
+    public init(runnerId: String, name: String, version: String? = nil, lastSeenAt: Date, draining: Bool? = nil, placed: Bool? = nil, main: Bool? = nil) {
         self.runnerId = runnerId
         self.name = name
         self.version = version
         self._lastSeenAt = FlexibleDate(wrappedValue: lastSeenAt)
         self.draining = draining
+        self.placed = placed
+        self.main = main
     }
 
     /// The runner writes a heartbeat every 60 s; three missed is offline.
@@ -745,10 +767,15 @@ public struct PhoneIdentity: Codable, Sendable, Hashable {
     /// The backend's API version (convex/version.ts). Missing from backends
     /// deployed before there was one.
     public var apiVersion: Int?
-    public init(name: String, expiresAt: Date?, apiVersion: Int? = nil) {
+    /// The backend can't send notifications (a self-hosted one, which the
+    /// push relay doesn't reach: docs/self-hosting.md). Missing means it can.
+    public var pushOff: Bool?
+    public var sendsNotifications: Bool { pushOff != true }
+    public init(name: String, expiresAt: Date?, apiVersion: Int? = nil, pushOff: Bool? = nil) {
         self.name = name
         self._expiresAt = OptionalFlexibleDate(wrappedValue: expiresAt)
         self.apiVersion = apiVersion
+        self.pushOff = pushOff
     }
 }
 
@@ -813,6 +840,14 @@ public enum BackendCompatibility {
     /// From 43 phone:threadsSince: the inbox's changes rather than the whole
     /// list for every row written.
     public static let threadChangesAPIVersion = 43
+    /// From 56 runners have an order (phone:setRunnerOrder) and phone:runners
+    /// lists them in it, so the new thread sheet can offer a runner, starting
+    /// on the first one online. Older backends get no runner picker.
+    public static let runnerOrderAPIVersion = 56
+    /// From 57 phone:waiting lists a thread's messages its runner hasn't
+    /// taken yet, and phone:cancel takes one back. Older backends have
+    /// neither, so the phone only shows a line for the last one it sent.
+    public static let waitingSendsAPIVersion = 57
 
     /// The line to show, or nil when the backend is fine.
     public static func problem(_ identity: PhoneIdentity) -> String? {
@@ -852,8 +887,8 @@ public struct PhoneCounts: Codable, Sendable, Hashable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
-        hibernating = Int((try? c.decodeIfPresent(Double.self, forKey: .hibernating)).flatMap { $0 } ?? 0)
-        den = Int((try? c.decodeIfPresent(Double.self, forKey: .den)).flatMap { $0 } ?? 0)
+        hibernating = (try? c.decodeIfPresent(Double.self, forKey: .hibernating)).flatMap { $0 }?.wholeCount() ?? 0
+        den = (try? c.decodeIfPresent(Double.self, forKey: .den)).flatMap { $0 }?.wholeCount() ?? 0
     }
 
     public func encode(to encoder: Encoder) throws {

@@ -9,6 +9,7 @@ import path from 'node:path';
 import { defaultHome, readToken, runnerUrl, type Config } from './config.ts';
 import { RunnerClient, RpcClientError } from './client.ts';
 import { ErrorCode, type Account, type ImageRef, type PersistedEvent, type RunnerDefaults, type ThreadSummary } from './protocol.ts';
+import { pushFailingText } from './push-failing.ts';
 import type { RestartResult, RunnerStatus } from './restart.ts';
 import type { UpstreamStatus } from './upstream.ts';
 
@@ -267,8 +268,10 @@ export async function runDev(client: RunnerClient, cmd: string, args: string[], 
       // The same guards tb approve, delete and interrupt apply: a thread's
       // own cards are Mike's to answer, and it can't stop itself.
       const own = env.THREADBEAR_THREAD_ID && (params as { threadId?: unknown }).threadId === env.THREADBEAR_THREAD_ID;
-      if (own && ['approvals.respond', 'threads.delete', 'threads.interrupt'].includes(args[0])) {
-        console.error(args[0] === 'approvals.respond' ? "That's this thread's own card; the user answers it." : `Not on the thread this runs in (${args[0]}).`);
+      // A plan's Go ahead is one of its cards too: approving its own plan
+      // would take the thread out of Plan first by itself.
+      if (own && ['approvals.respond', 'plans.approve', 'threads.delete', 'threads.interrupt'].includes(args[0])) {
+        console.error(args[0] === 'approvals.respond' || args[0] === 'plans.approve' ? "That's this thread's own card; the user answers it." : `Not on the thread this runs in (${args[0]}).`);
         return 1;
       }
       // Snoozing or archiving releases the CLI, ending this turn: tb snooze
@@ -445,8 +448,10 @@ export function formatStatus(s: RunnerStatus, threads: ThreadSummary[], now: num
   const u = s.update;
   if (u) lines.push(formatUpdate(u, now));
   if (s.upstream && (s.upstream.state !== 'off' || s.upstream.published)) lines.push(formatUpstream(s.upstream, now).split('\n')[0]);
+  // A held release is the one thing here that wants doing something about.
+  if (s.upstream?.held) lines.push(heldLine(s.upstream.held));
   if (s.sync) lines.push(formatSync(s.sync, now));
-  if (s.sync?.scrub) lines.push(...formatSecrets(s.sync.scrub, s.secretCheck, now));
+  if (s.sync?.scrub) lines.push(...formatSecrets(s.sync.scrub, s.secretCheck, now, s.sync.full));
   // Releases never touch the LaunchAgent (launch.mjs, the plist, Threadbear
   // Runner.app); only Mike's install-runner.sh does.
   if (u?.launcherChanged) lines.push(`${u.launcherReason ?? 'launch.mjs on main differs from the installed one.'} The user runs ${u.checkout ? `${u.checkout}/runner/` : 'runner/'}scripts/install-runner.sh once nothing is busy.`);
@@ -465,18 +470,29 @@ function formatSync(y: NonNullable<RunnerStatus['sync']>, now: number): string {
   const behind = y.backend && y.backend.apiVersion < y.backend.expected ? `; its backend is older than this runner (API ${y.backend.apiVersion}, wants ${y.backend.expected}): deploy it with runner/scripts/deploy-backend.mjs` : '';
   const held = y.schedulesHeld ? `; ${y.schedulesHeld} schedule${y.schedulesHeld === 1 ? '' : 's'} too big (or taken) for this runner's key, so its schedules stay in schedules.json on this Mac (tb logs says which)` : '';
   const rotating = y.ownerKeyRotating ? '; RUNNER_KEY_NEXT is still set, so two main keys work: finish with tb runner rotate-owner --finish' : '';
-  return `Convex mirror: on${where} as ${y.name ?? y.runnerId ?? 'this runner'}${last}${pending}${behind}${held}${rotating}`;
+  // A self-hosted backend can't send phone notifications (docs/self-hosting.md).
+  const push = y.pushOff ? "\nPhone notifications: off, as this backend can't send them (a self-hosted backend can't use the push relay)." : y.pushFailing ? `\n${pushFailingText(y.pushFailing)}` : '';
+  const f = y.full;
+  const full = f
+    ? f.backendTooOld
+      ? '\nFull sync: on, but the backend is too old to take tool output yet.'
+      : `\nFull sync: on: ${plural(f.bodies, 'tool', 'tools')} (${Math.round(f.bytes / 1024)} KB) sent since this runner started, ${f.withheld} held back as they can hold secrets${f.unsent ? `, ${f.unsent} not sent` : ''}${f.pending ? `, ${f.pending} waiting` : ''}.`
+    : '';
+  return `Convex mirror: on${where} as ${y.name ?? y.runnerId ?? 'this runner'}${last}${pending}${behind}${held}${rotating}${push}${full}`;
 }
 
 // What stands between this runner's threads and the Convex deployment
 // (src/scrub.ts), said plainly: docs/on-your-mac.md has the longer version.
-export function formatSecrets(y: NonNullable<NonNullable<RunnerStatus['sync']>['scrub']>, c: RunnerStatus['secretCheck'], now: number): string[] {
+export function formatSecrets(y: NonNullable<NonNullable<RunnerStatus['sync']>['scrub']>, c: RunnerStatus['secretCheck'], now: number, full?: NonNullable<RunnerStatus['sync']>['full']): string[] {
   const backend = y.backendChecks === false ? "; its backend is too old to check again" : y.backendChecks ? '; the backend checks again' : '';
-  const lines = [`Secrets: rules v${y.rulesVersion} and ${plural(y.knownValues, 'known value', 'known values')} on everything sent to Convex${backend}. Tool output stays here, with a withhold list ready for when it doesn't. Not a guarantee: rotate any key that leaks.`];
+  const lines = [`Secrets: rules v${y.rulesVersion} and ${plural(y.knownValues, 'known value', 'known values')} on everything sent to Convex${backend}. ${full ? 'Tool output goes up too, after those and a withhold list' : 'Tool output stays here, with a withhold list ready for when it does not'}. Not a guarantee: rotate any key that leaks.`];
   if (y.foldersUnread) lines.push(`Secrets: ${plural(y.foldersUnread, 'thread folder', 'thread folders')} didn't answer, so values in their .env files aren't known; only the rules cover those.`);
   if (y.failed) lines.push(`Secrets: the check failed on ${plural(y.failed, 'string', 'strings')}, held back rather than sent${y.lastFailure ? ` (${y.lastFailure})` : ''}.`);
   if (!c || c.state === 'off' || c.state === 'unsupported') {
     lines.push(`On-device secret check: ${c?.state === 'unsupported' ? 'none on this machine' : 'off'}, so this runner relies on the rules and the withhold list.`);
+  } else if (c.state === 'starting') {
+    // Its first look comes a few minutes after a start, with its counts kept from before.
+    lines.push(`On-device secret check: on, silently, and waiting for its first run since this runner started: ${c.flaggedText} of ${c.checkedText} tool outputs and ${c.flaggedImages} of ${c.checkedImages} pictures flagged so far.`);
   } else if (c.state === 'unavailable') {
     lines.push(`On-device secret check: unavailable${c.reason ? ` (${c.reason})` : ''}, so this runner relies on the rules and the withhold list.`);
   } else {
@@ -507,11 +523,17 @@ function formatUpdate(u: NonNullable<RunnerStatus['update']>, now: number): stri
   }
 }
 
+// Mike's runner, when GitHub's checks keep main's tip from being today's
+// release (upstream.ts ciVerdict).
+function heldLine(h: { commit: string; why: string }): string {
+  return `Today's release is waiting: ${h.why} (${h.commit.slice(0, 8)})`;
+}
+
 // Mike's releases (src/upstream.ts): a line, then what's in a release
 // main doesn't have yet.
 export function formatUpstream(u: UpstreamStatus, now: number): string {
   const checked = u.checkedAt ? `, checked ${duration(now - Date.parse(u.checkedAt))} ago` : '';
-  const published = u.published ? `\nLast release tagged here: ${u.published.tag}` : '';
+  const published = (u.published ? `\nLast release tagged here: ${u.published.tag}` : '') + (u.held ? `\n${heldLine(u.held)}` : '');
   const r = u.release;
   switch (u.state) {
     case 'off':
@@ -525,8 +547,11 @@ export function formatUpstream(u: UpstreamStatus, now: number): string {
       const more = r.changes > r.subjects.length ? `\n  … and ${r.changes - r.subjects.length} more` : '';
       return [
         `Mike's releases: ${r.tag} has ${r.changes} change${r.changes === 1 ? '' : 's'} this copy's main doesn't${checked}`,
+        // Mike's plain-words notes first, when his runner wrote some.
+        ...(r.notes ?? []).flatMap((n) => [`  What changed in ${n.tag}:`, ...n.lines.map((l) => `    ${l}`)]),
+        ...(r.notes?.length ? ['  Every change:'] : []),
         ...r.subjects.map((x) => `  ${x}`),
-      ].join('\n') + more + `\nTo bring it in, follow docs/bringing-in-updates.md (or Bring them in, in the app's Updates panel).`;
+      ].join('\n') + more + `\nIts commit, signed with the pinned key: ${r.commit}. To bring it in, follow docs/bringing-in-updates.md and merge that commit (git merge ${r.commit}), or use Bring them in, in the app's Updates panel.`;
     }
     default:
       return `Mike's releases: up to date${r ? ` with ${r.tag}` : ''}${u.reason ? ` (${u.reason})` : ''}${checked}${published}`;
@@ -534,7 +559,7 @@ export function formatUpstream(u: UpstreamStatus, now: number): string {
 }
 
 function access(t: ThreadSummary): string {
-  return t.permissionMode === 'ask' ? 'asks before edits' : t.permissionMode === 'auto' ? 'auto' : 'full access';
+  return t.permissionMode === 'ask' ? 'asks before edits' : t.permissionMode === 'auto' ? 'auto' : t.permissionMode === 'plan' ? 'plan first' : 'full access';
 }
 
 // tb models: one row per model, the default starred, with its effort
@@ -696,6 +721,13 @@ export function formatThread(t: ThreadSummary, events: PersistedEvent[], opts: {
       case 'plan.updated':
         lines.push('  Plan:');
         for (const x of e.entries) lines.push(`    [${x.status === 'completed' ? 'x' : x.status === 'in_progress' ? '>' : ' '}] ${x.text}`);
+        break;
+      case 'plan.proposed':
+        lines.push('  Plan, waiting for approval:');
+        for (const l of e.text.split('\n')) lines.push(`    ${l}`);
+        break;
+      case 'plan.resolved':
+        lines.push(e.decision === 'go' ? '  (plan approved)' : '  (plan sent back)');
         break;
       case 'turn.started':
         break;

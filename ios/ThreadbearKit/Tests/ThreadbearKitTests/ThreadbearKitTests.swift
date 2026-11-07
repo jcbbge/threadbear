@@ -405,6 +405,26 @@ import UniformTypeIdentifiers
         #expect(Pairing.parse(pairing.link) == pairing)
     }
 
+    /// A self-hosted backend on the tailnet (docs/self-hosting.md): its port
+    /// is kept, and anything else in the URL turns the link down.
+    @Test func pairsWithATailnetBackend() throws {
+        let url = URL(string: "threadbear://pair?url=https%3A%2F%2FMac.tail9ef766.ts.net%3A3210&token=tb_abc")!
+        let pairing = try #require(Pairing.parse(url))
+        #expect(pairing.deploymentURL.absoluteString == "https://mac.tail9ef766.ts.net:3210")
+        #expect(Pairing.parse(pairing.link) == pairing)
+        for bad in ["http://mac.tail9ef766.ts.net:3210", "https://user@mac.tail9ef766.ts.net:3210", "https://mac.tail9ef766.ts.net:3210/api", "https://mac.tail9ef766.ts.net:3210?x=1", "https://ts.net", "https://evil.ts.net.example.com", "https://tail9ef766.ts.net"] {
+            let link = URL(string: "threadbear://pair?url=\(bad.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!)&token=t")!
+            #expect(Pairing.parse(link) == nil, "\(bad)")
+        }
+    }
+
+    /// An older backend leaves pushOff out, and that means it can send.
+    @Test func onlyABackendThatSaysSoCantNotify() {
+        #expect(PhoneIdentity(name: "p", expiresAt: nil).sendsNotifications)
+        #expect(PhoneIdentity(name: "p", expiresAt: nil, pushOff: false).sendsNotifications)
+        #expect(!PhoneIdentity(name: "p", expiresAt: nil, pushOff: true).sendsNotifications)
+    }
+
     @Test func siteURLBecomesCloud() throws {
         let url = URL(string: "threadbear://pair?url=https://happy-bear-123.convex.site&token=t")!
         #expect(try #require(Pairing.parse(url)).deploymentURL.host() == "happy-bear-123.convex.cloud")
@@ -673,4 +693,18 @@ private func properties(of data: Data) -> [CFString: Any] {
     #expect(PhoneMessage(seq: 3, role: .user, text: "Ship it", at: at).agentHeader == nil)
     #expect(PhoneMessage(seq: 4, role: .user, text: move.text, origin: "schedule", at: at).agentHeader == nil)
     #expect(PhoneMessage(seq: 5, role: .assistant, text: move.text, at: at).agentHeader == nil)
+}
+
+@Test func aHibernatingRowSaysWhatItWaitsFor() throws {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    var t = PhoneThread(threadId: "t", title: "Plan", lastActivityAt: now, snoozedUntil: now.addingTimeInterval(86_400))
+    #expect(InboxSections.wakeLine(t, now: now) == nil)
+    t.wakeNote = "\"Convex I/O\" finishes"
+    #expect(InboxSections.wakeLine(t, now: now) == "Until \"Convex I/O\" finishes")
+    // From the backend's JSON, and gone once it's awake again.
+    let json = #"{"threadId":"t","runnerId":"mac","title":"Plan","cwd":"~","accountId":"a","provider":"claude","status":"idle","needsYou":false,"unread":false,"preview":"","lastActivityAt":"2026-11-05T00:00:00Z","snoozedUntilRestart":true,"wakeNote":"the runner updates","view":"hibernating"}"#
+    let decoded = try JSONDecoder().decode(PhoneThread.self, from: Data(json.utf8))
+    #expect(InboxSections.wakeLine(decoded, now: now) == "Until the runner updates")
+    t.snoozedUntil = nil
+    #expect(InboxSections.wakeLine(t, now: now) == nil)
 }

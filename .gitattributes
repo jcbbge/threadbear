@@ -1,0 +1,3 @@
+# Made from runner/src/experiments/*.md, one line per entry: two threads
+# adding an experiment at once both keep theirs (runner/src/experiment-docs.ts).
+docs/experiments.md merge=union

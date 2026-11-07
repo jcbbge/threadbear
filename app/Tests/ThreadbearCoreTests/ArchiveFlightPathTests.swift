@@ -60,4 +60,69 @@ final class ArchiveFlightPathTests: XCTestCase {
         XCTAssertLessThan(ArchiveFlightPath.progress(atTime: 0.1), 0.1)
         XCTAssertGreaterThan(ArchiveFlightPath.progress(atTime: 0.9), 0.9)
     }
+
+    // MARK: Hibernate, the same flight tucked in
+
+    private var tuck: ArchiveFlightPath {
+        ArchiveFlightPath(start: path.start, end: path.end, swing: 16, style: .tuck)
+    }
+
+    func testTuckStartsAsThePanelAndEndsOnTheMoon() {
+        let first = tuck.frame(at: 0)
+        XCTAssertEqual(first.position, path.start)
+        XCTAssertEqual(first.scale, 1)
+        XCTAssertEqual(first.opacity, 1)
+        XCTAssertEqual(first.dimming, 0)
+        let last = tuck.frame(at: 1)
+        XCTAssertEqual(last.position.x, path.end.x, accuracy: 1e-9)
+        XCTAssertEqual(last.position.y, path.end.y, accuracy: 1e-9)
+        XCTAssertEqual(last.scale, ArchiveFlightPath.smallest, accuracy: 1e-9)
+    }
+
+    /// No tilt anywhere: it's put to bed, not dropped.
+    func testTuckStaysLevel() {
+        for p in stride(from: 0.0, through: 1.0, by: 0.05) {
+            XCTAssertEqual(tuck.frame(at: p).tilt, 0)
+        }
+    }
+
+    /// The lights go down from the start and all the way, where the drop
+    /// stays bright until it's nearly there. About 40% just before it lands.
+    func testTuckDimsAllTheWayDown() {
+        let frames = stride(from: 0.0, through: 1.0, by: 0.05).map { tuck.frame(at: $0) }
+        for (a, b) in zip(frames, frames.dropFirst()) {
+            XCTAssertLessThan(b.opacity, a.opacity)
+            XCTAssertGreaterThan(b.dimming, a.dimming)
+        }
+        XCTAssertEqual(tuck.frame(at: 0.9).opacity, 0.4, accuracy: 1e-9)
+        XCTAssertLessThan(tuck.frame(at: 0.5).opacity, path.frame(at: 0.5).opacity)
+        XCTAssertEqual(path.frame(at: 0.5).dimming, 0, "the drop doesn't dim")
+    }
+
+    /// Nearly straight down first, then easing across: a smaller swing than
+    /// the drop's, so at the same point it's strayed less from the start's
+    /// line.
+    func testTuckSinksBeforeItEasesAcross() {
+        let early = tuck.frame(at: 0.2).position
+        XCTAssertGreaterThan(early.x, path.frame(at: 0.2).position.x)
+        XCTAssertLessThan(early.y, path.start.y)
+    }
+
+    func testTuckShrinksLaterThanTheDrop() {
+        XCTAssertGreaterThan(tuck.frame(at: 0.3).scale, path.frame(at: 0.3).scale)
+    }
+
+    func testTuckOffTheListGoesOutCompletely() {
+        let off = ArchiveFlightPath(start: path.start, end: path.end, swing: 16, onHeading: false, style: .tuck)
+        XCTAssertEqual(off.frame(at: 1).opacity, 0, accuracy: 1e-9)
+        XCTAssertEqual(tuck.frame(at: 1).opacity, 0.1, accuracy: 1e-9)
+    }
+
+    /// A sine, softer through the middle than the drop's cubic.
+    func testTuckProgressIsASine() {
+        XCTAssertEqual(ArchiveFlightPath.progress(atTime: 0, style: .tuck), 0, accuracy: 1e-9)
+        XCTAssertEqual(ArchiveFlightPath.progress(atTime: 0.5, style: .tuck), 0.5, accuracy: 1e-9)
+        XCTAssertEqual(ArchiveFlightPath.progress(atTime: 1, style: .tuck), 1, accuracy: 1e-9)
+        XCTAssertLessThan(ArchiveFlightPath.progress(atTime: 0.6, style: .tuck), ArchiveFlightPath.progress(atTime: 0.6))
+    }
 }

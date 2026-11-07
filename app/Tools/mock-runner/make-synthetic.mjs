@@ -141,6 +141,7 @@ function demoThread() {
     permissionMode: 'ask', status: 'waiting', live: true, needsYou: true,
     createdAt: minutes(96), updatedAt: minutes(1), lastActivityAt: minutes(1),
     preview: 'Here it is after a forced quit at about two thirds.', lastSeq: seq, lastSeenSeq: seq - 4, costUsd: 0.44,
+    contextTokens: 642_300, contextWindow: 1_000_000,
   };
   writeFixture(dir, summary, events);
 }

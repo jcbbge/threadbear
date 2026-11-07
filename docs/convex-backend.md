@@ -342,7 +342,7 @@ dashboard panel.
 
 - `convex/schema.ts`: `runners`, `threads`, `messages`, `commands`,
   `projects`, `schedules`, `accounts`, `tokens`, `devices`, `runnerKeys`,
-  `threadTombstones` (docs/protocol.md, "Runner keys").
+  `threadTombstones`, `runnerLogins` (docs/protocol.md, "Runner keys").
 - `convex/sync.ts`: the runner's mutations (`upsertThreads`,
   `removeThreads`, `prune`, `heartbeat`, `bye`, `appendMessages`,
   `setProjects`, `upsertProjects`, `setSchedules`, `setAccounts`, `takeCommand`,
@@ -380,8 +380,11 @@ dashboard panel.
   through the push relay (`docs/push-relay.md`), and registers with it
   once, proving it's this deployment through `/relay/verify` in
   `convex/http.ts` and the `relayChecks` table. Env on both deployments: `APNS_KEY_P8`, `APNS_KEY_ID`,
-  `APNS_TEAM_ID` (Poddle's, copied 28 Oct) and `APNS_TOPIC`
-  (`com.mikecann.threadbear`). `npx convex run push:test '{"body":"hi"}'
+  `APNS_TEAM_ID` (Poddle's key, copied 28 Oct and again on 6 Nov 2026
+  after Poddle's old key was revoked) and `APNS_TOPIC`
+  (`com.mikecann.threadbear`). Each send's outcome goes in the
+  `pushHealth` row (`convex/pushHealth.ts`); while none get through, the
+  owner runner's heartbeat answers `pushFailing` and `tb status` says so. `npx convex run push:test '{"body":"hi"}'
   --prod` sends a test; `npx convex run devices:list --prod` shows the
   phones.
 - `convex/tokens.ts`: the token helpers, and `issue`, `revoke`, `list` to
@@ -485,12 +488,23 @@ function takes `token` (a phone token from `tokens:issue`) and throws
 
 Queries:
 
-- `phone:me({ token })` → `{ name, expiresAt }`.
+- `phone:me({ token })` → `{ name, expiresAt, apiVersion, pushOff? }`.
+  `pushOff` is true when this backend can't send notifications (a
+  self-hosted one, docs/self-hosting.md); the phone's Settings says so in
+  place of the Notify me picker.
 - `phone:runners({ token })` → `[{ runnerId, name, version, lastSeenAt,
   draining }]`. Offline is `lastSeenAt` older than 3 minutes (a runner
   that stopped for good has `lastSeenAt` of 1970).
   Since API 45 also `release?, startedAt?, threadCount?, pressure?`
   (`memory` or `disk` while one's running low).
+  Since API 56 in Mike's order (`phone:setRunnerOrder`): the runners he's
+  placed as he placed them, then the rest, the main Mac first and the others
+  in the order they first heartbeated (never by thread count, which a
+  runner says of itself), with `placed: true` on the ones in the saved order
+  and `main: true` on the main Mac (owner key, no runner key of its own).
+  The phone's automatic pick is the first placed one online, else the main
+  Mac, else none (it sends no `runnerId`), so a runner key's Mac is only
+  picked for Mike once he's placed it.
 - `phone:wakes({ token })` (API 45) → `[{ scheduleId, threadId?, nextRunAt? }]`,
   a small row per active schedule, from `scheduleWakes`: what a sidebar needs
   all the time. `phone:schedules` costs about 150 KB and re-runs on every claim
@@ -529,7 +543,9 @@ Queries:
   oldest message the phone has is newer than that, there's more to load.
 - `phone:messages({ token, threadId, beforeSeq?, limit?, tools? })` (since
   API 2, 28 Oct) → `{ messages, hasMore }`, oldest first: the newest `limit`
-  (default 50, at most 2000) or the `limit` before `beforeSeq`. Every message
+  (default 50, at most 2000; NaN or an infinity is refused, here and in every
+  `limit`) or the `limit` before `beforeSeq`. Without `tools` it looks past at
+  most 4,000 tool rows for the page's text ones, then says `hasMore`. Every message
   is kept since API 2, and with `tools: true` there's one row per tool call
   too (`role: "tool"`, a one-line `text` such as "Run the unit tests" or
   "Edited ~/dev/x.ts", and `toolKind`). It reads Convex alone, so it works
@@ -551,6 +567,15 @@ Queries:
   from that seq on, for a client passing `noImages: true` to `phone:messages`.
 - `phone:command({ token, commandId })` → `{ state: "pending" | "taken" |
   "done" | "failed", note?, threadId? }`.
+- `phone:waiting({ token, threadId })` (API 57) → the thread's `send`
+  commands not yet finished, oldest first: `{ commandId, state: "pending" |
+  "taken", text, photos, createdAt }`. The phone shows each as a faded
+  message under the transcript, so several sent while the runner is asleep
+  don't look lost.
+- `phone:cancel({ token, commandId })` (API 57) → `true` if the send was
+  still pending and is now `failed` with note "Cancelled" (its photos
+  deleted), `false` once the runner has taken it. `sync:takeCommand` checks
+  `pending` in its own transaction, so only one of the two wins.
 
 Since API 16, `phone:search({ token, text })` returns up to 30 archived
 thread rows whose title or last reply has those words (Convex full-text
@@ -572,9 +597,18 @@ sidebar does; a runner before API 5 sends projects without `icon`.
 Mutations, each returning a `commandId`. The owning runner takes it
 within a second or two while it's online (state `taken`, then `done` or
 `failed` with a `note`); while it's offline the command waits as
-`pending`:
+`pending`, for up to 14 days (then `failed`, `sync:pruneFiles`). At most
+200 commands, or 8 MB of them, wait for one runner; past that the next is
+refused with `{ kind: "tooMany" }` until it takes some. A `runnerId` the
+phone names must be one that has heartbeated (or `"any"`), else
+`{ kind: "notFound" }`:
 
 - `phone:send({ token, threadId, text, answers? })` (`answers`, API 14: the card's asks it answers, `{ action, answer }[]`)
+- `phone:press({ token, threadId, buttonId })` (API 59) → commandId: a
+  reply button's press (docs/protocol.md, "Reply buttons"), queued as a
+  `press` command with `{ buttonId }`. Its `resultThreadId` is the thread
+  the button started or messaged. `phone:messages` rows carry `buttons`,
+  the state of the buttons an assistant message links, since API 59.
 - `phone:respond({ token, threadId, approvalId, decision: "allow" |
   "allowAlways" | "deny", message? })`
 - `phone:answer({ token, threadId, approvalId, answers: Record<string,
@@ -590,8 +624,15 @@ within a second or two while it's online (state `taken`, then `done` or
 - `phone:update({ token, threadId, change })` where `change` is one of
   `{ snooze: { until?, untilRestart? } }`, `{ wake: true }`, `{ archive:
   true }`, `{ unarchive: true }`, `{ markSeen: true }`, `{ title }`.
+- `phone:setRunnerOrder({ token, runnerIds })` (API 56): Mike's order for
+  his runners, from the phone's Settings (or the Mac's, through its runner:
+  `sync:runnerOrder` and `sync:setRunnerOrder`, API 58, the owner key only), at most 50 ids, kept in the one
+  `runnerOrder` row. The phone's new thread sheet offers a runner, starting
+  on the first one online in it.
 - `phone:create({ token, text, runnerId?, cwd?, accountId?, model? })`.
-  With no `runnerId`, of the runners heartbeating with the owner key
+  With no `runnerId`, the first runner online and not draining in Mike's
+  order (API 56); with no order, or none of it online, of the runners
+  heartbeating with the owner key
   (`byOwner`) seen in the last 3 minutes, the one with the most threads (the
   Mac Mike works on), or `"any"`, which only the owner key takes, so it waits
   for that Mac (docs/protocol.md, "Runner keys").
@@ -609,7 +650,11 @@ within a second or two while it's online (state `taken`, then `done` or
   after a day, so the phone should ask again rather than expect them to
   stay.
 - `phone:registerDevice({ token, apnsToken, environment: "sandbox" |
-  "production" })`. A push arrives when a thread starts needing Mike,
+  "production" })`. `apnsToken` is the device token in hex. A phone token
+  keeps at most 5 registrations; a new one past that replaces its oldest.
+  Revoking a token takes effect in that one small write (its phones get no
+  more pushes at once, `devices:targets`); their rows are deleted after, 100
+  a run (`tokens:dropDevices`). A push arrives when a thread starts needing Mike,
   as `{ aps: { alert: { title, body }, sound: "default", "thread-id":
   threadId }, threadId }` for bundle id `com.mikecann.threadbear`; the
   title is the thread's title and the body the question, the approval
@@ -649,6 +694,17 @@ first. The lessons are Agent Archive's:
   exports, and the keys had been to the AI providers already. So the docs say to
   rotate, and never that the data is secret-free.
 
+- **Scrub before cutting.** Titles, previews, ask lines, the wake note, tool
+  titles, quoted replies and check output are cut short on the runner, and a
+  rule that needs a secret's end (a connection URL's `@`, a closing quote, a
+  length) misses half of one: on 6 Nov Daybreak found a wake note cut through
+  `postgres://alice:password@host` with the password intact. So a cut never
+  lands inside anything the scrub would take out (`runner/src/safe-cut.ts`,
+  with the runner's known values too); it moves back to before it, leaving the
+  runner's own copy unscrubbed. Taking a first line, a first sentence or the
+  last part of something counts as a cut too. The wake note is scrubbed whole
+  on the way up and only then cut.
+
 Not scrubbed, on purpose: a command's words while it's on its way (a message from
 the phone or another Mac has to reach the runner as typed). Once a command is over,
 however it ended, its words are dropped from the row rather than scrubbed, so a
@@ -670,6 +726,16 @@ of tool outputs and 8% of screenshots, so it counts first. If it's ever trusted,
 it may only hold things back, never clear them: tool output is untrusted and can
 tell the model to answer "clean". Linux has no such model, so a Linux runner has
 the rules and the withhold list, and `tb status` says so.
+
+## Full sync (API 52, 6 Nov 2026)
+
+Tool output, input and diffs for a runner with `sync.full` on (docs/full-convex.md
+step 4; docs/protocol.md "Sync" has the fields). Convex charges a read for the whole
+document, so they're in `eventBodies`, not `messages`: no list ever reads one, and
+each is fetched once, by seq, when someone opens that tool. Writes are the cost, plus
+reading each row again to delete it after 30 days (`pruneBodies`), so about twice what
+comes up. Bumping the rules re-sends nothing; `scrub-stored.mjs` covers this table,
+but it's the one table where a run over everything costs real I/O.
 
 ## The Pocket (API 19)
 
@@ -892,7 +958,20 @@ Measured after API 48 landed (20 minutes of prod logs, 5 Nov, late at night with
 almost no client open, so not comparable with the samples above): `phone:projects`
 37 KB a run, `sync:schedulesSince` one whole read at 178 KB and then little,
 `sync:sharedUsage` still 12 KB a run and the biggest at 78 runs, and about 184 MB/day
-overall. A full day's rate is still to come.
+overall. A full day's rate is still to come. On 6 Nov `sync:sharedUsage` became a
+query every 5 minutes instead of a subscription (each runner's watch re-ran on
+every other runner's login write): 12 runs an hour per runner, about 14 MB a day
+for four runners whatever they write.
+
+Then, API 50 (6 Nov). The daily check's 15-minute samples had
+`sync:upsertProjects` at 55 KB a call, 11 to 16 calls a quarter hour while
+threads were busy: each `update_project` (or a project's thread count moving)
+rewrote the whole row, and 16 KB of the Threadbear project's 17.7 KB is notes,
+so each was about 34 KB read and 17 KB written. Notes now live in
+`projectNotes` (`convex/projectNotes.ts`) and a runner of 50 sends them only
+when they change, so a state update writes the small row alone. An older row's
+notes move out the first time it's written; `phone:project` reads either.
+`phone:projectSearch` and `setProjectIcon` read the smaller rows too.
 
 An estimate for one Mac with the app open, 300 threads, 15 turns and half an
 hour of phone use a day: about 6 MB a day, 185 MB a month, under a fifth of the

@@ -57,6 +57,16 @@ export class Scrubber {
   // split in two and each half missed. A failed check gives back nothing to send.
   safeText = (text: string): string => scrubDoc(text, this.text, (e) => this.noteFailure(e));
 
+  // For what must not go at all if its check fails: counted, then thrown on.
+  strict = (text: string): string => {
+    try {
+      return this.text(text);
+    } catch (e) {
+      this.noteFailure(e);
+      throw e;
+    }
+  };
+
   private noteFailure(e: unknown): void {
     this.failed++;
     // Its name only: an error's message can quote what it was looking at.

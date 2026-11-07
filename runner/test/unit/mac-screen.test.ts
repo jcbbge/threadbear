@@ -191,6 +191,7 @@ test('granting Full Disk Access keeps the thread while a dialog it told of is st
   await look();
   assert.match(notes(id).at(-1)!, /has Full Disk Access/);
   assert.equal(noticeThreads()[0]?.id, id, 'the dialog still needs answering');
+  assert.equal(noticeThreads()[0]?.needsYou, true, 'and it stays in Needs you');
   probe.count = 0;
   await look();
   assert.deepEqual(noticeThreads(), [], 'and goes with it');
@@ -260,4 +261,24 @@ test('parseDialogCount reads what osascript prints', () => {
   assert.equal(parseDialogCount('0\n'), 0);
   assert.equal(parseDialogCount(''), undefined);
   assert.equal(parseDialogCount('error'), undefined);
+});
+
+test("a dialog going while the access can't be told keeps the access notice", async () => {
+  const { probe, look, noticeThreads, notes } = setUp();
+  // Codex's review, 6 Nov 2026: a look that couldn't tell (an odd error
+  // opening TCC.db) isn't a grant, so it mustn't archive the access note,
+  // which is never said again once it's been said.
+  probe.app = false;
+  probe.access = false;
+  await look();
+  const id = noticeThreads()[0].id;
+  probe.count = 1;
+  await look();
+  await look(TELL_AFTER_MS);
+  probe.access = undefined;
+  probe.count = 0;
+  await look();
+  assert.match(notes(id).at(-1)!, /has gone/);
+  assert.equal(noticeThreads()[0]?.id, id);
+  assert.equal(noticeThreads()[0]?.needsYou, true);
 });

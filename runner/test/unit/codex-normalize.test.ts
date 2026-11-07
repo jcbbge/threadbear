@@ -529,6 +529,16 @@ test('plan updates: steps and statuses, a new explanation noted', () => {
   assert.deepEqual(evs.filter((x) => x.type === 'system.note').map((x) => x.text), ['Doing it in two steps']);
 });
 
+test("plan mode's proposed plan is a plan card; a subagent's isn't", () => {
+  const n = new CodexNormalizer(env().ctx);
+  const outs = [
+    ...n.handle('item/started', { item: { type: 'plan', id: 'p1', text: '' } }),
+    ...n.handle('item/completed', { item: { type: 'plan', id: 'p1', text: '1. Read\n2. Write\n' } }),
+  ];
+  assert.deepEqual(outs.filter((o) => o.kind === 'planProposed'), [{ kind: 'planProposed', itemId: 'p1', text: '1. Read\n2. Write' }]);
+  assert.equal(events(outs).length, 0);
+});
+
 test('an unknown item type shows as a plain row, closed with its text', () => {
   const n = new CodexNormalizer(env().ctx);
   const outs = [
@@ -668,6 +678,8 @@ test('the sanitiser rewrites temp folders, swaps base64, drops the account id, a
   assert.ok(leaks('{"x":"acct-1234567"}', ['acct-1234567'], []).length);
   assert.ok(leaks(`{"x":"${'QUJD'.repeat(600)}"}`, [], []).length);
   assert.ok(leaks('{"host":"Bobs-Mac"}', [], ['bobs-mac']).length);
+  assert.ok(leaks('{"x":"/home/vision/a"}', [], ['vision']).length);
+  assert.deepEqual(leaks('{"revision":"r1"}', [], ['vision']), []);
 });
 
 test('the committed Codex fixtures hold nothing private', () => {

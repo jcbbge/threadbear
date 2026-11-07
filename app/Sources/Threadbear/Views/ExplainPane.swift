@@ -19,7 +19,7 @@ struct ExplainPane: View {
                         VStack(alignment: .leading, spacing: zoomed(14)) {
                             SelectionQuote(text: session.selection)
                             ForEach(Array(session.turns.enumerated()), id: \.offset) { index, turn in
-                                TurnView(turn: turn) { app.retryExplainer(turn: index, in: thread.id) }
+                                TurnView(turn: turn, threadId: thread.id) { app.retryExplainer(turn: index, in: thread.id) }
                                     .id(index)
                             }
                         }
@@ -92,6 +92,8 @@ private struct SelectionQuote: View {
 
 private struct TurnView: View {
     let turn: ExplainTurn
+    /// The thread beside it, whose file links are that thread's to fetch.
+    let threadId: String
     let retry: () -> Void
 
     var body: some View {
@@ -103,6 +105,7 @@ private struct TurnView: View {
             }
             if let answer = turn.answer {
                 Text(Self.markdown(answer))
+                    .environment(\.openURL, OpenGate.urlAction(files: .thread(threadId)))
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             } else if let error = turn.error {

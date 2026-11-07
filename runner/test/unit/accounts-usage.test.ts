@@ -296,6 +296,11 @@ test("Claude's rate_limit_event becomes a limits reading the store keeps", () =>
     windows: [{ kind: 'weekly_model', title: 'Weekly Opus', remainingPercent: 10, resetsAt: new Date(1793250000_000).toISOString() }],
     blocked: false,
   });
+  // Fable's own week, which the CLI calls the overage-included window.
+  assert.deepEqual(
+    rateLimitReading({ status: 'allowed', unifiedWindows: { seven_day: { utilization: 0.2, resetsAt: 1793250000 }, seven_day_overage_included: { utilization: 0.35, resetsAt: 1793250000 } } })?.windows.map((w) => [w.kind, w.title, w.remainingPercent]),
+    [['weekly', 'Weekly', 80], ['weekly_model', 'Weekly Fable', 65]],
+  );
   assert.deepEqual(rateLimitReading({ status: 'allowed', rateLimitType: 'overage' }), { windows: [], blocked: false });
   assert.equal(rateLimitReading(undefined), undefined);
 });

@@ -651,7 +651,7 @@ private struct TourCard: View {
                 // squeezed Back to "Ba…").
                 if let doc = step.doc, let url = URL(string: "\(Tour.docsSite)/\(doc)") {
                     // The detail the card leaves out, on the website.
-                    Button { NSWorkspace.shared.open(url) } label: {
+                    Button { OpenGate.openOwn(url) } label: {
                         Image(systemName: "info.circle")
                     }
                     .buttonStyle(.plain)

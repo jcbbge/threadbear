@@ -8,6 +8,7 @@ import type { AdapterOutput, AgentWrite, SubagentUpdate, TurnResult } from '../t
 import type { NormalizerContext } from '../context.ts';
 import { EDIT_TOOLS, PlanTracker, computeEditDiff, toolKind, toolTitle, truncateInput } from '../../tools.ts';
 import { diffLines } from '../../diff.ts';
+import { safeEnd } from '../../safe-cut.ts';
 
 // The file helpers moved to ../context.ts so the Codex normaliser shares
 // them; re-exported for the callers and tests that import them from here.
@@ -55,6 +56,8 @@ export class ClaudeNormalizer {
   private authFailed = false; // this turn's login was refused (signed out, or its session ran out)
   private afterCompact = false;
   private agentTasks = new Set<string>(); // task ids that are sub-agents
+  private model?: string; // the session's model, from init
+  private contextNow?: number; // tokens in the context at the last model call
 
   constructor(ctx: NormalizerContext) {
     this.ctx = ctx;
@@ -136,6 +139,7 @@ export class ClaudeNormalizer {
     if (typeof msg.subtype === 'string' && msg.subtype.startsWith('task_')) this.subagentTask(msg, out);
     if (msg.subtype === 'init' && typeof msg.session_id === 'string') {
       out.push({ kind: 'session', nativeSessionId: msg.session_id, model: msg.model });
+      if (typeof msg.model === 'string') this.model = msg.model;
       // The version of the CLI running this session, so CLI updates know
       // which versions are in use (the runner notes a change).
       if (typeof msg.claude_code_version === 'string' && msg.claude_code_version) out.push({ kind: 'cliVersion', version: msg.claude_code_version });
@@ -149,7 +153,7 @@ export class ClaudeNormalizer {
       // and the note says why.
       const text = typeof msg.summary === 'string' && msg.summary.trim() ? oneLineNote(msg.summary) : 'A background task finished.';
       if (this.turn === 'none') this.pendingNote = this.pendingNote ? `${this.pendingNote}\n${text}` : text;
-      else out.push({ kind: 'event', event: { type: 'system.note', text } });
+      else out.push({ kind: 'event', event: { type: 'system.note', text, wake: true } });
     } else if (msg.subtype === 'background_tasks_changed' && Array.isArray(msg.tasks)) {
       const tasks = (msg.tasks as AnyMsg[])
         .filter((t) => !t.ambient && typeof t.task_id === 'string')
@@ -244,7 +248,10 @@ export class ClaudeNormalizer {
       }
       case 'message_delta': {
         const tokens = contextTokens(ev.usage);
-        if (tokens !== undefined) out.push({ kind: 'context', contextTokens: tokens });
+        if (tokens !== undefined) {
+          this.contextNow = tokens;
+          out.push({ kind: 'context', contextTokens: tokens });
+        }
         break;
       }
       default:
@@ -500,6 +507,10 @@ export class ClaudeNormalizer {
     }
     this.limitRejected = false;
     this.authFailed = false;
+    // Only the result says how big the model's window is (modelUsage), so
+    // a client can show how full the context is.
+    const window = contextWindowOf(msg.modelUsage, this.model);
+    if (window !== undefined && this.contextNow !== undefined) out.push({ kind: 'context', contextTokens: this.contextNow, contextWindow: window });
     out.push({ kind: 'result', result });
   }
 }
@@ -527,6 +538,10 @@ const RATE_LIMIT_WINDOWS: Record<string, { kind: UsageWindow['kind']; title: str
   seven_day: { kind: 'weekly', title: 'Weekly' },
   seven_day_opus: { kind: 'weekly_model', title: 'Weekly Opus' },
   seven_day_sonnet: { kind: 'weekly_model', title: 'Weekly Sonnet' },
+  // Fable's own week. The CLI calls it the "overage-included" window and
+  // names it "Fable limit" (Claude Code 2.1.318); titled as Token Stats
+  // titles it, so the two readings merge into one window.
+  seven_day_overage_included: { kind: 'weekly_model', title: 'Weekly Fable' },
 };
 
 function usageWindow(type: string, utilization: unknown, resetsAt: unknown): UsageWindow | undefined {
@@ -540,7 +555,8 @@ function usageWindow(type: string, utilization: unknown, resetsAt: unknown): Usa
 }
 
 // A rate_limit_event's rate_limit_info as a reading. The CLI sends
-// unifiedWindows (five_hour and seven_day) though sdk.d.ts doesn't list
+// unifiedWindows (five_hour, seven_day and, for logins that have it,
+// seven_day_overage_included) though sdk.d.ts doesn't list
 // it; without it, the documented single rateLimitType and utilization.
 export function rateLimitReading(info: AnyMsg | undefined): { windows: UsageWindow[]; blocked: boolean } | undefined {
   if (!info || typeof info !== 'object') return undefined;
@@ -559,6 +575,19 @@ export function rateLimitReading(info: AnyMsg | undefined): { windows: UsageWind
   const blocked = info.status === 'rejected';
   if (!windows.length && typeof info.status !== 'string') return undefined;
   return { windows, blocked };
+}
+
+// The session model's window from a result's modelUsage, keyed by model
+// name. Other models the turn used (a sub-agent, a title) have entries
+// too, so it's the session model's entry, matched without a "[1m]"-style
+// suffix on either side, or the only entry there is.
+function contextWindowOf(modelUsage: unknown, model: string | undefined): number | undefined {
+  if (!modelUsage || typeof modelUsage !== 'object') return undefined;
+  const entries = Object.entries(modelUsage as Record<string, AnyMsg>).filter(([, u]) => typeof u?.contextWindow === 'number' && u.contextWindow > 0);
+  const bare = (name: string) => name.replace(/\[.*\]$/, '');
+  const own = model ? entries.find(([k]) => k === model) ?? entries.find(([k]) => bare(k) === bare(model)) : undefined;
+  if (own) return own[1].contextWindow as number;
+  return entries.length === 1 ? (entries[0][1].contextWindow as number) : undefined;
 }
 
 function contextTokens(usage: AnyMsg | undefined): number | undefined {
@@ -580,7 +609,8 @@ function truncateText(text: string, itemId: string, ctx: NormalizerContext): { t
   } catch {
     blobPath = undefined;
   }
-  const cut = cutUtf8(text, LIMITS.toolResultText);
+  const bytesCut = cutUtf8(text, LIMITS.toolResultText);
+  const cut = bytesCut.slice(0, safeEnd(text, bytesCut.length));
   return blobPath ? { text: cut, truncated: true, blobPath } : { text: cut, truncated: true };
 }
 
@@ -603,15 +633,19 @@ export function cutUtf8(text: string, max: number): string {
 // the file by the time the runner looks (a command run straight after may
 // have changed it). Undefined when it can't be rebuilt (no originalFile,
 // text that has moved): then nothing is trusted, and a patch waits for
-// Mike as one written any other way does.
+// Mike as one written any other way does. `base`: an edit's originalFile's
+// hash, as the rest of the file is that and not the agent's (F21); null
+// for a Write, or an edit of a file that was missing or empty.
 export function wroteFromResult(name: string, input: Record<string, unknown>, tur: AnyMsg | undefined): AgentWrite | undefined {
   const file = (typeof tur?.filePath === 'string' && tur.filePath) || (typeof input.file_path === 'string' ? input.file_path : '');
   if (!file) return undefined;
   let after: string | null = null;
+  let base: string | null = null;
   if (name === 'Write') {
     after = typeof tur?.content === 'string' ? tur.content : typeof input.content === 'string' ? input.content : null;
   } else {
     let text: string | null = typeof tur?.originalFile === 'string' ? tur.originalFile : tur?.originalFile === null ? '' : null;
+    if (text) base = sha256Of(text);
     const edits =
       name === 'MultiEdit'
         ? Array.isArray(input.edits)
@@ -626,7 +660,11 @@ export function wroteFromResult(name: string, input: Record<string, unknown>, tu
     after = text;
   }
   if (after === null) return undefined;
-  return { path: file, sha256: crypto.createHash('sha256').update(Buffer.from(after, 'utf8')).digest('hex') };
+  return { path: file, sha256: sha256Of(after), base };
+}
+
+function sha256Of(text: string): string {
+  return crypto.createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
 }
 
 // One edit as Claude Code's Edit applies it: an empty old_string makes a

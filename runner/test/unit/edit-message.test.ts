@@ -205,3 +205,27 @@ test('an edit while background work runs refuses until told to stop it', async (
   assert.ok(log(h, thread.id).some((e) => e.type === 'system.note' && /Upload the video/.test(e.text)));
   assert.ok(log(h, thread.id).some((e) => e.type === 'thread.rewound'));
 });
+
+test('an edit into a slash command the runner answers: messages sent meanwhile still go, and the cut waits for the CLI', async () => {
+  const h = makeHarness();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const { thread, s, seq } = await twoTurns(h, async () => {
+    await gate;
+    return { resumeAt: 'entry-1' };
+  });
+  s.text('a2', 'Done.');
+  s.result();
+  await tick();
+  const editing = h.runner.editMessage(thread.id, seq, '/model opus');
+  await tick();
+  h.runner.send(thread.id, 'sent during the edit');
+  release();
+  await editing;
+  await tick();
+  const next = h.adapter.last;
+  assert.equal(h.runner.get(thread.id).model, 'opus');
+  // The message sent meanwhile started a CLI, cut at the edit.
+  assert.equal(next.sent.at(-1)?.text, 'sent during the edit');
+  assert.equal(next.opts.resumeAt, 'entry-1');
+});

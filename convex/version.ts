@@ -216,4 +216,60 @@
 //    none and is told about everyone's, as before. sync:schedules reads only a
 //    runner key's own rows. sync:schedulesSince is the table once and then only
 //    the rows written since; an older runner goes on using sync:schedules.
-export const API_VERSION = 48;
+// 49: a thread row can carry wakeNote, what a hibernating thread waits for when
+//    it's more than a time ("\"Convex I/O\" finishes", "the runner updates"), for
+//    the phone's and the website's rows. An older runner sends none.
+// 50: a project's notes live in projectNotes, apart from its row, and
+//    sync:upsertProjects takes a project without `notes` when they haven't
+//    changed. A Convex write costs the whole document, and notes were most of
+//    a project's, so each state update rewrote them. A runner sends `notes`
+//    only to a backend of 50 or later; an older runner always sends them, as
+//    before. phone:project still returns them whole.
+// 51: an owned schedule can carry `check`, a shell command its runner runs
+//    before each run (experiment scheduleChecks). An older runner sends none.
+// 52: full sync (docs/full-convex.md step 4). eventBodies, sync:appendBodies,
+//    sync:remoteBody and phone:eventBody: a tool's output, input and diffs under
+//    the seq of its row, only from a runner with sync.full on. heldPictures,
+//    phone:requestPicture, phone:heldPicture and a `picture` command: one tool
+//    picture uploaded for a day when it's tapped. An older runner fails a picture
+//    command as unknown, and an older phone never asks for any of it.
+// 53: sync:sharedUsage goes by who wrote each reading. A runner key gets only
+//    the owner key's readings, of the logins the owner has listed for its
+//    runner (runnerLogins, sync:setRunnerLogins and sync:runnerLogins, owner
+//    key only), with no runnerId, marked `byOwnerKey`; nobody gets a runner
+//    key's readings, the owner included. A runner key's account readings are
+//    stored read no later than now. sync:pools gives a runner key no member
+//    named by another runner's id. An older runner takes the rows it's given
+//    as before.
+// 54: a runner key's archived threads stay in threadIndex (within its cap,
+//    archived rows giving way first), so the main Mac's Archived list has
+//    other machines' archived threads and can open and unarchive them
+//    (docs/protocol.md, "Other runners' threads"). A runner sends the
+//    archived rows an older backend dropped once, on first hearing 54.
+// 55: an owned schedule can carry `checkTimeoutSecs`, how long its check may
+//    take (60 s without). An older runner sends none.
+// 56: runners have an order Mike sets on the phone (runnerOrder,
+//    phone:setRunnerOrder). phone:runners lists them in it, and a new thread
+//    or quick ask that names no runner goes to the first one online in it
+//    before falling back to the main Mac as before. An older phone gets the
+//    list in that order and still sends no runner.
+// 57: phone:waiting, a thread's sends its runner hasn't applied yet, and
+//    phone:cancel, which takes back one still pending. An older phone
+//    never asks for either.
+// 58: sync:runnerOrder and sync:setRunnerOrder, the main Mac's key only:
+//    the same runner order the phone sets (API 56), for the Mac's Settings >
+//    Runners. An older runner sends the Mac no order, and its Settings list
+//    the runners as before.
+// 59: reply buttons (docs/protocol.md, "Reply buttons"). A message row can
+//    carry `buttons`, the state of the buttons its text links ([title](button:<id>)),
+//    which the runner sends again when one is pressed (appendMessages patches
+//    just them); phone:messages returns them, and phone:press queues a `press`
+//    command with { buttonId }. An older runner sends none and fails a press
+//    as unknown; an older phone shows the link as text.
+// 60: sync:sharedThreads, the ids of a runner's rows shared by link, which a
+//    runner checks against its own threads on every start and every hour,
+//    removing ones it deleted and rewriting ones it stopped sharing. And a
+//    runner key can't save a schedule under an id gone from another runner
+//    within the day (scheduleGone). An older runner never asks, and does
+//    as before.
+export const API_VERSION = 60;

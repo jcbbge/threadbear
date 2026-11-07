@@ -22,7 +22,7 @@ export const slugify = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replac
  * body. `required` is the slugs something outside the site links to.
  */
 export function readGuide(repoRoot, required = []) {
-  const text = readFileSync(join(repoRoot, "docs", "guide.md"), "utf8").replace(/\r\n/g, "\n");
+  const text = withExperiments(repoRoot, readFileSync(join(repoRoot, "docs", "guide.md"), "utf8").replace(/\r\n/g, "\n"));
   const [head, ...rest] = text.split(/^(?=## )/m);
   const title = head.match(/^# (.+)$/m)?.[1].trim() ?? "Docs";
   const intro = head.replace(/^# .+$/m, "");
@@ -42,6 +42,20 @@ export function readGuide(repoRoot, required = []) {
     if (!seen.has(slug)) throw new Error(`docs/guide.md has no section with the slug ${slug}, and the app links to /docs/${slug} (site/app-doc-slugs.json)`);
   }
   return { title, intro, sections };
+}
+
+/**
+ * The guide points at docs/experiments.md for the experiments there are now (it's made from
+ * runner/src/experiments/*.md, so it can't fall out of date). The site shows the list itself
+ * in its place, as the guide's relative link means nothing here.
+ */
+function withExperiments(repoRoot, guide) {
+  const region = /<!-- experiments:start -->[\s\S]*?<!-- experiments:end -->/;
+  if (!region.test(guide)) return guide;
+  const doc = readFileSync(join(repoRoot, "docs", "experiments.md"), "utf8").replace(/\r\n/g, "\n");
+  const list = doc.match(/<!-- list:start -->\n([\s\S]*?)<!-- list:end -->/)?.[1].trim();
+  if (!list) throw new Error("docs/experiments.md has no list between its list:start and list:end markers");
+  return guide.replace(region, () => list);
 }
 
 /**

@@ -17,4 +17,19 @@ struct CardMentionsTests {
         #expect(found.map(\.title) == ["Fix the chip"])
         #expect(found.first?.isThread == true)
     }
+
+    @Test func aPastedThreadIdGoesInAsALink() {
+        let known: Set = ["0cf430ac-f429-4b1e-9d8a-1c2b3d4e5f60"]
+        let id = "0cf430ac-f429-4b1e-9d8a-1c2b3d4e5f60"
+        #expect(CardMentions.pastedThreadId("  \(id)\n", known: known.contains) == id)
+        #expect(CardMentions.pastedThreadId("thread:\(id)", known: known.contains) == id)
+        #expect(CardMentions.pastedThreadId(id.uppercased(), known: known.contains) == id)
+        // Not one of his threads, or not only an id: the words as they are.
+        #expect(CardMentions.pastedThreadId("11111111-2222-3333-4444-555555555555", known: known.contains) == nil)
+        #expect(CardMentions.pastedThreadId("see \(id)", known: known.contains) == nil)
+        let link = CardMentions.threadReference(id: id, title: "Fix [the] chip")
+        #expect(link == "[Fix \\[the\\] chip](thread:\(id))")
+        #expect(CardMentions.find(in: link).first?.title == "Fix [the] chip")
+        #expect(CardMentions.threadReference(id: id, title: "") == "[Thread](thread:\(id))")
+    }
 }

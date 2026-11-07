@@ -33,7 +33,10 @@ public struct ReviewAnswer: Sendable, Hashable {
             if first == "Picked none of them." {
                 lines.append(Line(label: title, text: "None of them"))
                 paragraphs = paragraphs.dropFirst()
-            } else if let picked = first.firstMatch(of: /^Picked (.+?)\. (.+?)\.?$/) {
+            // The id can't run past the first ". " (and below, the first
+            // " ("): the plain lazy `.+?` tried every one of them with all
+            // that came after, quadratic on a long line. Same matches.
+            } else if let picked = first.firstMatch(of: /^Picked (.(?:(?!\. ).)*?)\. (.+?)\.?$/) {
                 let id = String(picked.1)
                 lines.append(Line(label: title, text: "Picked \(id): \(bare(String(picked.2), id: id))"))
                 paragraphs = paragraphs.dropFirst()
@@ -51,7 +54,7 @@ public struct ReviewAnswer: Sendable, Hashable {
             if paragraph.hasPrefix("Notes on ") || notes.isEmpty { notes.append(paragraph) } else { notes[notes.count - 1] += "\n\n" + paragraph }
         }
         for part in notes {
-            guard let note = part.firstMatch(of: /^Notes on (.+?) \((.+?)\): ([\s\S]+)$/) else { return nil }
+            guard let note = part.firstMatch(of: /^Notes on (.(?:(?! \().)*?) \((.+?)\): ([\s\S]+)$/) else { return nil }
             let id = String(note.1)
             // With nothing picked, the review's title goes over the first note.
             lines.append(Line(label: (lines.isEmpty ? title + "\n" : "") + "Notes on \(id): \(bare(String(note.2), id: id))", text: String(note.3)))

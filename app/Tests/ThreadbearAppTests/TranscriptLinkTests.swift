@@ -168,6 +168,40 @@ final class TranscriptPathRefTests: XCTestCase {
         view.clicked(onLink: url, at: at)
         XCTAssertEqual(opened, "app/Sources/A.swift")
     }
+
+    /// `[plan](shorts-plan/candidates.md)` went to AppKit as a scheme-less
+    /// URL and Finder said "can't be opened. -50" (6 Nov).
+    func testRelativeMarkdownLinkIsAPathRef() throws {
+        let cases = [
+            "[candidates.md](shorts-plan/candidates.md)": "shorts-plan/candidates.md",
+            "[clip](exports/series-examples/example-no-project-picker.mp4)": "exports/series-examples/example-no-project-picker.mp4",
+            "[launch](exports/Threadbear%20Launch.mp4)": "exports/Threadbear Launch.mp4",
+            "[launch](<exports/Threadbear Launch.mp4>)": "exports/Threadbear Launch.mp4",
+            "[up](../notes.md)": "../notes.md",
+            "[page](site/grow.html?clean#top)": "site/grow.html?clean#top",
+        ]
+        for (markdown, path) in cases {
+            let url = try link(markdown)
+            XCTAssertEqual(FilePathRefs.text(of: url), path, markdown)
+        }
+        XCTAssertNil(MarkdownRenderer.render("[below](#usage)").string.attribute(.link, at: 0, effectiveRange: nil))
+        XCTAssertEqual(try link("[mail](mailto:a@b.co)").scheme, "mailto")
+
+        let view = TranscriptTextView()
+        let delegate = LinkDelegate()
+        view.delegate = delegate
+        var opened: [String] = []
+        view.openPathRef = { opened.append($0); return true }
+        view.clicked(onLink: try link("[c](shorts-plan/candidates.md)"), at: 0)
+        // One with no scheme that got here some other way doesn't reach AppKit either.
+        view.clicked(onLink: try XCTUnwrap(URL(string: "shorts-plan/a%20b.md")), at: 0)
+        XCTAssertEqual(opened, ["shorts-plan/candidates.md", "shorts-plan/a b.md"])
+        XCTAssertNil(delegate.clicked)
+    }
+
+    private func link(_ markdown: String) throws -> URL {
+        try XCTUnwrap(MarkdownRenderer.render(markdown).string.attribute(.link, at: 0, effectiveRange: nil) as? URL)
+    }
 }
 
 @MainActor

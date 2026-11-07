@@ -2,7 +2,7 @@ import AppKit
 import ThreadbearCore
 
 enum SettingsTab: String, Hashable, CaseIterable {
-    case general, models, pools, runners, devices
+    case general, voice, models, pools, runners, devices, keyboard
 }
 
 /// The Settings window's side of AppModel. Everything in it is the
@@ -57,6 +57,7 @@ extension AppModel {
             if let v = update.followMain { shown.followMain = v }
             if let v = update.bulletReplies { shown.bulletReplies = v }
             if let v = update.oneReply { shown.oneReply = v }
+            if let v = update.bringIn { shown.bringIn = v }
             if let v = update.pool { shown.models.pool = v }
             if let v = update.privateFolders { shown.models.privateFolders = v }
             runnerSettings = shown

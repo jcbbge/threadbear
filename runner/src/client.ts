@@ -1,5 +1,6 @@
 // Small JSON-RPC client for the runner, used by the tb CLI and the tests.
 import { WebSocket } from 'ws';
+import { awakeTimeout } from './awake-timer.ts';
 import { answerChallenge, loopbackPort, RunnerNotProvedError, type AuthServer } from './rpc-auth.ts';
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
@@ -63,12 +64,13 @@ export class RunnerClient {
       }
       const fail = (e: Error) => {
         this.proving = undefined;
-        clearTimeout(timer);
+        timer.clear();
         reject(e);
         this.ws.close();
       };
-      const timer = setTimeout(() => fail(new RunnerNotProvedError("The runner didn't prove itself in time.")), opts.authTimeoutMs ?? AUTH_TIMEOUT_MS);
-      timer.unref();
+      // Counts only time this process was awake: a starved tb (or test)
+      // would otherwise give up with the proof already in the socket.
+      const timer = awakeTimeout(opts.authTimeoutMs ?? AUTH_TIMEOUT_MS, () => fail(new RunnerNotProvedError("The runner didn't prove itself in time.")));
       let check: ((result: unknown) => boolean) | undefined;
       this.proving = (msg) => {
         if (!check) {
@@ -86,7 +88,7 @@ export class RunnerClient {
         if (msg.error) return fail(new RpcClientError(msg.error.code, msg.error.message));
         if (!check(msg.result)) return fail(new RunnerNotProvedError("The runner's proof was wrong, so it isn't the runner."));
         this.proving = undefined;
-        clearTimeout(timer);
+        timer.clear();
         resolve();
       };
     });

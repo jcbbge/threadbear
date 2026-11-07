@@ -8,6 +8,7 @@ import path from 'node:path';
 import type { PersistedEvent } from './protocol.ts';
 import { absolute } from './highlights.ts';
 import { sniffImage, sniffVideo } from './media.ts';
+import { isSpace, seeker } from './linear-text.ts';
 
 // A picture bigger than this stays on the Mac.
 export const SHARE_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -57,14 +58,92 @@ export function localImagePath(src: string, home = os.homedir(), typeOf = imageT
 }
 
 // ![alt](src) and ![alt](<src> "title"), as CommonMark writes them.
-const MARKDOWN_IMAGE = /!\[[^\]]*\]\(\s*(?:<([^>\n]+)>|([^)\s]+))(?:\s+"[^"]*")?\s*\)/g;
-
 export function markdownImages(text: string, home = os.homedir(), typeOf = imageType): { src: string; path: string }[] {
   const out: { src: string; path: string }[] = [];
-  for (const m of text.matchAll(MARKDOWN_IMAGE)) {
-    const src = (m[1] ?? m[2])!;
+  const seen = new Set<string>();
+  for (const src of markdownImageSources(text)) {
+    // Each src looked up once: a reply can name the same one thousands of times.
+    if (seen.has(src)) continue;
+    seen.add(src);
     const p = localImagePath(src, home, typeOf);
-    if (p && !out.some((x) => x.src === src)) out.push({ src, path: p });
+    if (p) out.push({ src, path: p });
+  }
+  return out;
+}
+
+// The src of each image, as
+// `/!\[[^\]]*\]\(\s*(?:<([^>\n]+)>|([^)\s]+))(?:\s+"[^"]*")?\s*\)/g` finds
+// them, in time linear in the text. That regex started again at every "!["
+// and scanned ahead from it, so a model's reply of "![" over and over took
+// the square of its length; here every scan ahead is remembered (seeker)
+// and every "]" tried once, as all that follows an image's "]" depends on
+// where that "]" is.
+export function markdownImageSources(text: string): string[] {
+  const out: string[] = [];
+  const n = text.length;
+  const skipSpace = (i: number) => {
+    while (i < n && isSpace(text[i])) i++;
+    return i;
+  };
+  const closeBracket = seeker(text, (c) => c === ']');
+  const angleEnd = seeker(text, (c) => c === '>' || c === '\n');
+  const bareEnd = seeker(text, (c) => c === ')' || isSpace(c));
+  // What may follow a src, which ends just before `at`: a "title" after
+  // some whitespace, then ")". Where the image ends, or -1. One per kind of
+  // src, so each one's scans only ever move forward, and several "!["
+  // whose src ends at the same place ask once.
+  const after = () => {
+    const quoteEnd = seeker(text, (c) => c === '"');
+    let lastAt = -1;
+    let lastEnd = -1;
+    return (at: number): number => {
+      if (at === lastAt) return lastEnd;
+      lastAt = at;
+      return (lastEnd = imageEnd(at));
+    };
+    function imageEnd(at: number): number {
+      const w = skipSpace(at);
+      if (w > at && text[w] === '"') {
+        const q = quoteEnd(w + 1);
+        const c = q < 0 ? -1 : skipSpace(q + 1);
+        if (c >= 0 && text[c] === ')') return c + 1;
+      }
+      return text[w] === ')' ? w + 1 : -1;
+    }
+  };
+  const afterAngle = after();
+  const afterBare = after();
+  let failedAt = -1;
+  for (let p = text.indexOf('!['); p >= 0; ) {
+    const q = closeBracket(p + 2);
+    if (q < 0) break; // no "]" after this "![", nor after any later one
+    let end = -1;
+    let src = '';
+    if (q !== failedAt && text[q + 1] === '(') {
+      const j = skipSpace(q + 2);
+      if (text[j] === '<') {
+        const g = angleEnd(j + 1);
+        if (g > j + 1 && text[g] === '>') {
+          end = afterAngle(g + 1);
+          src = text.slice(j + 1, g);
+        }
+      }
+      if (end < 0) {
+        const e = bareEnd(j);
+        const stop = e < 0 ? n : e;
+        if (stop > j) {
+          end = afterBare(stop);
+          src = text.slice(j, stop);
+        }
+      }
+    }
+    if (end < 0) {
+      failedAt = q;
+      p = text.indexOf('![', p + 1);
+    } else {
+      out.push(src);
+      p = text.indexOf('![', end);
+    }
   }
   return out;
 }
@@ -159,7 +238,9 @@ export function readShareImage(file: string, mediaDir: string | undefined): { by
     } catch {
       return { skip: 'the file is gone' };
     }
-    if (!open.isFile() || open.ino !== atReal.ino || open.dev !== atReal.dev) return { skip: "it can't be read" };
+    // Against what was looked at first too: a folder on the way swapped for a link
+    // after that would otherwise agree with itself.
+    if (!open.isFile() || open.ino !== atReal.ino || open.dev !== atReal.dev || open.ino !== st.ino || open.dev !== st.dev) return { skip: "it can't be read" };
     if (open.size > SHARE_IMAGE_BYTES) return { skip: `it's ${Math.round(open.size / 1024 / 1024)} MB` };
     const bytes = Buffer.alloc(open.size);
     let got = 0;

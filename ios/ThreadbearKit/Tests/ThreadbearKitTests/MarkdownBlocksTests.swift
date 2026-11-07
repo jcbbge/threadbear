@@ -33,6 +33,129 @@ import Testing
         #expect(MarkdownBlock.parse("A [link](/a.png) isn't one") == [.paragraph("A [link](/a.png) isn't one")])
     }
 
+    @Test func mermaidAndHTMLFencesAreRichBlocks() {
+        #expect(MarkdownBlock.parse("```mermaid\nflowchart TD\n  A --> B\n```") == [.rich(kind: .mermaid, source: "flowchart TD\n  A --> B")])
+        #expect(MarkdownBlock.parse("~~~ HTML title=x\n<b>hi</b>\n~~~") == [.rich(kind: .html, source: "<b>hi</b>")])
+        #expect(MarkdownBlock.parse("```Mermaid\npie\n```") == [.rich(kind: .mermaid, source: "pie")])
+        // Anything else, or a word that only starts the same, stays code.
+        #expect(MarkdownBlock.parse("```swift\nlet a = 1\n```") == [.code("let a = 1")])
+        #expect(MarkdownBlock.parse("```htmlx\n<b>\n```") == [.code("<b>")])
+        #expect(MarkdownBlock.parse("```\nmermaid\n```") == [.code("mermaid")])
+    }
+
+    @Test func slackEmailAndDraftFencesAreDrafts() {
+        // Every line kept, blank ones too: none of it is joined up.
+        #expect(MarkdownBlock.parse("Here it is:\n\n```slack\n*Update*\n• one\n• two\n\nThanks\n```\nSend it?") == [
+            .paragraph("Here it is:"),
+            .draft(DraftBlock(kind: .slack, source: "*Update*\n• one\n• two\n\nThanks")),
+            .paragraph("Send it?"),
+        ])
+        #expect(MarkdownBlock.parse("~~~Email to=x\nHi,\nBye\n~~~") == [.draft(DraftBlock(kind: .email, source: "Hi,\nBye"))])
+        #expect(MarkdownBlock.parse("```draft\nhi\n```") == [.draft(DraftBlock(kind: .draft, source: "hi"))])
+        // Still streaming in, empty, or only starting the same: code.
+        #expect(MarkdownBlock.parse("```slack\n*Update*\n• one") == [.code("*Update*\n• one")])
+        #expect(MarkdownBlock.parse("```slack\n\n```") == [.code("")])
+        #expect(MarkdownBlock.parse("```slackbot\nhi\n```") == [.code("hi")])
+    }
+
+    @Test func aDraftNeedsItsOwnClosingFence() {
+        // Only a fence on its own closes it, at any indent.
+        #expect(MarkdownBlock.parse("```slack\nhello\n> ```") == [.code("hello\n> ```")])
+        #expect(MarkdownBlock.parse("```slack\nhello\n   ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("```slack\nhello\n    ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("```slack\nhello\n``` x") == [.code("hello\n``` x")])
+        // A fence opening on a list item's own line: the block, in the item.
+        #expect(MarkdownBlock.parse("- ```slack\n  hello\n  ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("- Run:\n1. ```sh\n   tb land\n   ```") == [
+            .listItem(text: "Run:", marker: "•", depth: 0, task: nil), .code("tb land"),
+        ])
+        // A different fence character, or a shorter run, doesn't close it.
+        #expect(MarkdownBlock.parse("```slack\nhello\n~~~") == [.code("hello\n~~~")])
+        #expect(MarkdownBlock.parse("````slack\nhello\n```") == [.code("hello\n```")])
+        #expect(MarkdownBlock.parse("````slack\nhello\n````") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("```slack\r\nhi\r\nthere\r\n```\r\n") == [.draft(DraftBlock(kind: .slack, source: "hi\nthere"))])
+        #expect(MarkdownBlock.parse("> ```slack\n> hello\n> ```") == [.quote([.draft(DraftBlock(kind: .slack, source: "hello"))])])
+        // Too big to be a message: code.
+        let big = String(repeating: "a", count: DraftBlock.maxSource + 1)
+        #expect(MarkdownBlock.parse("```slack\n\(big)\n```") == [.code(big)])
+    }
+
+    // Cross-lab review, round three (6 Nov).
+    @Test func backticksAfterABacktickFenceMakeItWords() {
+        #expect(MarkdownBlock.parse("- ```literal```\n- next") == [
+            .listItem(text: "```literal```", marker: "•", depth: 0, task: nil),
+            .listItem(text: "next", marker: "•", depth: 0, task: nil),
+        ])
+        #expect(MarkdownBlock.parse("```a``` b\nnext") == [.paragraph("```a``` b next")])
+        // A tilde fence's info string may have backticks.
+        #expect(MarkdownBlock.parse("~~~slack `x`\nhi\n~~~") == [.draft(DraftBlock(kind: .slack, source: "hi"))])
+    }
+
+    @Test func aClosingFenceClosesAtAnyIndent() {
+        #expect(MarkdownBlock.parse("   ```slack\n   hello\n    ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("  ```slack\n  hello\n```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("- ```slack\n  hello\n```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("- ```slack\n  hello\n     ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("- Steps:\n\n  ```slack\n  hello\n  ```") == [
+            .listItem(text: "Steps:", marker: "•", depth: 0, task: nil),
+            .draft(DraftBlock(kind: .slack, source: "hello")),
+        ])
+        #expect(MarkdownBlock.parse("- a\n  - b\n\n    ```\n    code\n    ```") == [
+            .listItem(text: "a", marker: "•", depth: 0, task: nil),
+            .listItem(text: "b", marker: "•", depth: 1, task: nil),
+            .code("code"),
+        ])
+        // Round four: a reply's words after the block stay words, under a
+        // nested list or after a heading that ended one.
+        #expect(MarkdownBlock.parse("- root\n  - middle\n    - child\n\n    ```swift\n    let x = 1\n    ```\n\nAfter.") == [
+            .listItem(text: "root", marker: "•", depth: 0, task: nil),
+            .listItem(text: "middle", marker: "•", depth: 1, task: nil),
+            .listItem(text: "child", marker: "•", depth: 2, task: nil),
+            .code("let x = 1"),
+            .paragraph("After."),
+        ])
+        #expect(MarkdownBlock.parse("- item\n\n# Heading\n\n  ```swift\n  let x = 1\n```\n\nAfter.") == [
+            .listItem(text: "item", marker: "•", depth: 0, task: nil),
+            .heading(level: 1, text: "Heading"),
+            .code("let x = 1"),
+            .paragraph("After."),
+        ])
+    }
+
+    @Test func aFencedItemKeepsTheListsDepths() {
+        #expect(MarkdownBlock.parse("- ```sh\n  echo hi\n  ```\n  - child\n- sibling") == [
+            .code("echo hi"),
+            .listItem(text: "child", marker: "•", depth: 1, task: nil),
+            .listItem(text: "sibling", marker: "•", depth: 0, task: nil),
+        ])
+    }
+
+    @Test func ordinaryListsAndCodeAreAsBefore() {
+        #expect(MarkdownBlock.parse("- one\n  - two\n- three") == [
+            .listItem(text: "one", marker: "•", depth: 0, task: nil),
+            .listItem(text: "two", marker: "•", depth: 1, task: nil),
+            .listItem(text: "three", marker: "•", depth: 0, task: nil),
+        ])
+        #expect(MarkdownBlock.parse("```swift\nlet a = 1\n```\nafter") == [.code("let a = 1"), .paragraph("after")])
+        #expect(MarkdownBlock.parse("````\n```\ninner\n```\n````") == [.code("```\ninner\n```")])
+        #expect(MarkdownBlock.parse("Use `a` and ``b``") == [.paragraph("Use `a` and ``b``")])
+    }
+
+    @Test func aFenceStillStreamingInOrTooBigStaysCode() {
+        // The reply so far, its fence not closed yet: drawn once it is.
+        #expect(MarkdownBlock.parse("```mermaid\nflowchart TD\n  A -->") == [.code("flowchart TD\n  A -->")])
+        let big = String(repeating: "a", count: MarkdownBlock.maxRichSource + 1)
+        #expect(MarkdownBlock.parse("```html\n\(big)\n```") == [.code(big)])
+        #expect(MarkdownBlock.parse("```mermaid\n\n```") == [.code("")])
+    }
+
+    @Test func aRichBlockInAListKeepsItsSource() {
+        #expect(MarkdownBlock.parse("- Steps:\n\n  ```mermaid\n  flowchart LR\n    A --> B\n  ```") == [
+            .listItem(text: "Steps:", marker: "•", depth: 0, task: nil),
+            .rich(kind: .mermaid, source: "flowchart LR\n  A --> B"),
+        ])
+    }
+
     @Test func aPictureInAQuoteStaysInTheQuote() {
         #expect(MarkdownBlock.parse("> ![a](/a.png)") == [.quote([.image(alt: "a", src: "/a.png")])])
     }

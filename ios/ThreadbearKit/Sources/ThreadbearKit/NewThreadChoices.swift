@@ -68,8 +68,28 @@ public struct NewThreadSettings: Sendable, Hashable {
     }
 }
 
-/// The new thread sheet's model and effort pickers, from the mirrored accounts.
+/// The new thread sheet's runner, model and effort pickers, from the
+/// mirrored runners and accounts.
 public enum NewThreadChoices {
+    /// Where a new thread starts unless Mike picks another: the first runner
+    /// online of those he's placed in his order (phone:runners lists them in
+    /// it), or else the main Mac, to wait for. A runner he hasn't placed is
+    /// never picked for him, so a Mac with a runner key only gets his words
+    /// when he's said so. Nil with neither, which leaves it to the backend
+    /// (phone:create's own choice). Draining ones are passed over.
+    public static func runner(_ runners: [PhoneRunner], now: Date) -> PhoneRunner? {
+        runners.first { $0.placed == true && $0.isOnline(at: now) && $0.draining != true }
+            ?? runners.first { $0.main == true }
+    }
+
+    /// The models on offer on one runner: its own logins' (a row with no
+    /// runner is anyone's). None while its logins haven't come up yet, so it
+    /// starts on its own default rather than another Mac's model.
+    public static func models(_ accounts: [PhoneAccount], runnerId: String?) -> [PhoneModelChoice] {
+        guard let runnerId else { return models(accounts) }
+        return models(accounts.filter { $0.runnerId == nil || $0.runnerId == runnerId })
+    }
+
     /// Every model on offer, Claude's first, each once.
     public static func models(_ accounts: [PhoneAccount]) -> [PhoneModelChoice] {
         let order = ["claude", "codex"]

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths } from './config.ts';
+import { paths, readRunnerJson } from './config.ts';
 import type { Logger } from './log.ts';
 
 // Keeps the data dir and logs from growing forever (Mike, 29 Oct: after a
@@ -15,9 +15,12 @@ export const LOG_CAP_BYTES = 20 * 1024 * 1024; // the same cap Agent Archive's l
 const INBOX_KEEP_MS = 7 * DAY;
 // Deleted threads wait in trash/ to be put back by hand (store.ts trash).
 const TRASH_KEEP_MS = 30 * DAY;
-// Screenshots are most of a thread's size. A month after it was archived
-// nobody is looking at them, and Agent Archive keeps its own copy.
-const ARCHIVED_MEDIA_KEEP_MS = 30 * DAY;
+// Archived threads' pictures (pasted ones and agents' screenshots) are
+// most of a thread's size, but they're the user's, so they're only cleared
+// when runner.json's archivedMediaDays says after how long. Mike's runners
+// set 30, as Agent Archive keeps its own copy; anyone else's keep them
+// (Mike, 6 Nov: "for now we don't want to have users' data deleted", until
+// archiving to their own storage is worked out).
 const EVERY_MS = 6 * 3_600_000;
 
 export type LogToCap = { file: string; inPlace?: boolean };
@@ -98,10 +101,13 @@ export function tidy(opts: { home: string; logs: LogToCap[]; now: number; log?: 
     });
   }
 
-  for (const id of entries(paths.threads(home))) {
+  // Read each time, so a change to runner.json counts without a restart.
+  const days = readRunnerJson(home).archivedMediaDays;
+  const keepMs = typeof days === 'number' && days > 0 ? days * DAY : undefined;
+  for (const id of keepMs === undefined ? [] : entries(paths.threads(home))) {
     attempt(`thread ${id}`, () => {
       const rec = JSON.parse(fs.readFileSync(path.join(paths.thread(home, id), 'thread.json'), 'utf8')) as { archivedAt?: string };
-      if (!rec.archivedAt || now - Date.parse(rec.archivedAt) <= ARCHIVED_MEDIA_KEEP_MS) return;
+      if (!rec.archivedAt || now - Date.parse(rec.archivedAt) <= keepMs!) return;
       const media = paths.media(home, id);
       if (!entries(media).length) return;
       fs.rmSync(media, { recursive: true, force: true });

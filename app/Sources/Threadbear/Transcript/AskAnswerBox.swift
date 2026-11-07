@@ -84,7 +84,8 @@ enum AskBoxMetrics {
 /// words (Mike, 30 Oct, option A of the review). Paste or drop pictures in
 /// it, or use its picture button, as in the composer: each goes in as a
 /// chip where the cursor is (Mike, 1 Nov), its thumbnail over the words.
-/// Return sends the lot, Shift-Return adds a line. The card leaves room for it (`.tbAnswerBox`)
+/// Return goes on to the next ask still unanswered, and sends the lot once
+/// there's none; ⌘Return always sends, Shift-Return adds a line. The card leaves room for it (`.tbAnswerBox`)
 /// and TextRowCell puts it there.
 final class AskAnswerBox: NSView {
     // Clicks count while Threadbear isn't the app in front (FirstClick.swift).
@@ -102,7 +103,9 @@ final class AskAnswerBox: NSView {
     var onChange: ((AskNote) -> Void)?
     /// Pictures when there's no `pictures` to put them in as chips.
     var onImages: (([URL]) -> Void)?
-    var onSend: (() -> Void)?
+    /// Return (or ⌘Return, `command`), not Shift- or Option-Return, which
+    /// add a line.
+    var onReturn: ((_ command: Bool) -> Void)?
     /// Pictures pasted, dropped or chosen go in as chips (ComposerTextView).
     var pictures: ComposerTextView.Pictures? {
         get { textView.pictures }
@@ -119,13 +122,10 @@ final class AskAnswerBox: NSView {
         textView.delegate = self
         textView.inAnswerBox = true
         textView.placeholder = "Your answer"
-        textView.onSend = { [weak self] in self?.onSend?() }
-        // Nothing typed: Return still sends, as the pictures or the other
-        // picks may be the answer.
-        textView.onReturnWhenEmpty = { [weak self] in
-            self?.onSend?()
-            return true
-        }
+        // Typed or not (the pictures or the other picks may be the answer),
+        // Return is the cell's to decide: on to the next unanswered ask, or
+        // send once there's none.
+        textView.onAnswerReturn = { [weak self] command in self?.onReturn?(command) }
         textView.onImages = { [weak self] urls in self?.onImages?(urls) }
         scroll.documentView = textView
         scroll.drawsBackground = false

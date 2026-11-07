@@ -1,0 +1,69 @@
+# Builds the Mac app and the iPhone app with Xcode 26, the oldest Xcode the
+# README and INSTALL promise. Mike's Macs only have a newer Xcode, so nothing
+# else here would notice: on 6 Nov 2026 main stopped building on Xcode 26
+# (an API only in the macOS 27 SDK, and a closure Swift 6.3 typed
+# differently) and the people installing it after the launch video found
+# out first (PR #1).
+#
+# The Mac app builds with the oldest and the newest Xcode 26 the runner image
+# has, as the two can break in different ways. The iPhone app builds with
+# the newest only: the image has the iOS platform installed for its newest
+# Xcode and not the older ones. Nothing is signed, run or uploaded.
+name: Builds on Xcode 26
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xcode-26-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.app }} on the ${{ matrix.xcode }} Xcode 26
+    runs-on: macos-26
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [mac, iphone]
+        xcode: [oldest, newest]
+        exclude:
+          - app: iphone
+            xcode: oldest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the Xcode
+        run: |
+          # Released Xcode 26s only (no betas or release candidates), by version.
+          all=$(ls -d /Applications/Xcode_26*.app | grep -viE 'beta|_rc' | sort -V)
+          echo "Xcode 26s on this runner:"; echo "$all"
+          if [ "${{ matrix.xcode }}" = oldest ]; then pick=$(echo "$all" | head -1); else pick=$(echo "$all" | tail -1); fi
+          [ -n "$pick" ] || { echo "No Xcode 26 on this runner image"; exit 1; }
+          echo "DEVELOPER_DIR=$pick/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$pick/Contents/Developer" xcodebuild -version
+          DEVELOPER_DIR="$pick/Contents/Developer" swift --version
+
+      - name: Build the Mac app
+        if: matrix.app == 'mac'
+        working-directory: app
+        # Release, as app/install.sh builds it (app/build-app.sh).
+        run: swift build -c release --product Threadbear
+
+      - name: Build the iPhone app
+        if: matrix.app == 'iphone'
+        working-directory: ios
+        # For a phone, as ios/scripts/install-phone.sh builds it: Convex's
+        # prebuilt library has no Intel simulator slice, so a generic
+        # simulator build can't link.
+        run: |
+          xcodebuild -project Threadbear.xcodeproj -scheme Threadbear -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO THREADBEAR_APS_ENVIRONMENT=development build

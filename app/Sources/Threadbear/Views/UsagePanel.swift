@@ -115,8 +115,8 @@ private struct SpendSection: View {
                          detail: usual.map { "usually " + UsageStatsMath.tokens($0) },
                          tip: (usual.map { "Usually " + UsageStatsMath.tokens($0) + " by this time of day. " } ?? "") + UsageStatsMath.breakdown(today))
                 StatTile(title: "Last hour", value: UsageStatsMath.tokens(lastHour),
-                         detail: UsageStatsMath.tokens(Int(Double(today.total) / hoursToday)) + "/h today",
-                         tip: "Tokens in the last 60 minutes, across every login. Today has averaged " + UsageStatsMath.tokens(Int(Double(today.total) / hoursToday)) + " an hour.")
+                         detail: UsageStatsMath.tokens(Int(saturating: Double(today.total) / hoursToday)) + "/h today",
+                         tip: "Tokens in the last 60 minutes, across every login. Today has averaged " + UsageStatsMath.tokens(Int(saturating: Double(today.total) / hoursToday)) + " an hour.")
                 StatTile(title: "7 days", value: UsageStatsMath.tokens(week.total),
                          detail: UsageStatsMath.tokens(week.total / 7) + " a day",
                          tip: UsageStatsMath.breakdown(week))
@@ -344,7 +344,7 @@ private struct HoverNote: View {
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        let total = bars.reduce(0) { $0 + $1.tokens }
+        let total = bars.reduce(0) { $0.adding(saturating: $1.tokens) }
         VStack(alignment: .leading, spacing: zoomed(3)) {
             Text((byDay ? TokensChart.dayLabel(start, now: now) : AccountUsageText.clock(start)) + "  " + UsageStatsMath.tokens(total))
                 .font(.system(size: zoomed(11), weight: .semibold))
@@ -423,8 +423,10 @@ private struct PoolCard: View {
 }
 
 /// A login: its name and what it's spent today, its 5-hour and weekly
-/// windows side by side (one over the other in a narrow panel), then only
-/// the extras that decide something (`AccountUsageText.extraLines`).
+/// windows side by side (one over the other in a narrow panel), then a
+/// model's own week ("Weekly Fable") with its own chart, as Claude Code's
+/// /usage has (Ayush, 6 Nov), then only the extras that decide something
+/// (`AccountUsageText.extraLines`).
 private struct LoginRow: View {
     let account: Account
     let allAccounts: [Account]
@@ -436,7 +438,7 @@ private struct LoginRow: View {
 
     var body: some View {
         let usage = account.usage
-        let windows = AccountUsageText.mainWindows(usage)
+        let windows = AccountUsageText.mainWindows(usage) + AccountUsageText.modelWeeks(usage)
         let today = stats.map { UsageStatsMath.today($0, accounts: [account.id], now: now) }
         let colour = colours.colour(account.id, dark: scheme == .dark)
         VStack(alignment: .leading, spacing: zoomed(8)) {
@@ -467,6 +469,16 @@ private struct LoginRow: View {
             if !windows.isEmpty {
                 ViewThatFits(in: .horizontal) {
                     HStack(alignment: .top, spacing: zoomed(18)) { meters(windows, colour: colour) }
+                    // Three (5-hour, week, Fable's week) in a panel too
+                    // narrow for a row of them: two a row, rather than
+                    // three tall ones stacked.
+                    if windows.count > 2 {
+                        Grid(alignment: .topLeading, horizontalSpacing: zoomed(18), verticalSpacing: zoomed(10)) {
+                            ForEach(Array(stride(from: 0, to: windows.count, by: 2)), id: \.self) { i in
+                                GridRow { meters(Array(windows[i..<min(i + 2, windows.count)]), colour: colour) }
+                            }
+                        }
+                    }
                     VStack(alignment: .leading, spacing: zoomed(10)) { meters(windows, colour: colour) }
                 }
             }
@@ -485,10 +497,10 @@ private struct LoginRow: View {
 
     @ViewBuilder
     private func meters(_ windows: [UsageWindow], colour: Color) -> some View {
-        ForEach(windows, id: \.kind) { window in
+        ForEach(windows, id: \.title) { window in
             // Each meter takes its share of the row: capped at 320 they
             // stopped two thirds of the way across a wide panel (Mike, 5 Nov).
-            WindowMeter(window: window, samples: stats?.samples(account.id, kind: window.kind) ?? [], colour: colour, stale: account.usage?.stale == true, now: now)
+            WindowMeter(window: window, samples: stats?.samples(account.id, kind: window.kind, title: window.title) ?? [], colour: colour, stale: account.usage?.stale == true, now: now)
                 .frame(minWidth: zoomed(170), maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -532,8 +544,9 @@ private struct WindowMeter: View {
                     .foregroundStyle(short ? AnyShapeStyle(fill) : AnyShapeStyle(.primary))
             }
             // The weekly chart already shows what's left (its line ends at
-            // it), so only the 5-hour window gets a bar.
-            if window.kind == "weekly" {
+            // it), so only the 5-hour window gets a bar. A model's own week
+            // is charted the same way.
+            if window.kind == "weekly" || window.kind == "weekly_model" {
                 WeekChart(window: window, samples: samples, pace: stale ? nil : pace, colour: colour, now: now)
                     .frame(height: zoomed(44))
             } else {

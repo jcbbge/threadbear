@@ -82,6 +82,9 @@ public enum MarkdownExport {
             if response.none { lines.append("None of them") }
             if let reply = response.reply, !reply.isEmpty { lines.append(reply) }
             return lines.joined(separator: "\n")
+        case .planCard(let card):
+            let state = switch card.state { case .waiting: ""; case .approved: " (approved)"; case .sentBack: " (sent back)" }
+            return "**Plan**\(state)\n\n" + card.text
         case .plan(let entries):
             return entries.map { entry in
                 let box = entry.status == .completed ? "[x]" : "[ ]"

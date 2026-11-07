@@ -9,6 +9,66 @@ import ThreadbearCore
 extension Automation {
     // MARK: Commands
 
+    /// Settings > Keyboard from a script: `record` starts listening for a
+    /// command, `press` is a key through the recorder ("cmd+e"), `answer` is
+    /// `use` or `cancel`, `reset` is a command or `all`. `post` is a real key
+    /// press, {"keyCode": 14, "characters": "e", "modifiers": ["cmd"]}, sent
+    /// through this app's own event queue, so its monitors and menus see it as
+    /// they would a press while nothing reaches any other app. Says what's
+    /// listening and what's changed.
+    static func shortcuts(_ c: [String: Any]) async -> String {
+        let shortcuts = AppShortcuts.shared
+        let recorder = ShortcutRecorder.shared
+        if let name = c["record"] as? String {
+            guard let command = ShortcutCommand(rawValue: name) else { return "error no command \(name)" }
+            recorder.start(command)
+        }
+        if let text = c["press"] as? String {
+            guard let key = ShortcutKey(string: text) else { return "error not a key: \(text)" }
+            recorder.press(key)
+        }
+        switch c["answer"] as? String {
+        case "use": recorder.useTakenKey()
+        case "cancel": recorder.cancel()
+        case nil: break
+        case let other?: return "error answer is use or cancel, not \(other)"
+        }
+        if let name = c["reset"] as? String {
+            if name == "all" {
+                shortcuts.change { $0.resetAll() }
+            } else if let command = ShortcutCommand(rawValue: name) {
+                shortcuts.change { $0.reset(command) }
+            } else {
+                return "error no command \(name)"
+            }
+        }
+        if let post = c["post"] as? [String: Any] {
+            guard let code = post["keyCode"] as? Int, let characters = post["characters"] as? String else { return "error post needs keyCode and characters" }
+            var flags: NSEvent.ModifierFlags = []
+            for modifier in post["modifiers"] as? [String] ?? [] {
+                switch modifier {
+                case "cmd": flags.insert(.command)
+                case "opt": flags.insert(.option)
+                case "ctrl": flags.insert(.control)
+                case "shift": flags.insert(.shift)
+                default: return "error modifier is cmd, opt, ctrl or shift"
+                }
+            }
+            guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+                                               windowNumber: NSApp.mainWindow?.windowNumber ?? NSApp.windows.first?.windowNumber ?? 0,
+                                               context: nil, characters: characters, charactersIgnoringModifiers: characters,
+                                               isARepeat: false, keyCode: UInt16(code)) else { return "error no event" }
+            NSApp.postEvent(event, atStart: false)
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        let changed = ShortcutCommand.allCases.filter { shortcuts.bindings.isChanged($0) }
+            .map { "\($0.rawValue):\(shortcuts.key($0)?.string ?? "none")" }
+        // A moment for a change to reach the menus, as the next line checks they did.
+        try? await Task.sleep(for: .milliseconds(100))
+        let drift = shortcuts.menusOutOfStep()
+        return "ok listening=\(recorder.command?.rawValue ?? "nothing") outcome=\(recorder.outcome) changed=[\(changed.joined(separator: ","))] menus=\(drift.isEmpty ? "in step" : drift.joined(separator: ","))"
+    }
+
     /// What the new-thread composer's folder, account, model and "Ask
     /// before edits" menus set. Anything else is an error rather than a
     /// silent "ok" (a typo like "models" would leave the account's default
@@ -82,9 +142,9 @@ extension Automation {
 
     /// A key event the text box with the cursor gets, as a real key press
     /// would reach it, without the app coming to the front.
-    static func pressAtCursor(_ window: NSWindow?, characters: String, keyCode: UInt16) -> String {
+    static func pressAtCursor(_ window: NSWindow?, characters: String, keyCode: UInt16, modifiers: NSEvent.ModifierFlags = []) -> String {
         guard let field = window?.firstResponder as? NSTextView else { return "error the cursor isn't in a text box" }
-        guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+        guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: ProcessInfo.processInfo.systemUptime,
                                            windowNumber: window?.windowNumber ?? 0, context: nil, characters: characters,
                                            charactersIgnoringModifiers: characters, isARepeat: false, keyCode: keyCode)
         else { return "error no event" }
@@ -295,6 +355,33 @@ extension Automation {
         return "ok \(along), let go: \(app.threads[id]?.isArchived == true ? "archived" : "not archived")"
     }
 
+    /// Two fingers across the middle of the window (`{"dx": 150, "dy": 0}`,
+    /// right and down positive; right is Back), through the handler
+    /// SwipeNavigation's monitor calls. A made-up event has no window of its
+    /// own, so, as for `mouse-button`, it's handed the main one. `"lift":
+    /// false` leaves the fingers down, for a shot of the arrow; a later
+    /// page-swipe carries on. Says how far it got and where the window is after.
+    static func pageSwipe(_ c: [String: Any], app: AppModel) async -> String {
+        guard let window = MainWindowFrame.window else { return "error no window" }
+        let dx = number(c["dx"]) ?? 0, dy = number(c["dy"]) ?? 0
+        let steps = max(1, Int(number(c["steps"]) ?? 8))
+        func page(_ x: Double, _ y: Double, _ phase: RowSwipeEvents.Phase) {
+            guard let event = RowSwipeEvents.event(dx: x, dy: y, phase: phase, middle: true) else { return }
+            _ = SwipeNavigation.shared.handle(event, in: window)
+        }
+        if SwipeNavigation.shared.swipe.phase == .idle { page(0, 0, .began) }
+        for _ in 0..<steps {
+            page(dx / Double(steps), dy / Double(steps), .changed)
+            try? await Task.sleep(for: .milliseconds(16))
+        }
+        let swipe = SwipeNavigation.shared.swipe
+        let along = "\(swipe.direction.map { "\($0)" } ?? "no swipe") progress \(String(format: "%.2f", swipe.progress)) armed \(swipe.armed)"
+        guard c["lift"] as? Bool ?? true else { return "ok \(along)" }
+        page(0, 0, .ended)
+        try? await Task.sleep(for: .milliseconds(300))
+        return "ok \(along), let go: \(app.selection ?? "new") back=\(app.canGoBack) forward=\(app.canGoForward)"
+    }
+
     static func post(_ event: NSEvent?) {
         guard let event else { return }
         NSApp.postEvent(event, atStart: false)
@@ -431,6 +518,11 @@ extension Automation {
             }
             if c["show"] as? Bool == true { return show { app.modelPickerRequest += 1 } }
             return "ok " + json(settings.pickerLines())
+        case "context":
+            // The context ring's popover; only on a thread that has one.
+            guard let thread = app.selectedThread, let meter = ContextMeter(thread) else { return "error no context meter on this thread" }
+            if c["show"] as? Bool == true { return show { app.contextMeterRequest += 1 } }
+            return "ok " + json([meter.amount, "\(meter.percent)%"])
         case "account":
             // An account by its email (as the picker shows it) or its id.
             if let title = c["click"] as? String {

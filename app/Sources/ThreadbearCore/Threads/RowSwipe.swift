@@ -27,12 +27,15 @@ public struct RowSwipe: Sendable, Equatable {
     private var sumX = 0.0
     private var sumY = 0.0
     private var lastDX: Double = 0
+    /// A swipe right is Back's (SwipeNavigation in the app) while there's somewhere
+    /// to go back to, rather than the row giving a little and stopping.
+    private var rightTaken = false
 
     /// Movement before a gesture is called across or up and down.
-    static let decideAfter = 6.0
+    public static let decideAfter = 6.0
     /// Across has to be this much more than up and down to count, so a
     /// slightly diagonal scroll still scrolls.
-    static let across = 1.5
+    public static let across = 1.5
     /// One event moving this far left at the end is a flick: it archives
     /// even short of the line, once the row's at least `flickTravel` along.
     static let flickSpeed = 14.0
@@ -58,9 +61,21 @@ public struct RowSwipe: Sendable, Equatable {
 
     public var isSwiping: Bool { phase == .tracking }
 
-    /// Fingers touched the trackpad.
-    public mutating func begin() {
+    /// A mouse dragging a row `dx`, `dy` from where it went down (left
+    /// negative): true once that's the thread being dragged out, to drop
+    /// into another thread's message (ThreadDrag in the app), rather than
+    /// this swipe. Any way but mostly left, by the same rule that decides a
+    /// swipe, so the two never both start.
+    public static func dragsOut(dx: Double, dy: Double) -> Bool {
+        guard max(abs(dx), abs(dy)) >= decideAfter else { return false }
+        return !(dx < 0 && abs(dx) >= abs(dy) * across)
+    }
+
+    /// Fingers touched the trackpad. `rightTaken`: a swipe right goes
+    /// Back, so it isn't the row's.
+    public mutating func begin(rightTaken: Bool = false) {
         phase = .deciding
+        self.rightTaken = rightTaken
         travel = 0
         sumX = 0
         sumY = 0
@@ -78,7 +93,7 @@ public struct RowSwipe: Sendable, Equatable {
             sumX += dx
             sumY += dy
             guard max(abs(sumX), abs(sumY)) >= Self.decideAfter else { return false }
-            if abs(sumX) >= abs(sumY) * Self.across {
+            if abs(sumX) >= abs(sumY) * Self.across, !(rightTaken && sumX > 0) {
                 phase = .tracking
                 travel = sumX
                 lastDX = dx

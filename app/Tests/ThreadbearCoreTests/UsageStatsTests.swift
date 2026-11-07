@@ -136,6 +136,36 @@ final class UsageStatsTests: XCTestCase {
         XCTAssertEqual(LimitPace.of(window, samples: recent, now: now)!.rate, 15, accuracy: 0.01)
     }
 
+    func testFablesOwnWeekGoesLikeAWeekButNeverSaysGoingSpare() {
+        // Three and a half days in, 30% of Fable's week left: 20% a day,
+        // out in 1.5 days, as the main week would be.
+        let now = at(12)
+        let fable = UsageWindow(kind: "weekly_model", title: "Weekly Fable", remainingPercent: 30, resetsAt: now.addingTimeInterval(3.5 * 86400))
+        let pace = LimitPace.of(fable, samples: [], now: now)!
+        XCTAssertEqual(pace.rate, 20, accuracy: 0.01)
+        XCTAssertEqual(pace.rateText(kind: "weekly_model"), "20% a day")
+        XCTAssertEqual(LimitPace.verdict(fable, pace: pace, stale: false, now: now, calendar: calendar)?.tone, .short)
+        // Untouched: most logins never run out of Fable, so "100% will go
+        // unused" on each would be noise. Just when it resets.
+        let untouched = UsageWindow(kind: "weekly_model", title: "Weekly Fable", remainingPercent: 100, resetsAt: now.addingTimeInterval(5 * 86400))
+        let verdict = LimitPace.verdict(untouched, pace: LimitPace.of(untouched, samples: [], now: now), stale: false, now: now, calendar: calendar)!
+        XCTAssertEqual(verdict.tone, .fine)
+        XCTAssertEqual(verdict.text, "Resets Tue 12 pm")
+    }
+
+    func testAModelsWeekReadingsAreFoundByTitle() throws {
+        let json = #"""
+        {"generatedAt":"2026-11-06T00:00:00Z","ready":true,"tokens":[],"limits":[
+          {"accountId":"a","kind":"weekly","samples":[[1793000000000,50]]},
+          {"accountId":"a","kind":"weekly_model","title":"Weekly Opus","samples":[[1793000000000,80]]},
+          {"accountId":"a","kind":"weekly_model","title":"Weekly Fable","samples":[[1793000000000,70]]}]}
+        """#
+        let stats = try JSONDecoder().decode(UsageStats.self, from: Data(json.utf8))
+        XCTAssertEqual(stats.samples("a", kind: "weekly").map(\.remainingPercent), [50])
+        XCTAssertEqual(stats.samples("a", kind: "weekly_model", title: "Weekly Fable").map(\.remainingPercent), [70])
+        XCTAssertEqual(stats.samples("a", kind: "weekly_model", title: "Weekly Sonnet"), [])
+    }
+
     func testFiveHourPaceIsPerHourAndNeedsSomeTime() {
         let now = at(12)
         let window = UsageWindow(kind: "five_hour", title: "5-hour", remainingPercent: 40, resetsAt: now.addingTimeInterval(3 * 3600))

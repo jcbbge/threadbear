@@ -279,12 +279,12 @@ final class FolderBrowserTests: XCTestCase {
 
         let exports = root.appendingPathComponent("exports").path
         let leaving = FolderMemory(selected: [exports], expanded: [])
-        app.browseFolder(exports, from: leaving, in: thread)
+        app.browseFolder(exports, from: leaving, showing: app.panePreview[thread.id]!, in: thread)
         XCTAssertEqual(app.panePreview[thread.id]?.folderPath, exports)
         XCTAssertEqual(app.panePreview[thread.id]?.title, "exports")
 
         let clip = FolderEntry(name: "clip.txt", path: exports + "/clip.txt", isFolder: false)
-        app.openFromFolder(clip, from: FolderMemory(selected: [clip.path]), in: thread)
+        app.openFromFolder(clip, from: FolderMemory(selected: [clip.path]), showing: app.panePreview[thread.id]!, in: thread)
         XCTAssertEqual(app.panePreview[thread.id]?.fileURL?.path, clip.path)
 
         app.previewBack(in: thread.id)
@@ -299,12 +299,59 @@ final class FolderBrowserTests: XCTestCase {
         XCTAssertNil(app.panePreview[thread.id], "and then out to the section")
     }
 
+    /// The bug Wayne hit (6 Nov): the rail's Files panel shows the thread's
+    /// folder without storing a preview, so a click there found none and
+    /// did nothing. A file opened from it shows over it, in the Files
+    /// section, with Back to the folder; so does a folder, and it works
+    /// with another section's file already stored too.
+    func testAClickInTheFilesPanelOpensTheFile() {
+        let app = AppModel()
+        let thread = thread()
+        let files = PaneSection.panel(BuiltinPanels.files)
+        let shown = PanePreview(target: .folder(root.path), title: "Files", from: files)
+        XCTAssertNil(app.panePreview[thread.id])
+
+        let notes = FolderEntry(name: "notes.md", path: root.appendingPathComponent("notes.md").path, isFolder: false)
+        app.openFromFolder(notes, from: FolderMemory(selected: [notes.path]), showing: shown, in: thread)
+        XCTAssertEqual(app.panePreview[thread.id]?.fileURL?.path, notes.path)
+        XCTAssertEqual(app.panePreview[thread.id]?.from, files)
+        app.previewBack(in: thread.id)
+        XCTAssertEqual(app.panePreview[thread.id]?.folderPath, root.path, "Back is the folder")
+        XCTAssertEqual(app.panePreview[thread.id]?.folderMemory.selected, [notes.path])
+
+        // Something from Highlights already open: the Files click still goes to Files.
+        app.closePreview(in: thread.id)
+        app.preview(path: notes.path, in: thread)
+        let exports = FolderEntry(name: "exports", path: root.appendingPathComponent("exports").path, isFolder: true)
+        app.openFromFolder(exports, from: FolderMemory(), showing: shown, in: thread)
+        XCTAssertEqual(app.panePreview[thread.id]?.folderPath, exports.path)
+        XCTAssertEqual(app.panePreview[thread.id]?.from, files)
+    }
+
+    /// Another Mac's thread: its Files panel says whose folder it is, and a
+    /// file opened from it is fetched over Files too, not over whichever
+    /// section the thread would pick.
+    func testTheFilesPanelOnAnotherMac() {
+        let app = AppModel()
+        var thread = thread()
+        thread.runnerId = "bruce"
+        let shown = app.filesPanelPreview(for: thread)
+        XCTAssertEqual(shown.folderPath, "/tmp")
+        XCTAssertNotNil(shown.away)
+        XCTAssertNil(app.filesPanelPreview(for: self.thread()).away, "this Mac's own")
+
+        let notes = FolderEntry(name: "notes.md", path: "/tmp/notes.md", isFolder: false)
+        app.openFromFolder(notes, from: FolderMemory(selected: [notes.path]), showing: shown, in: thread)
+        XCTAssertEqual(app.panePreview[thread.id]?.from, .panel(BuiltinPanels.files))
+        XCTAssertEqual(app.panePreview[thread.id]?.back.last?.folderPath, "/tmp", "Back is the folder")
+    }
+
     /// A file opened from outside the browser has only the section behind it.
     func testALinkFromOutsideStartsAfresh() {
         let app = AppModel()
         let thread = thread()
         app.preview(path: root.path, in: thread)
-        app.browseFolder(root.appendingPathComponent("exports").path, from: FolderMemory(), in: thread)
+        app.browseFolder(root.appendingPathComponent("exports").path, from: FolderMemory(), showing: app.panePreview[thread.id]!, in: thread)
         app.preview(path: root.appendingPathComponent("notes.md").path, in: thread)
         XCTAssertEqual(app.panePreview[thread.id]?.back, [])
     }

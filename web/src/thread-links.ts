@@ -2,8 +2,9 @@
 // thread"), as the Mac's WorkLinks and the phone's ThreadLinks read them:
 // `work:<words>` quotes a step in the turn's working, `thread:<id>` is another
 // thread and `review:<id>` a design review, which only the Mac can open.
+// `button:<id>` is a reply button (docs/protocol.md, "Reply buttons").
 
-export type LinkTarget = { kind: 'step'; quote: string } | { kind: 'thread'; id: string } | { kind: 'review' };
+export type LinkTarget = { kind: 'step'; quote: string } | { kind: 'thread'; id: string } | { kind: 'review' } | { kind: 'button'; id: string };
 type Row = { seq: number; role: 'user' | 'assistant' | 'tool'; text: string; summary?: boolean };
 
 // The markdown with work: and thread: destinations escaped, as agents write
@@ -49,7 +50,7 @@ function decoded(text: string): string {
 
 // What a link means, or undefined for anywhere else (a web page).
 export function readLink(href: string): LinkTarget | undefined {
-  const match = /^(work|thread|review):(.*)$/is.exec(href);
+  const match = /^(work|thread|review|button):(.*)$/is.exec(href);
   if (!match) return undefined;
   const words = decoded(match[2]!).trim();
   switch (match[1]!.toLowerCase()) {
@@ -57,6 +58,8 @@ export function readLink(href: string): LinkTarget | undefined {
       return words ? { kind: 'step', quote: words } : undefined;
     case 'thread':
       return words ? { kind: 'thread', id: words } : undefined;
+    case 'button':
+      return words ? { kind: 'button', id: words } : undefined;
     default:
       return { kind: 'review' };
   }

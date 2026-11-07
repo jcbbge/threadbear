@@ -5,6 +5,7 @@ import path from 'node:path';
 import { makeHarness, tick } from '../helpers/fakes.ts';
 import { makePng } from '../helpers/png.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
+import { stills, withCharset } from '../../src/review-media.ts';
 
 function fixture() {
   const h = makeHarness();
@@ -305,6 +306,16 @@ test('an option keeps its shots and url, and old single-image options are unchan
   assert.throws(()=>h.runner.createReview(thread.id,{title:'Too big',options:Array.from({length:6},(_,i)=>({id:`O${i}`,title:'Many',shots:Array.from({length:7},()=>({path:source}))}))}),/at most 40/);
 });
 
+test('recommended marks the agent\'s pick, and must name an option that can be picked', () => {
+  const {h,thread,input}=fixture();
+  const {review}=h.runner.createReview(thread.id,{...input,recommended:'B'});
+  assert.equal(review.recommended,'B');
+  assert.equal(h.restart().runner.getReview(thread.id,review.id).review.recommended,'B');
+  assert.equal(h.runner.createReview(thread.id,input).review.recommended,undefined);
+  assert.throws(()=>h.runner.createReview(thread.id,{...input,recommended:'Z'}),/option ids/);
+  assert.throws(()=>h.runner.createReview(thread.id,{...input,recommended:'D'}),/reference/);
+});
+
 test('several picks, none, and a reply go to the agent in the order of the options', () => {
   const {h,thread,input}=fixture();
   const {review}=h.runner.createReview(thread.id,input);
@@ -332,4 +343,67 @@ test('none of them, with or without a reply, is an answer', () => {
   h.runner.respondReview(thread.id,second.id,0,{notes:{},reply:'Can you explain what these are for?'});
   const reply=h.store.load(thread.id)!.queue.at(-1)!;
   assert.equal(reply.text,`Review: Account picker (${second.id})\n\nCan you explain what these are for?`);
+});
+
+// The smallest file sniffVideo calls an MP4: an ftyp box, nothing to play.
+function fakeMp4(): Buffer {
+  const box = Buffer.alloc(16);
+  box.writeUInt32BE(16, 0);
+  box.write('ftypisom', 4, 'ascii');
+  return box;
+}
+
+test('a shot can be a video or an HTML page: copied with a still, and the page brings what it names', (t) => {
+  // Nothing here can draw the fake clip, and Quick Look hangs on it till its timeout.
+  t.mock.method(stills,'quickLook',()=>undefined);
+  t.mock.method(stills,'ffmpegFrame',()=>undefined);
+  const {h,thread,source}=fixture();
+  const clip=path.join(h.home,'clip.mp4');
+  fs.writeFileSync(clip,fakeMp4());
+  const site=path.join(h.home,'site');
+  fs.mkdirSync(path.join(site,'img'),{recursive:true});
+  fs.writeFileSync(path.join(site,'img','a.png'),makePng(4,4));
+  fs.writeFileSync(path.join(site,'style.css'),'body{background:url("img/bg.png")}');
+  fs.writeFileSync(path.join(site,'img','bg.png'),makePng(2,2));
+  fs.writeFileSync(path.join(h.home,'secret.txt'),'not for the page');
+  fs.writeFileSync(path.join(site,'other.html'),'<p>another page</p>');
+  fs.symlinkSync(path.join(h.home,'secret.txt'),path.join(site,'linked.png'));
+  const page=path.join(site,'index.html');
+  fs.writeFileSync(page,'<link rel="stylesheet" href="style.css"><img src="img/a.png?v=2"><img src="../secret.txt"><img src="linked.png"><img src="https://example.com/x.png"><a href="other.html">next</a>');
+  const {review}=h.runner.createReview(thread.id,{title:'Clips',options:[
+    {id:'A',title:'Clip',path:clip},
+    {id:'B',title:'Page',path:source,shots:[{path:page,title:'Live'}]},
+  ]});
+  const [a,b]=review.options;
+  assert.equal(a.shots?.length,1,'a lone video still comes as a shot, so its media isn’t lost');
+  assert.equal(a.shots?.[0].media?.mediaType,'video/mp4');
+  assert.notEqual(a.shots?.[0].media?.path,clip);
+  assert.deepEqual(fs.readFileSync(a.shots![0].media!.path),fakeMp4());
+  assert.equal(a.image.path,a.shots?.[0].image.path,'the option’s image is the video’s still');
+  assert.ok(fs.existsSync(a.image.path)&&a.image.width&&a.image.height,'a still even when nothing can draw this clip');
+  assert.equal(b.shots?.[0].media,undefined,'a picture has no media');
+  const copied=b.shots![1].media!;
+  assert.equal(copied.mediaType,'text/html');
+  assert.equal(path.basename(copied.path),'index.html');
+  const folder=path.dirname(copied.path);
+  for (const f of ['style.css','img/a.png','img/bg.png']) assert.ok(fs.existsSync(path.join(folder,f)),f);
+  assert.ok(!fs.existsSync(path.join(folder,'..','secret.txt')),'nothing from outside the page’s folder');
+  assert.ok(!fs.existsSync(path.join(folder,'other.html')),'other pages aren’t followed');
+  assert.ok(!fs.existsSync(path.join(folder,'linked.png')),'nor a link out of the folder');
+  assert.ok(fs.existsSync(b.shots![1].image.path));
+  const notes=path.join(h.home,'notes.txt');
+  fs.writeFileSync(notes,'plain text');
+  assert.throws(()=>h.runner.createReview(thread.id,{title:'Bad',options:[{id:'X',title:'Text',path:notes}]}),/video \(MP4, MOV\) or HTML page/);
+});
+
+// Mike, 7 Nov: a mockup with ✓ and no charset showed "âœ“" in the review
+// window and its still, both of which read an undeclared page as Latin-1.
+test('a review page that is UTF-8 without saying so gets a charset in its copy', () => {
+  const page=(s:string|Buffer)=>withCharset(Buffer.isBuffer(s)?s:Buffer.from(s,'utf8')).toString('latin1');
+  assert.equal(page('<p>✓ done</p>'),Buffer.from('<meta charset="utf-8"><p>✓ done</p>','utf8').toString('latin1'));
+  assert.match(page('<!DOCTYPE html><html><p>✓</p>'),/^<!DOCTYPE html><meta charset="utf-8"><html>/,'after the doctype, so no quirks mode');
+  for (const s of ['<head><meta charset="windows-1252"></head>✓','<meta http-equiv="Content-Type" content="text/html; charset=utf-8">✓','﻿<p>✓</p>'])
+    assert.equal(page(s),Buffer.from(s,'utf8').toString('latin1'),'its own declaration or BOM stands');
+  const latin1=Buffer.from([0x3c,0x70,0x3e,0xe9,0x3c,0x2f,0x70,0x3e]); // <p>é</p> in Latin-1, not valid UTF-8
+  assert.deepEqual(withCharset(latin1),latin1,'a page in another encoding is left alone');
 });

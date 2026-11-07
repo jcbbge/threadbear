@@ -12,7 +12,20 @@ import type { Logger } from './log.ts';
 import { atomicWriteFileSync, readJsonSync } from './fsutil.ts';
 
 export const HISTORY_KINDS = ['five_hour', 'weekly'] as const;
-export type HistoryKind = (typeof HISTORY_KINDS)[number];
+export type HistoryKind = (typeof HISTORY_KINDS)[number] | 'weekly_model';
+// A model's own week ("Weekly Fable") is kept too, so the Usage panel can
+// chart it like the main week. There can be several (Opus, Sonnet, Fable),
+// so each is kept under "weekly_model:<title>" and goes out with its title.
+const MODEL_PREFIX = 'weekly_model:';
+type Key = string;
+function keyOf(w: { kind: string; title: string }): Key | undefined {
+  if ((HISTORY_KINDS as readonly string[]).includes(w.kind)) return w.kind;
+  return w.kind === 'weekly_model' ? MODEL_PREFIX + w.title : undefined;
+}
+function kindOf(key: Key): { kind: HistoryKind; title?: string } {
+  return key.startsWith(MODEL_PREFIX) ? { kind: 'weekly_model', title: key.slice(MODEL_PREFIX.length) } : { kind: key as HistoryKind };
+}
+export type HistoryRow = { accountId: string; kind: HistoryKind; title?: string; samples: Sample[] };
 export type Sample = [number, number]; // [atMs, remainingPercent]
 
 export const HISTORY_DAYS = 8;
@@ -22,13 +35,13 @@ export const MAX_GAP_MS = 30 * 60_000;
 // written once they settle.
 const SAVE_DELAY_MS = 5_000;
 
-type HistoryFile = { version: 1; accounts: Record<string, Partial<Record<HistoryKind, Sample[]>>> };
+type HistoryFile = { version: 1; accounts: Record<string, Record<Key, Sample[]>> };
 
 export class UsageHistory {
   private file: string;
   private clock: Clock;
   private log: Logger;
-  private samples = new Map<string, Map<HistoryKind, Sample[]>>();
+  private samples = new Map<string, Map<Key, Sample[]>>();
   private saveTimer?: TimerHandle;
   private writes = true;
 
@@ -39,10 +52,10 @@ export class UsageHistory {
     const saved = readJsonSync<HistoryFile>(this.file);
     if (saved?.version === 1 && saved.accounts && typeof saved.accounts === 'object') {
       for (const [id, kinds] of Object.entries(saved.accounts)) {
-        const m = new Map<HistoryKind, Sample[]>();
-        for (const kind of HISTORY_KINDS) {
-          const list = kinds?.[kind];
-          if (Array.isArray(list)) m.set(kind, list.filter((s) => Array.isArray(s) && typeof s[0] === 'number' && typeof s[1] === 'number'));
+        const m = new Map<Key, Sample[]>();
+        for (const [key, list] of Object.entries(kinds ?? {})) {
+          if (!(HISTORY_KINDS as readonly string[]).includes(key) && !key.startsWith(MODEL_PREFIX)) continue;
+          if (Array.isArray(list)) m.set(key, list.filter((s) => Array.isArray(s) && typeof s[0] === 'number' && typeof s[1] === 'number'));
         }
         this.samples.set(id, m);
       }
@@ -54,9 +67,11 @@ export class UsageHistory {
     if (!usage) return;
     const now = this.clock.now();
     let changed = false;
-    for (const kind of HISTORY_KINDS) {
-      const w = usage.windows.find((x) => x.kind === kind);
-      if (!w) continue;
+    const seen = new Set<Key>();
+    for (const w of usage.windows) {
+      const kind = keyOf(w);
+      if (!kind || seen.has(kind)) continue;
+      seen.add(kind);
       let m = this.samples.get(accountId);
       if (!m) this.samples.set(accountId, (m = new Map()));
       let list = m.get(kind);
@@ -76,12 +91,15 @@ export class UsageHistory {
   }
 
   // Samples since `since`, per account and window.
-  rows(since: number): { accountId: string; kind: HistoryKind; samples: Sample[] }[] {
-    const out: { accountId: string; kind: HistoryKind; samples: Sample[] }[] = [];
+  rows(since: number): HistoryRow[] {
+    const out: HistoryRow[] = [];
+    // The main two first, then the models' weeks by title.
+    const order = (k: Key) => { const i = (HISTORY_KINDS as readonly string[]).indexOf(k); return i < 0 ? HISTORY_KINDS.length : i; };
     for (const [accountId, m] of this.samples) {
-      for (const kind of HISTORY_KINDS) {
-        const list = m.get(kind)?.filter((s) => s[0] >= since);
-        if (list?.length) out.push({ accountId, kind, samples: list });
+      const keys = [...m.keys()].sort((a, b) => order(a) - order(b) || a.localeCompare(b));
+      for (const key of keys) {
+        const list = m.get(key)?.filter((s) => s[0] >= since);
+        if (list?.length) out.push({ accountId, ...kindOf(key), samples: list });
       }
     }
     return out;

@@ -187,6 +187,20 @@ enum Automation {
             try? await Task.sleep(for: .milliseconds(15))
         }
         guard let window = SettingsWindow.current, window.isVisible else { return "error the Settings window didn't open" }
+        // {"front": true}: in front and key, for real events on a desktop
+        // nobody's using (Tinker Desk). Says its number and where it is, top
+        // left, in screen points. A gesture of SwiftUI's own ignores a window
+        // that isn't key, so `point` can't reach those behind Mike's windows.
+        if c["front"] as? Bool == true {
+            // Floating: macOS can refuse a script's activate, and then a
+            // normal window stays under whatever's in front.
+            window.level = .floating
+            NSApp.activate()
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            let top = (NSScreen.screens.first?.frame.height ?? 0) - window.frame.maxY
+            return "ok front \(window.windowNumber) \(Int(window.frame.minX)) \(Int(top))"
+        }
         window.tuckBehind()
         // Let the tab switch and the window's new height settle.
         try? await Task.sleep(for: .milliseconds(400))
@@ -272,6 +286,11 @@ enum Automation {
             // A beat for the table to lay out and draw.
             try? await Task.sleep(for: .milliseconds(150))
             return "ok \(id) \(session.displayCount) rows"
+        case "refusal":
+            guard let id = app.selection, let thread = app.threads[id] else { return "error no thread selected" }
+            guard let account = app.refusalTarget(for: thread) else { return "ok none" }
+            if c["continue"] as? Bool == true { app.continueRefusal(id) }
+            return "ok \(account.id) \(RefusalRecovery.model)"
         case "signin":
             // The selected thread's Sign in… line (SignInBanner): which
             // login it names, and with sendAgain its Send again button.
@@ -321,13 +340,19 @@ enum Automation {
         case "point":
             // Real events at a spot in the window, for SwiftUI controls with
             // nothing to find them by: {"cmd":"point","x":956,"y":265} clicks
-            // (points from the window's top left), with "toX" drags there,
+            // (points from the window's top left), with "toX" and "toY" drags there,
             // and "scrollX"/"scrollY" is a wheel, in lines. They go straight
             // to the window, so Mike's pointer stays where it is.
-            // {"review": id}: in that review's own window.
+            // {"review": id}: in that review's own window. {"settings": true}:
+            // in the Settings window. "holdMs" waits with the button still
+            // down at the end of a drag, for a `shot` of it mid-drag.
             let reviewWindow = (c["review"] as? String).flatMap { id in app.reviewWindows.values.first { $0.session.review.id == id }?.window }
-            guard let window = reviewWindow ?? window, let x = c["x"] as? Double, let y = c["y"] as? Double else { return "error point needs x and y" }
+            let settingsWindow = c["settings"] as? Bool == true ? SettingsWindow.current : nil
+            guard let window = reviewWindow ?? settingsWindow ?? window, let x = c["x"] as? Double, let y = c["y"] as? Double else { return "error point needs x and y" }
             let at = { (px: Double) in NSPoint(x: px, y: window.frame.height - y) }
+            // Anywhere on the way from the start to (toX, toY), `t` from 0 to 1.
+            let endY = (c["toY"] as? Double) ?? y
+            let along = { (t: Double, endX: Double) in NSPoint(x: x + (endX - x) * t, y: window.frame.height - (y + (endY - y) * t)) }
             if c["scrollX"] != nil || c["scrollY"] != nil {
                 let lines = (Int32(c["scrollY"] as? Double ?? 0), Int32(c["scrollX"] as? Double ?? 0))
                 guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: lines.0, wheel2: lines.1, wheel3: 0) else { return "error no event" }
@@ -359,7 +384,7 @@ enum Automation {
             // A text view's mouseDown waits in its own loop for the button to
             // come up, so a click on its words (a link, a chip) has the up
             // queued first, or the main thread sits there for good.
-            if end == x, window.contentView?.superview?.hitTest(at(x)) is NSTextView, let up = mouse(.leftMouseUp, at(x)) {
+            if end == x, endY == y, window.contentView?.superview?.hitTest(at(x)) is NSTextView, let up = mouse(.leftMouseUp, at(x)) {
                 NSApp.postEvent(up, atStart: false)
                 window.sendEvent(down)
                 try? await Task.sleep(for: .milliseconds(350))
@@ -367,13 +392,14 @@ enum Automation {
             }
             window.sendEvent(down)
             try? await Task.sleep(for: .milliseconds(40))
-            if end != x {
+            if end != x || endY != y {
                 for step in 1...8 {
-                    if let drag = mouse(.leftMouseDragged, at(x + (end - x) * Double(step) / 8)) { window.sendEvent(drag) }
+                    if let drag = mouse(.leftMouseDragged, along(Double(step) / 8, end)) { window.sendEvent(drag) }
                     try? await Task.sleep(for: .milliseconds(16))
                 }
             }
-            if let up = mouse(.leftMouseUp, at(end)) { window.sendEvent(up) }
+            if let hold = c["holdMs"] as? Double { try? await Task.sleep(for: .milliseconds(hold)) }
+            if let up = mouse(.leftMouseUp, along(1, end)) { window.sendEvent(up) }
             try? await Task.sleep(for: .milliseconds(350))
             return "ok"
         case "mouse-button":
@@ -393,6 +419,33 @@ enum Automation {
             guard MouseNavigation.handle(event, in: window, app: app) else { return "error not taken (not the main window?)" }
             let place = app.place
             return "ok \(place.mode) \(place.threadId ?? "new") back=\(app.canGoBack) forward=\(app.canGoForward)"
+        case "menu-key":
+            // A key equivalent through the main menu, as a press of it
+            // would go: {"key": "down", "modifiers": ["cmd", "opt"]}. Says
+            // whether a menu item took it, the open thread and any
+            // end-of-inbox note.
+            guard let key = c["key"] as? String else { return "error key missing" }
+            let named: [String: Int] = ["down": NSDownArrowFunctionKey, "up": NSUpArrowFunctionKey,
+                                        "left": NSLeftArrowFunctionKey, "right": NSRightArrowFunctionKey]
+            let chars = named[key].map { String(Character(UnicodeScalar($0)!)) } ?? key
+            var flags: NSEvent.ModifierFlags = []
+            for m in c["modifiers"] as? [String] ?? [] {
+                switch m {
+                case "cmd": flags.insert(.command)
+                case "opt": flags.insert(.option)
+                case "ctrl": flags.insert(.control)
+                case "shift": flags.insert(.shift)
+                default: return "error modifier is cmd, opt, ctrl or shift"
+                }
+            }
+            if named[key] != nil { flags.formUnion([.numericPad, .function]) }
+            guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+                                               windowNumber: window?.windowNumber ?? 0, context: nil, characters: chars,
+                                               charactersIgnoringModifiers: chars, isARepeat: false, keyCode: 0) else { return "error no event" }
+            let taken = NSApp.mainMenu?.performKeyEquivalent(with: event) ?? false
+            try? await Task.sleep(for: .milliseconds(150))
+            let note = app.inboxEndNote.map { $0.empty ? " note=empty" : " note=end" } ?? ""
+            return "ok taken=\(taken) selection=\(app.selection ?? "none")\(note)"
         case "options":
             return options(c, app: app)
         case "review":
@@ -427,12 +480,23 @@ enum Automation {
             return composer.readSelection(from: board) ? "ok" : "error paste refused"
         case "return":
             // `"shift": true` for Shift-Return (a new line, carrying a list on).
-            // `"focused": true` presses it where the cursor is, as `type` does.
-            if c["focused"] as? Bool == true { return pressAtCursor(window, characters: "\r", keyCode: 36) }
+            // `"focused": true` presses it where the cursor is, as `type` does,
+            // with `"command": true` for ⌘Return.
+            if c["focused"] as? Bool == true {
+                return pressAtCursor(window, characters: "\r", keyCode: 36, modifiers: c["command"] as? Bool == true ? .command : [])
+            }
             return pressReturn(window, shift: c["shift"] as? Bool == true)
         case "escape":
             // The Escape key, where the cursor is.
             return pressAtCursor(window, characters: "\u{1b}", keyCode: 53)
+        case "arrow":
+            // {"cmd":"arrow","dir":"down"} (or "up"), where the cursor is:
+            // the composer's slash command palette moves its pick.
+            let up = c["dir"] as? String == "up"
+            return pressAtCursor(window, characters: String(UnicodeScalar(up ? 0xF700 : 0xF701)!), keyCode: up ? 126 : 125)
+        case "tab":
+            // The Tab key, where the cursor is.
+            return pressAtCursor(window, characters: "\t", keyCode: 48)
         case "rename":
             // No title: the open thread's title becomes a field, as a click
             // does. With one: saves it, as Return in that field does.
@@ -477,6 +541,49 @@ enum Automation {
             board.clearContents()
             board.writeObjects([URL(fileURLWithPath: path) as NSURL])
             return composer.takeImages(from: board) ? "ok" : "error not an image"
+        case "drop":
+            // {"cmd":"drop","path":…,"x":,"y":} drops a file at that spot in
+            // the window (points from its top left), on the view AppKit would
+            // pick: the deepest one under it signed up for a type it has. `"hover":
+            // true` stops before the drop, so a shot shows the mark;
+            // `"leave": true` drags back off. Errors list the views under it.
+            guard let window = mainWindow, let content = window.contentView,
+                  let x = c["x"] as? Double, let y = c["y"] as? Double else { return "error drop needs x and y" }
+            let board = pasteboard
+            if let path = c["path"] as? String {
+                board.clearContents()
+                board.writeObjects([URL(fileURLWithPath: path) as NSURL])
+            }
+            let point = NSPoint(x: x, y: window.frame.height - y)
+            let hit = content.superview?.hitTest(point) ?? content.hitTest(point)
+            var view = hit
+            // As AppKit does: the first view up from the one under the
+            // pointer signed up for any type the drag has.
+            let types = Set(board.types ?? [])
+            while let v = view, types.isDisjoint(with: v.registeredDraggedTypes) { view = v.superview }
+            guard let target = view else {
+                var chain: [String] = []
+                var v = hit
+                while let each = v { chain.append("\(type(of: each))\(each.registeredDraggedTypes.isEmpty ? "" : "\(each.registeredDraggedTypes.map(\.rawValue))")"); v = each.superview }
+                return "error nothing takes files there: \(chain.joined(separator: " < "))"
+            }
+            // AppKit's own views (an image view, say) want more of a drag
+            // than this stand-in has, so those are only named.
+            guard target is ComposerDropView || target is ComposerTextView else {
+                return "error \(type(of: target)) would get it, not the composer"
+            }
+            let drag = AutomationDrag(pasteboard: board, window: window, location: point)
+            if c["leave"] as? Bool == true {
+                target.draggingExited(drag)
+                return "ok left \(type(of: target))"
+            }
+            let operation = target.draggingEntered(drag)
+            _ = target.draggingUpdated(drag)
+            if c["hover"] as? Bool == true { return "ok \(type(of: target)) \(operation.rawValue)" }
+            let dropped = target.performDragOperation(drag)
+            target.concludeDragOperation(drag)
+            target.draggingEnded(drag)
+            return dropped ? "ok dropped on \(type(of: target))" : "error \(type(of: target)) turned it away"
         case "browser":
             // {"cmd":"browser","do":"click|right|scroll|key|type","x":,"y":,...}: real
             // NSEvents to the Browser panel's page, in the page's own points,
@@ -510,10 +617,36 @@ enum Automation {
             guard let button = buttons.last else { return "error no button \(title)" }
             button.performClick(nil)
             return "ok"
+        case "click-at":
+            // A click at a point in the main window, in points from its
+            // top left, through the window as a real one goes, without moving
+            // the pointer. For what has no tooltip to find it by.
+            guard let window, let x = c["x"] as? Double, let y = c["y"] as? Double else { return "error needs x and y" }
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                guard let event = NSEvent.mouseEvent(with: type, location: NSPoint(x: x, y: window.frame.height - y), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                     windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+                else { return "error no event" }
+                window.sendEvent(event)
+            }
+            return "ok"
+        case "press-button":
+            // {"cmd":"press-button","id":"b7k2abcd"} (or "title":"Fill in the
+            // form") clicks a reply button in the open thread as its pill
+            // would: presses it, or opens the thread a pressed one started.
+            let ids = (app.transcript.session?.model.rows ?? []).flatMap { row -> [String] in
+                if case .assistant(let item) = row.content { return ReplyButtons.ids(in: item.text) }
+                return []
+            }
+            let id = (c["id"] as? String).flatMap { want in ids.last { $0 == want } }
+                ?? (c["title"] as? String).flatMap { want in ids.last { ReplyButtons.shared.known($0)?.button.title == want } }
+            guard let id else { return "error no reply button like that in the open thread" }
+            guard ReplyButtons.shared.known(id) != nil else { return "error button \(id) isn't known" }
+            app.pressReplyButton(id, from: app.transcript.session?.threadId)
+            return "ok"
         case "ask":
             // {"cmd":"ask","row":"ak:6","action":"pick:0:1"} clicks an open
             // asks card's button: "pick:<ask>:<choice>" or "link:<ask>:<link>",
-            // 0-based, "page:<n>" on a paged card, "collapse", or the done card's "next:<n>", "explain:<n>" or "archive:<verdict>" (worked, didntWork, notNeeded; plain "archive" opens the menu).
+            // 0-based, "page:<n>" on a paged card, "collapse", or the done card's "next:<n>", "explain:<n>" or "archive".
             guard let id = c["row"] as? String, let action = c["action"] as? String,
                   case .asks(let card)? = app.transcript.session?.model.row(id: id)?.content else { return "error no asks card" }
             guard card.isOpen else { return "error that card is closed" }
@@ -532,6 +665,10 @@ enum Automation {
             guard let id = target.id else { return target.error }
             app.setStarred(id, name == "star")
             return "ok \(id)"
+        case "milestone":
+            // Scripted runs never earn the note, so this is how to see it.
+            app.milestoneNote = MilestoneNote(tier: c["tier"] as? Int ?? 1000)
+            return "ok"
         case "undo-archive":
             // The Archived note's Undo.
             guard let id = app.archivedNote?.threadId else { return "error no archived note" }
@@ -565,7 +702,7 @@ enum Automation {
             // {"cmd":"panel"} toggles. On a project's page, the project's.
             guard let thread = app.paneThread else { return "error no thread selected" }
             if let id = c["id"] as? String {
-                let ids = (app.openProject == nil ? [PaneSection.highlightsId, AgentBrowser.panelId] : []) + thread.panels.map(\.id) + (thread.patches.isEmpty ? [] : [PaneSection.patchesId])
+                let ids = (app.openProject == nil ? [PaneSection.highlightsId, AgentBrowser.panelId, BuiltinPanels.files] : []) + thread.panels.map(\.id) + (thread.patches.isEmpty ? [] : [PaneSection.patchesId])
                 guard ids.contains(id) else { return "error no panel \(id); this thread has \(ids.joined(separator: ", "))" }
                 app.choosePanel(id, in: thread.id)
             } else if let show = c["show"] as? Bool {
@@ -616,9 +753,16 @@ enum Automation {
             // "close":true} goes back to the section. Over a text file,
             // "edit" true or false is the bar's pencil or Done, "insert"
             // types text at the end of the editor (and waits for the
-            // save, unless "wait" is false), and "resolve" ("file" or
-            // "mine") is the conflict bar's button.
+            // save, unless "wait" is false), "save" true is ⌘S, and
+            // "resolve" ("file" or "mine") is the conflict bar's button.
             guard let thread = app.selectedThread else { return "error no thread selected" }
+            if c["save"] as? Bool == true {
+                guard let controller = TextFileController.current, app.panePreview[thread.id]?.editing == true else {
+                    return "error nothing is being edited"
+                }
+                controller.saveNow()
+                return "ok \(controller.conflict != nil ? "changed on disk, so not saved; " : "")file ends \(((try? String(contentsOf: controller.url, encoding: .utf8)) ?? "").suffix(40).debugDescription)"
+            }
             if c["close"] as? Bool == true {
                 app.closePreview(in: thread.id)
             } else if c["back"] as? Bool == true {
@@ -945,6 +1089,25 @@ enum Automation {
             // give AppKit a moment to redraw in the new one.
             try? await Task.sleep(for: .milliseconds(200))
             return "ok \(mode)"
+        case "voice-stage":
+            // Shows Voice mode's bear in a phase, with no microphone or
+            // engine (screenshots of the avatar); "off" puts it away.
+            guard let id = app.selection else { return "error no thread is open" }
+            // The experiment, for this look only: the mock's hello hasn't it.
+            app.experiments.insert(VoiceMode.experiment)
+            let words = c["text"] as? String ?? ""
+            let level = Float(number(c["level"]) ?? 0)
+            switch c["phase"] as? String {
+            case "listening": VoiceMode.shared.stage(.listening, threadId: id, level: level)
+            case "hearing": VoiceMode.shared.stage(.hearing(words), threadId: id, level: level)
+            case "thinking": VoiceMode.shared.stage(.thinking, threadId: id, level: level)
+            case "speaking": VoiceMode.shared.stage(.speaking, threadId: id, level: level)
+            case "starting": VoiceMode.shared.stage(.starting(words.isEmpty ? "Getting ready…" : words), threadId: id, level: level)
+            case "off": VoiceMode.shared.stage(.off, threadId: nil, level: 0)
+            default: return "error phase is listening, hearing, thinking, speaking, starting or off"
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+            return "ok"
         case "zoom":
             // What ⌘=, ⌘- and ⌘0 do, or a percent from TextZoom.steps.
             let zoom = TextZoom.shared
@@ -986,6 +1149,8 @@ enum Automation {
             return "ok editing seq \(edit.seq)"
         case "swipe":
             return await swipe(c, app: app)
+        case "page-swipe":
+            return await pageSwipe(c, app: app)
         case "decide":
             return decide(c, app: app)
         case "hints":
@@ -1057,6 +1222,24 @@ enum Automation {
             return composer.debugHoverChip(number).map { "ok window \($0)" } ?? "error no chip \(number) with a card"
         case "select-text":
             return select(c, app: app)
+        case "den":
+            // Threadbear > About Threadbear, through the menu item itself.
+            guard let menu = NSApp.mainMenu?.items.first?.submenu,
+                  let index = menu.items.firstIndex(where: { $0.title == "About Threadbear" }) else { return "error no About Threadbear in the app menu" }
+            menu.update()
+            menu.performActionForItem(at: index)
+            try? await Task.sleep(for: .milliseconds(200))
+            return DenWindow.current?.isVisible == true ? "ok " + menu.items.prefix(3).map(\.title).joined(separator: " | ") : "error the Den didn't open"
+        case "room":
+            // Every login's room, as the honey pot and Usage see it:
+            // {"percent": 44}. Lasts until the runner next says otherwise.
+            guard let percent = c["percent"] as? Double else { return "error needs percent" }
+            app.accounts = app.accounts.map {
+                var account = $0
+                account.usage = AccountUsage(windows: [UsageWindow(kind: "weekly", title: "Weekly", remainingPercent: percent)])
+                return account
+            }
+            return "ok"
         case "account-ids":
             // For screenshots: accounts are titled by their email address,
             // so show their ids instead. Lasts until the next reconnect.
@@ -1104,6 +1287,8 @@ enum Automation {
             guard let path = c["path"] as? String, path.hasPrefix("/") else { return "error path must be absolute" }
             if let refused = refusesToWrite(path) { return refused }
             guard var window else { return "error no window" }
+            // {"den": true}: About Threadbear (open it with `den`).
+            if c["den"] as? Bool == true, let den = DenWindow.current { window = den }
             // {"review": id}: its own window.
             if let id = c["review"] as? String {
                 if let review = app.reviewWindows.values.first(where: { $0.session.review.id == id })?.window {
@@ -1172,6 +1357,8 @@ enum Automation {
             return "ok \(window.windowNumber) \(Int(size.width))x\(Int(size.height))"
         case "settings":
             return await settings(c, app: app)
+        case "shortcuts":
+            return await shortcuts(c)
         case "focus":
             // The app acts as if it were in front, so a thread that's open
             // gets marked read the way it does when Mike looks at it. It is
@@ -1180,6 +1367,15 @@ enum Automation {
             app.actsActive = on
             if on { app.appBecameActive() }
             return "ok \(on ? "on" : "off")"
+        case "error":
+            // Puts text in the error bar, as a failure would (its
+            // Investigate button needs one to show); no text clears it.
+            if let text = c["text"] as? String {
+                app.showError(text, in: c["threadId"] as? String, doing: c["doing"] as? String)
+            } else {
+                app.errorMessage = nil
+            }
+            return "ok"
         case "waitFor":
             return await waitFor(c, app: app)
         case "menu":
@@ -1372,7 +1568,7 @@ extension Automation {
     @MainActor
     static func decide(_ c: [String: Any], app: AppModel) -> String {
         guard let thread = app.selectedThread else { return "error no thread open" }
-        guard Decisions.isOpen(thread) else { return "error the open thread has no card of asks to answer" }
+        guard Decisions.isOpen(thread, card: app.sessions[thread.id]?.openCard) else { return "error the open thread has no card of asks to answer" }
         if c["clear"] as? Bool == true {
             for (ask, option) in app.picks(for: thread) { app.pickAnswer(thread: thread, ask: ask, option: option) }
         }
@@ -1435,5 +1631,29 @@ private final class FrameWatch: NSObject {
         let dropped = gaps.filter { $0 > frame * 1.5 }.count
         return String(format: "%d frames at %.1f ms, %d dropped, worst %.0f ms, %d over 20 ms", gaps.count + 1, frame, dropped, worst, missed)
     }
+}
+
+/// Just enough of a drag for `drop`: a file at a spot in the window.
+private final class AutomationDrag: NSObject, NSDraggingInfo {
+    let draggingPasteboard: NSPasteboard
+    let draggingDestinationWindow: NSWindow?
+    let draggingLocation: NSPoint
+    init(pasteboard: NSPasteboard, window: NSWindow, location: NSPoint) {
+        draggingPasteboard = pasteboard
+        draggingDestinationWindow = window
+        draggingLocation = location
+    }
+    var draggingSourceOperationMask: NSDragOperation { .copy }
+    var draggedImageLocation: NSPoint { draggingLocation }
+    var draggedImage: NSImage? { nil }
+    var draggingSource: Any? { nil }
+    var draggingSequenceNumber: Int { 1 }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    var draggingFormation: NSDraggingFormation = .default
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 1
+    func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions = [], for view: NSView?, classes classArray: [AnyClass], searchOptions: [NSPasteboard.ReadingOptionKey: Any] = [:], using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+    func resetSpringLoading() {}
 }
 #endif

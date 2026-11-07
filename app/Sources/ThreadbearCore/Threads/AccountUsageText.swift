@@ -30,6 +30,15 @@ public enum AccountUsageText {
         return usage.windows.filter { !main.contains($0.kind) && seen.insert($0.kind + "|" + $0.title).inserted }
     }
 
+    /// A model's own weeks ("Weekly Fable"), each once. The Usage panel
+    /// gives them their own meters under the main two, as Claude Code's
+    /// /usage does (Ayush, 6 Nov: "usage page should include fable
+    /// section"). They never decide the room: a login out of Fable can
+    /// still run other models.
+    public static func modelWeeks(_ usage: AccountUsage?) -> [UsageWindow] {
+        extraWindows(usage).filter { $0.kind == "weekly_model" }
+    }
+
     /// The tighter of the main windows, the one that runs out first.
     public static func tightest(_ usage: AccountUsage?) -> UsageWindow? {
         mainWindows(usage).min { $0.remainingPercent < $1.remainingPercent }
@@ -43,7 +52,7 @@ public enum AccountUsageText {
 
     /// A percentage as shown: whole numbers, never "100%" for 99.6.
     public static func percent(_ value: Double) -> String {
-        "\(Int(value.rounded(.down)))%"
+        "\(Int(saturating: value.rounded(.down)))%"
     }
 
     /// "5h", "week": the short names the menu uses.
@@ -152,11 +161,13 @@ public enum AccountUsageText {
         return "\(tight.title) resets " + resetTime(reset, now: now, calendar: calendar)
     }
 
-    /// The quiet lines under an account in the usage popover, after its two
-    /// bars. A model's own weekly limit ("Weekly Fable") only when it's
+    /// The quiet lines under an account in the Usage panel, after its
+    /// meters. A bare percentage (Codex's other buckets) only when it's
     /// tighter than the main windows, since otherwise it never decides
     /// anything; any other window by its detail ("$250 allowance: $132.79
-    /// left"); then the account's own part of Token Stats' notice.
+    /// left"); then the account's own part of Token Stats' notice. A
+    /// model's own week has a meter of its own (`modelWeeks`), so it's not
+    /// said here.
     public static func extraLines(_ usage: AccountUsage?, notice: String?, now: Date, calendar: Calendar = .current) -> [String] {
         guard let usage else { return [] }
         let room = room(usage) ?? 100
@@ -164,7 +175,7 @@ public enum AccountUsageText {
         let mainResets = mainWindows(usage).compactMap(\.resetsAt)
         var lines: [String] = []
         var money: [String] = []
-        for window in extraWindows(usage) {
+        for window in extraWindows(usage) where window.kind != "weekly_model" {
             // A bare percentage (a model's own week, Codex's other
             // buckets) only matters when it runs out before the main ones.
             if (window.detail ?? "").isEmpty && window.kind != "allowance" {

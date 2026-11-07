@@ -39,7 +39,7 @@ public struct TurnGap: Hashable, Sendable {
     }
 
     static func later(_ interval: TimeInterval) -> String {
-        let seconds = Int(interval.rounded())
+        let seconds = Int(saturating: interval.rounded())
         if seconds < 60 { return seconds < 2 ? "Moments later" : "\(seconds)s later" }
         let minutes = Int((Double(seconds) / 60).rounded())
         if minutes < 60 { return "\(minutes) min later" }

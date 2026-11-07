@@ -4,11 +4,13 @@ import Foundation
 /// the thread"), as the Mac's WorkLinks reads them: `work:<words>` quotes a
 /// step in the turn's working, `thread:<id>` is another thread and
 /// `review:<id>` a design review, which only the Mac can open.
+/// `button:<id>` is a reply button (ReplyButtons.swift).
 public enum ThreadLinks {
     public enum Target: Equatable, Sendable {
         case step(quote: String)
         case thread(String)
         case review
+        case button(String)
     }
 
     /// What a work: link opens: its turn's working, and the step if it was
@@ -26,12 +28,12 @@ public enum ThreadLinks {
     /// (Mike, 1 Nov). Code spans stay as written, as they're being talked about.
     public static func escapeDestinations(_ markdown: String) -> String {
         guard markdown.contains("](work:") || markdown.contains("](thread:") else { return markdown }
-        let codeSpans = markdown.ranges(of: /`+[^`\n]*`+/)
+        var codeSpans = CodeSpans(markdown.ranges(of: /`+[^`\n]*`+/))
         var out = ""
         var from = markdown.startIndex
         // One level of brackets inside, for `work:npm test (unit)`.
         for match in markdown.matches(of: /\]\((work|thread):((?:[^()\n]|\([^()\n]*\))*)\)/) {
-            if codeSpans.contains(where: { $0.overlaps(match.range) }) { continue }
+            if codeSpans.overlap(match.range) { continue }
             out += markdown[from..<match.output.2.startIndex]
             let raw = String(match.output.2)
             out += (raw.removingPercentEncoding ?? raw).addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
@@ -56,6 +58,7 @@ public enum ThreadLinks {
         case "work": return words.isEmpty ? nil : .step(quote: words)
         case "thread": return words.isEmpty ? nil : .thread(words)
         case "review": return .review
+        case "button": return words.isEmpty ? nil : .button(words)
         default: return nil
         }
     }
@@ -102,7 +105,9 @@ public enum ThreadLinks {
         switch message.role {
         case .tool: normal(message.text).contains(q)
         // A line that links to a step isn't the step, nor is the summary.
-        case .assistant: !message.summary && normal(message.text.replacing(/\]\(work:[^)\n]*\)/, with: "]")).contains(q)
+        // One with no `)` uses up its line and stays: trying every `](work:`
+        // after it again was quadratic.
+        case .assistant: !message.summary && normal(message.text.replacing(/\]\(work:[^)\n]*(\))?/) { $0.1 == nil ? String($0.0) : "]" }).contains(q)
         case .user: false
         }
     }

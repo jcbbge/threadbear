@@ -21,6 +21,9 @@ final class ThreadSession {
     nonisolated static let eventsPage = 500
 
     let threadId: String
+    /// Mike opened this thread with it still saying "Woke up", so the bear on
+    /// its newest wake note plays its waking up, the first time it's shown.
+    @ObservationIgnored var wakeUpPending = false
     /// Set for a sub-agent's transcript: read-only, read whole from
     /// `threads.subagent` (again for more while it runs), never subscribed.
     let subagentId: String?
@@ -76,6 +79,10 @@ final class ThreadSession {
     /// The open card (TranscriptModel.openCard), observed, so the composer
     /// it's drawn in follows its picks and notes and drops it once it closes.
     private(set) var openCard: TranscriptRow?
+    /// Observed by recovery controls outside the AppKit transcript. The
+    /// rows themselves aren't observed, so a refusal arriving after its
+    /// thread summary must still redraw the offer.
+    private(set) var latestCompletion: TurnCompletion?
 
     init(threadId: String, subagentId: String? = nil, app: AppModel) {
         self.threadId = threadId
@@ -120,6 +127,8 @@ final class ThreadSession {
         failureHeadline = nil
         let threadId = threadId
         let expanded = expanded
+        // Another Mac's thread draws no pictures from this Mac (MarkdownRenderer.localPictures).
+        let localPictures = !(app?.isRemote(threadId) ?? false)
         // File rows name folders from the thread's folder.
         let root = app?.threads[threadId]?.cwd
         let signpost = perfLog.beginInterval("open", id: perfLog.makeSignpostID(), "\(threadId)")
@@ -129,11 +138,29 @@ final class ThreadSession {
                 let debug = CommandLine.arguments.contains("--perf-debug")
                 if debug { print(String(format: "    open %@: before fetch %.0f MB", threadId, memoryMB())) }
                 let client = try await appModel.openClient(for: threadId)
+                // Buttons made in turns older than the page: asked for
+                // alongside it (an older runner has no buttons.list).
+                let buttonList = Task { try? await client.replyButtons(threadId: threadId) }
                 let page = try await client.events(threadId: threadId, limit: Self.eventsPage)
+                // Known before the rows render, so a reply's pills are
+                // right the first time. The list is waited for only when
+                // the page links a button its events don't have.
+                let buttons = ReplyButtons.shared
+                buttons.fold(page.events, threadId: threadId)
+                let unknown = page.events.contains { event in
+                    guard case .assistantText(_, let text, _, _, _, _) = event.payload else { return false }
+                    return ReplyButtons.ids(in: text).contains { buttons.known($0) == nil }
+                }
+                if unknown {
+                    if let list = await buttonList.value { buttons.receive(list, threadId: threadId) }
+                } else {
+                    Task { if let list = await buttonList.value { buttons.receive(list, threadId: threadId) } }
+                }
                 if debug { print(String(format: "    after fetch %.0f MB", memoryMB())) }
                 // What the thread's summary says is running in the
                 // background, for the line at the end.
                 let background = app?.threads[threadId]?.background ?? []
+                let looseEnds = app?.threads[threadId]?.looseEnds
                 // Answers picked on the open card before it was last shown.
                 let picks = app?.askPicks[threadId]
                 let nextPicks = app?.nextPicks[threadId]
@@ -144,12 +171,13 @@ final class ThreadSession {
                         _ = model.setAskNotes(picks.asksSeq, picks.notes)
                     }
                     if let nextPicks { _ = model.setNextPicks(nextPicks.seq, nextPicks.picked, explain: nextPicks.explain) }
+                    _ = model.setLooseEnds(looseEnds)
                     model.load(events: page.events, inProgress: page.inProgress)
                     model.knownStart = page.atStart
                     _ = model.setBackground(background)
                     if debug { print(String(format: "    after model %.0f MB", memoryMB())) }
                     let start = max(0, model.rows.count - Self.initialRows)
-                    TranscriptController.renders.prepare(Array(model.rows[start...]), expanded: expanded, width: width)
+                    TranscriptController.renders.prepare(Array(model.rows[start...]), expanded: expanded, width: width, localPictures: localPictures)
                     if debug { print(String(format: "    after prepare %.0f MB", memoryMB())) }
                     return (model, start)
                 }.value
@@ -183,6 +211,8 @@ final class ThreadSession {
         missing = false
         let threadId = threadId
         let expanded = expanded
+        // Another Mac's thread draws no pictures from this Mac (MarkdownRenderer.localPictures).
+        let localPictures = !(app?.isRemote(threadId) ?? false)
         let root = app?.threads[threadId]?.cwd
         loadTask = Task {
             defer { loadTask = nil }
@@ -194,7 +224,7 @@ final class ThreadSession {
                     model.load(events: reply.events, inProgress: [])
                     if let live { _ = model.setLiveTurn("", startedAt: live) }
                     let start = max(0, model.rows.count - Self.initialRows)
-                    TranscriptController.renders.prepare(Array(model.rows[start...]), expanded: expanded, width: width)
+                    TranscriptController.renders.prepare(Array(model.rows[start...]), expanded: expanded, width: width, localPictures: localPictures)
                     return (model, start)
                 }.value
                 feed = ThreadFeed(model: prepared.0)
@@ -244,6 +274,7 @@ final class ThreadSession {
         do {
             let reply = try await client.subscribe(threadId: threadId, afterSeq: feed.acceptedSeq)
             subscribed = true
+            ReplyButtons.shared.fold(reply.events, threadId: threadId)
             handle(feed.finishSubscribe(reply.events, inProgress: reply.inProgress))
             // An older page that failed while the connection was down,
             // retries used up on a short page that can't scroll: ask again
@@ -314,6 +345,7 @@ final class ThreadSession {
 
     func receive(_ event: Event) {
         guard state == .loaded else { return }
+        if subagentId == nil { VoiceMode.shared.receive(event) }
         handle(feed.receive(event))
     }
 
@@ -343,6 +375,7 @@ final class ThreadSession {
                 if stalls > 0 { try? await Task.sleep(for: .milliseconds(250 << min(stalls, 3))) }
                 do {
                     let page = try await client.events(threadId: threadId, afterSeq: afterSeq, limit: 2000)
+                    ReplyButtons.shared.fold(page.events, threadId: threadId)
                     handle(feed.catchUp(page.events))
                 } catch {
                     feed.catchUpFailed()
@@ -386,6 +419,15 @@ final class ThreadSession {
         guard state == .loaded, !rebuilding else { return }
         let oldStart = displayStart
         let change = feed.setBackground(tasks)
+        guard !change.isEmpty else { return }
+        show(change, oldStart: oldStart)
+    }
+
+    /// The summary's loose-ends check for the done card changed.
+    func setLooseEnds(_ check: LooseEnds?) {
+        guard state == .loaded, !rebuilding else { return }
+        let oldStart = displayStart
+        let change = feed.setLooseEnds(check)
         guard !change.isEmpty else { return }
         show(change, oldStart: oldStart)
     }
@@ -506,9 +548,31 @@ final class ThreadSession {
         view?.apply(removed: removed, inserted: inserted, updated: updated)
     }
 
+    private static func cardSeq(_ row: TranscriptRow?) -> Int? {
+        if case .asks(let card)? = row?.content { return card.seq }
+        return nil
+    }
+
+    /// The card that's just turned up, until the composer has settled it in.
+    @ObservationIgnored var arrivingCard: Int?
+
     private func syncOpenCard() {
+        if feed.model.openTurn == nil {
+            let latest = feed.model.rows.reversed().lazy.compactMap { row -> TurnCompletion? in
+                if case .footer(let completion) = row.content { return completion }
+                return nil
+            }.first
+            if latest != latestCompletion { latestCompletion = latest }
+        } else if latestCompletion != nil {
+            latestCompletion = nil
+        }
         let card = feed.model.openCard
-        if card != openCard { openCard = card }
+        guard card != openCard else { return }
+        // A card turning up as he watches, rather than one that was there
+        // when the thread opened: only this one settles in (`ComposerCard`).
+        if let seq = Self.cardSeq(card), seq != Self.cardSeq(openCard), state == .loaded, !rebuilding, view != nil { arrivingCard = seq }
+        openCard = card
+        app?.relayCardChanged(threadId)
     }
 
     // MARK: Older rows
@@ -520,12 +584,14 @@ final class ThreadSession {
         loadingOlder = true
         let width = view?.width ?? 800
         let expanded = expanded
+        // Another Mac's thread draws no pictures from this Mac (MarkdownRenderer.localPictures).
+        let localPictures = !(app?.isRemote(threadId) ?? false)
         if displayStart > 0 {
             let newStart = max(0, displayStart - Self.pageRows)
             let rows = Array(feed.model.rows[newStart..<displayStart])
             Task {
                 await Task.detached(priority: .userInitiated) {
-                    TranscriptController.renders.prepare(rows, expanded: expanded, width: width)
+                    TranscriptController.renders.prepare(rows, expanded: expanded, width: width, localPictures: localPictures)
                 }.value
                 // Where the reader is, read while the table and `displayStart`
                 // still agree (a flush may have landed during the await).
@@ -546,6 +612,8 @@ final class ThreadSession {
                 let fetchStart = CACurrentMediaTime()
                 let page = try await client.events(threadId: threadId, beforeSeq: before, limit: Self.eventsPage)
                 olderFetchMs.append((CACurrentMediaTime() - fetchStart) * 1000)
+                // An older snapshot never undoes a newer one (ReplyButton.supersedes).
+                ReplyButtons.shared.fold(page.events, threadId: threadId)
                 olderFailures = 0
                 guard page.events.contains(where: { !$0.isTransient && $0.seq < before }) else {
                     // Step back past the range the page covered and go on.
@@ -562,7 +630,7 @@ final class ThreadSession {
                     let result = copy.prepend(olderEvents: page.events)
                     if page.atStart { copy.knownStart = true }
                     let newStart = max(0, result.added - Self.pageRows)
-                    TranscriptController.renders.prepare(Array(copy.rows[newStart..<result.added]), expanded: expanded, width: width)
+                    TranscriptController.renders.prepare(Array(copy.rows[newStart..<result.added]), expanded: expanded, width: width, localPictures: localPictures)
                     return (copy, result)
                 }.value
                 // Read the scroll anchor before the model changes under the
@@ -629,32 +697,156 @@ final class ThreadSession {
 
     // MARK: Actions
 
-    /// Ticks an ask on the open card. The runner's thread.updated and
-    /// asks.ticked event bring the change back.
+    /// Ticks an ask on the open card. The box changes at once and goes back
+    /// if the runner refuses. A click while one's on its way does nothing, so
+    /// a double click doesn't undo itself, and two can't overlap: if both
+    /// failed, the second's rollback would leave the first's guess showing.
+    /// The runner's thread.updated and asks.ticked event bring the change back.
     func tickAsk(asksSeq: Int, index: Int, ticked: Bool) {
-        guard let client = app?.client(for: threadId) else { return }
+        guard let app, let client = app.client(for: threadId) else { return }
         let threadId = threadId
-        Task {
+        let key = BusyKey.tickAsk(threadId, asksSeq: asksSeq, index: index)
+        guard !app.isBusy(key) else { return }
+        if askShown(asksSeq: asksSeq, index: index) != nil { app.threads[threadId]?.asks[index].ticked = ticked }
+        app.whileBusy(key) { [self] in
             do {
                 _ = try await client.tickAsk(threadId: threadId, asksSeq: asksSeq, index: index, ticked: ticked)
             } catch {
+                if askShown(asksSeq: asksSeq, index: index) == ticked { app.threads[threadId]?.asks[index].ticked = !ticked }
+                app.show(error)
+            }
+        }
+    }
+
+    /// Whether the ask is ticked now, or nil if that card has gone: a newer
+    /// card's ask at the same place mustn't be changed.
+    private func askShown(asksSeq: Int, index: Int) -> Bool? {
+        guard let thread = app?.threads[threadId], thread.asksSeq == asksSeq, thread.asks.indices.contains(index) else { return nil }
+        return thread.asks[index].ticked
+    }
+
+    /// Requests being read for their cards (docs/protocol.md, "Asking
+    /// another runner"), so a card drawn again doesn't ask again.
+    private var startRequestsLoading: Set<String> = []
+
+    /// Reads another runner's request for a thread from this Mac's own
+    /// runner (the only one that can), and puts it on its card.
+    func loadStartRequest(_ approvalId: String) {
+        guard !startRequestsLoading.contains(approvalId), let client = app?.client else { return }
+        startRequestsLoading.insert(approvalId)
+        let threadId = threadId
+        Task { [weak self] in
+            let info: StartRequest
+            do {
+                info = try await client.startRequest(threadId: threadId, approvalId: approvalId)
+            } catch {
+                info = .failed(error.localizedDescription)
+            }
+            // Loaded or not, it may be asked for again: a reload (the direct
+            // link turned on or off) builds the card afresh without it.
+            self?.startRequestsLoading.remove(approvalId)
+            guard let self, self.state == .loaded, !self.rebuilding else { return }
+            let oldStart = self.displayStart
+            let change = self.feed.setStartRequest(approvalId, info)
+            if !change.isEmpty { self.show(change, oldStart: oldStart) }
+        }
+    }
+
+    /// Start it or Don't on another runner's request: this Mac's runner
+    /// starts it and answers the card (requests.answer), never the
+    /// thread's own runner, which may not start threads elsewhere.
+    private func answerStartRequest(approvalId: String, allow: Bool) -> Bool {
+        guard case .approval(let item)? = feed.model.item(id: "ap:" + approvalId)?.content, item.isStartRequest else { return false }
+        // Only what Mike has read can be started: never one still loading
+        // or that failed to load. The fingerprint ties the answer to what
+        // the card showed, so a request filed again under the same id with
+        // other words isn't started on the strength of the old card.
+        guard let client = app?.client else { return true }
+        let shown = item.startRequest
+        if allow, shown == nil || shown?.error != nil || shown?.fingerprint == nil { return true }
+        let threadId = threadId
+        let runnerId = shown?.startsOn?.id
+        let fingerprint = shown?.fingerprint
+        ActivityRecorder.shared.answered(threadId: threadId, decision: allow ? .allow : .deny)
+        startAnswering(approvalId)
+        Task {
+            do {
+                try await client.answerStartRequest(threadId: threadId, approvalId: approvalId, allow: allow, runnerId: allow ? runnerId : nil, fingerprint: fingerprint)
+            } catch {
+                self.stopAnswering(approvalId)
+                app?.show(error)
+            }
+        }
+        return true
+    }
+
+    /// Cards whose answer is on its way. Another runner's thread takes a
+    /// moment or more to hear it (relay.ts waits for that runner to take
+    /// the command), so the card shows a spinner, its buttons stop taking
+    /// clicks, and a second click or Return does nothing. Once the answer
+    /// lands the card turns into its answered line by itself; on a failure
+    /// the buttons come back with the error.
+    private(set) var answering: Set<String> = []
+
+    private func startAnswering(_ approvalId: String) {
+        answering.insert(approvalId)
+        view?.refreshCard(approvalId)
+    }
+
+    private func stopAnswering(_ approvalId: String) {
+        answering.remove(approvalId)
+        view?.refreshCard(approvalId)
+    }
+
+    func respond(approvalId: String, decision: ApprovalDecision, answers: [String: String]?, message: String?) {
+        guard !answering.contains(approvalId) else { return }
+        if decision != .answered, answerStartRequest(approvalId: approvalId, allow: decision != .deny) { return }
+        guard let client = app?.client(for: threadId) else { return }
+        let threadId = threadId
+        ActivityRecorder.shared.answered(threadId: threadId, decision: decision)
+        startAnswering(approvalId)
+        Task {
+            do {
+                try await client.respond(threadId: threadId, approvalId: approvalId, decision: decision, message: message, answers: answers)
+            } catch {
+                self.stopAnswering(approvalId)
                 app?.show(error)
             }
         }
     }
 
-    func respond(approvalId: String, decision: ApprovalDecision, answers: [String: String]?, message: String?) {
-        guard let client = app?.client(for: threadId) else { return }
+    /// The approval card as this thread shows it now, nil once it's settled
+    /// or not there (Voice checks a spoken answer against it).
+    func openApproval(_ approvalId: String) -> ApprovalRequest? {
+        guard !answering.contains(approvalId),
+              case .approval(let item)? = feed.model.item(id: "ap:\(approvalId)")?.content,
+              item.resolution == nil else { return nil }
+        return item.request
+    }
+
+    /// Go ahead on a "Plan first" plan card (docs/protocol.md).
+    /// The card spins like an approval's until the answer lands.
+    func approvePlan(itemId: String) {
+        guard !answering.contains(itemId), let client = app?.client(for: threadId) else { return }
         let threadId = threadId
-        ActivityRecorder.shared.answered(threadId: threadId, decision: decision)
+        ActivityRecorder.shared.answered(threadId: threadId, decision: .allow)
+        startAnswering(itemId)
         Task {
             do {
-                try await client.respond(threadId: threadId, approvalId: approvalId, decision: decision, message: message, answers: answers)
+                try await client.approvePlan(threadId: threadId, itemId: itemId)
+                // The card turns into its approved state by itself. Let go
+                // a little later in case that never comes, so it can be
+                // pressed again.
+                try? await Task.sleep(for: Self.planLetGo)
             } catch {
                 app?.show(error)
             }
+            self.stopAnswering(itemId)
         }
     }
+
+    /// A var only so tests can make it short.
+    static var planLetGo: Duration = .seconds(5)
 
     /// Sends a secret card's answer (docs/protocol.md, "Secrets") to the
     /// thread's own runner, this Mac's or another's. Nil once it's gone,
@@ -676,23 +868,34 @@ final class ThreadSession {
         }
     }
 
-    /// Copies the whole thread, fetching any older pages first.
+    /// Copies the whole thread, fetching any older pages first, which takes
+    /// a while on a long one: the banner says so until it's on the clipboard.
+    /// A page that can't be read leaves the clipboard alone and says why,
+    /// rather than copying part of the thread as if it were all of it.
     func copyTranscript() {
-        guard let client = app?.client(for: threadId) else { return }
+        guard let app, let client = app.client(for: threadId) else { return }
         let threadId = threadId
-        let title = app?.threads[threadId]?.title ?? ""
-        var events = feed.model.events
-        Task {
+        let title = app.threads[threadId]?.title ?? ""
+        let newest = feed.model.events
+        app.whileBusy(BusyKey.copying(threadId), note: "Copying the transcript…") {
+            var events = newest
             var first = events.first?.seq ?? 0
-            while first > 1 {
-                guard let page = try? await client.events(threadId: threadId, beforeSeq: first, limit: 2000), !page.events.isEmpty else { break }
-                events = page.events + events
-                first = page.events.first?.seq ?? 1
+            do {
+                while first > 1 {
+                    let page = try await client.events(threadId: threadId, beforeSeq: first, limit: 2000)
+                    guard !page.events.isEmpty else { break }
+                    events = page.events + events
+                    first = page.events.first?.seq ?? 1
+                }
+            } catch {
+                app.show(error)
+                return
             }
             let all = events
             // Items, not rows: nothing folded in a group is left out.
             let text = await Task.detached { MarkdownExport.transcript(title: title, rows: TranscriptModel(events: all).items) }.value
-            app?.copyToPasteboard(text)
+            app.copyToPasteboard(text)
+            app.flashDone("Transcript copied")
         }
     }
 }

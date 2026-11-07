@@ -110,11 +110,11 @@ public enum ScheduleTime {
     public static func relative(_ date: Date, now: Date) -> String {
         let seconds = date.timeIntervalSince(now)
         if seconds <= 0 { return "now" }
-        let minutes = Int((seconds / 60).rounded(.up))
+        let minutes = Int(saturating: (seconds / 60).rounded(.up))
         if minutes < 60 { return "in \(minutes)m" }
-        let hours = Int((seconds / 3600).rounded())
+        let hours = Int(saturating: (seconds / 3600).rounded())
         if hours < 24 { return "in \(hours)h" }
-        let days = Int((seconds / 86_400).rounded())
+        let days = Int(saturating: (seconds / 86_400).rounded())
         return days == 1 ? "in 1 day" : "in \(days) days"
     }
 

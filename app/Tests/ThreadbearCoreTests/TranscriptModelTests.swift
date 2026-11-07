@@ -22,6 +22,28 @@ final class TranscriptModelTests: XCTestCase {
         XCTAssertEqual(model.lastSeq, 7)
     }
 
+    /// "Woke up after hibernating for 2 days." is what Mike opened the thread
+    /// to read, so it has a row of its own under the turn before, rather than
+    /// going into that turn's "Worked for" group. Other notes still fold.
+    func testAWakeNoteStaysOutOfTheGroupAbove() {
+        let model = TranscriptModel(events: [
+            E.event(1, "turn.started", ["turnId": "t1"]),
+            E.user(2, "Fix the test"),
+            E.call(3, "c1", title: "npm test"),
+            E.result(4, "c1", text: "ok"),
+            E.text(5, "m1", "Fixed it."),
+            E.done(6),
+            E.event(7, "system.note", ["text": "Put in Threadbear"], turn: nil),
+            E.event(8, "system.note", ["text": "Woke up after hibernating for 2 days."], turn: nil),
+        ])
+        XCTAssertEqual(model.rows.map(\.id), ["u:2", "g:t:c1", "a:m1", "f:t1", "n:8"])
+        XCTAssertEqual(model.rows.last?.inGroup, false)
+        for note in ["Woke up after hibernating for 2 days.", "Woke up from hibernating.", "Woke up after 3 hours, as the runner restarted.", "Woke up: Mike mentioned woodworking."] {
+            XCTAssertTrue(RowContent.note(note).isWakeNote, note)
+        }
+        XCTAssertFalse(RowContent.note("Put in Threadbear").isWakeNote)
+    }
+
     /// The summary's background work is the last row while no turn runs:
     /// it comes and goes in place, and a running turn's working line takes
     /// its place.
@@ -171,6 +193,54 @@ final class TranscriptModelTests: XCTestCase {
         guard case .approval(let approval) = model.rows[0].content, case .question(let question) = model.rows[1].content else { return XCTFail() }
         XCTAssertEqual(approval.resolution?.decision, .deny)
         XCTAssertEqual(question.resolution?.decision, .answered)
+    }
+
+    /// A subagent's card can be open with no turn, across turns (7 Nov 2026):
+    /// it was folded into the finished turn and the thread sat in Needs you
+    /// with nothing to answer in sight.
+    func testASubagentsOpenCardStaysAtTheEndUntilAnswered() {
+        var model = TranscriptModel()
+        _ = model.apply([
+            E.event(1, "turn.started", ["turnId": "t1"], turn: "t1"),
+            E.event(2, "user.message", ["text": "go"], turn: "t1"),
+            E.event(3, "assistant.text", ["itemId": "a1", "text": "Started."], turn: "t1"),
+            E.event(4, "turn.completed", ["turnId": "t1", "outcome": "completed", "durationMs": 100], turn: "t1"),
+            E.event(5, "approval.requested", ["approvalId": "ap1", "name": "Write", "title": "Write a.ts", "input": [:], "options": ["allow", "deny"]], turn: nil),
+        ])
+        _ = model.setBackground([BackgroundTask(kind: .agent, description: "Port it")])
+        XCTAssertEqual(model.rows.last?.id, "ap:ap1")
+        XCTAssertFalse(model.rows.contains { $0.kind == .background }, "no \"working\" under a card it's waiting on")
+        XCTAssertEqual(model.pendingApprovalIds, ["ap1"])
+        // A later turn goes above it.
+        _ = model.apply([
+            E.event(6, "turn.started", ["turnId": "t2"], turn: "t2"),
+            E.event(7, "user.message", ["text": "ping"], turn: "t2"),
+            E.event(8, "assistant.text", ["itemId": "a2", "text": "pong"], turn: "t2"),
+        ])
+        XCTAssertTrue(model.rows.contains { $0.id == "ap:ap1" })
+        XCTAssertLessThan(model.rows.firstIndex { $0.id == "a:a2" } ?? .max, model.rows.firstIndex { $0.id == "ap:ap1" } ?? -1)
+        _ = model.apply([E.event(9, "turn.completed", ["turnId": "t2", "outcome": "completed", "durationMs": 100], turn: "t2")])
+        XCTAssertEqual(model.rows.last?.id, "ap:ap1")
+        XCTAssertEqual(model.rows.filter { $0.id == "ap:ap1" }.count, 1)
+        // Denied: it goes back to its place above t2.
+        _ = model.apply([E.event(10, "approval.resolved", ["approvalId": "ap1", "decision": "deny"], turn: nil)])
+        XCTAssertFalse(model.rows.contains { $0.id == "ap:ap1" }, "answered, it folds into its finished turn like any card")
+        XCTAssertTrue(model.pendingApprovalIds.isEmpty)
+        XCTAssertTrue(model.rows.contains { $0.kind == .background }, "and the background line is back")
+    }
+
+    /// A card from inside a running turn stays put, and floats once that ends.
+    func testASubagentsCardFromATurnFloatsWhenThatTurnEnds() {
+        var model = TranscriptModel()
+        _ = model.apply([
+            E.event(1, "turn.started", ["turnId": "t1"], turn: "t1"),
+            E.event(2, "user.message", ["text": "go"], turn: "t1"),
+            E.event(3, "approval.requested", ["approvalId": "ap1", "name": "Write", "title": "Write a.ts", "input": [:], "options": ["allow", "deny"]], turn: "t1"),
+            E.event(4, "assistant.text", ["itemId": "a1", "text": "Started."], turn: "t1"),
+        ])
+        XCTAssertLessThan(model.rows.firstIndex { $0.id == "ap:ap1" } ?? .max, model.rows.firstIndex { $0.id == "a:a1" } ?? -1)
+        _ = model.apply([E.event(5, "turn.completed", ["turnId": "t1", "outcome": "completed", "durationMs": 100], turn: "t1")])
+        XCTAssertEqual(model.rows.last?.id, "ap:ap1")
     }
 
     /// A secret card is a pending approval of its own (`s:`): resolved by

@@ -12,6 +12,15 @@ public enum PhotoPrep {
     /// How many photos one message takes (phone.ts, MAX_COMMAND_IMAGES).
     public static let maxPhotos = 6
 
+    /// The most a photo can be before it's prepared: past these it's
+    /// refused before anything decodes it. A pasted picture can be a small
+    /// file that unpacks to a huge one (a 16,000 px square PNG is 750 KB
+    /// and 768 MB of pixels), and decoding that froze the phone or got it
+    /// killed for its memory (Daybreak, 7 Nov 2026). The camera's 48 MP
+    /// photos and its panoramas fit.
+    public static let maxSourceBytes = 100 * 1024 * 1024
+    public static let maxSourcePixels = 100_000_000
+
     /// The long edge of a composer's thumbnail: its 64 pt tile at 3x, for a
     /// 3:2 photo's short side, and plenty for a chip.
     public static let thumbnailPixels = 320
@@ -22,6 +31,38 @@ public enum PhotoPrep {
     public struct Prepared: Sendable {
         public let jpeg: Data
         public let thumbnail: CGImage
+    }
+
+    /// `prepared(from:)`, two photos at a time at most, so six big ones
+    /// added together don't all hold their pixels at once.
+    public static func preparedInTurn(from data: Data) async -> Prepared? {
+        await inTurn { prepared(from: data) }
+    }
+
+    /// `work`, two at a time at most across the app (the same turns as
+    /// `preparedInTurn`'s).
+    public static func inTurn<T: Sendable>(_ work: @Sendable () async -> T) async -> T {
+        await gate.enter()
+        let result = await work()
+        await gate.leave()
+        return result
+    }
+
+    private static let gate = Gate(width: 2)
+
+    private actor Gate {
+        private var free: Int
+        private var waiting: [CheckedContinuation<Void, Never>] = []
+        init(width: Int) { free = width }
+
+        func enter() async {
+            if free > 0 { free -= 1; return }
+            await withCheckedContinuation { waiting.append($0) }
+        }
+
+        func leave() {
+            if waiting.isEmpty { free += 1 } else { waiting.removeFirst().resume() }
+        }
     }
 
     public static func prepared(from data: Data) -> Prepared? {
@@ -36,8 +77,24 @@ public enum PhotoPrep {
         return Prepared(jpeg: jpeg, thumbnail: thumbnail)
     }
 
+    /// Whether a picture is small enough to prepare, from its size and the
+    /// width and height its header gives, before any of it is decoded.
+    public static func fits(_ data: Data) -> Bool {
+        guard data.count <= maxSourceBytes, let source = CGImageSourceCreateWithData(data as CFData, nil) else { return false }
+        return fits(source)
+    }
+
+    static func fits(_ source: CGImageSource) -> Bool {
+        guard CGImageSourceGetCount(source) > 0,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+              width >= 1, height >= 1, width * height <= Double(maxSourcePixels) else { return false }
+        return true
+    }
+
     public static func jpeg(from data: Data, maxPixels: Int = maxPixels, quality: Double = 0.85) -> Data? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        guard data.count <= maxSourceBytes, let source = CGImageSourceCreateWithData(data as CFData, nil), fits(source) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,

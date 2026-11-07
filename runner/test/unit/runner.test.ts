@@ -543,7 +543,7 @@ test('a dated snooze or a message clears an until-restart snooze', () => {
   h.runner.update({ threadId: thread.id, snoozedUntil: 'restart' });
   h.runner.send(thread.id, 'back to it');
   assert.equal(h.runner.get(thread.id).snoozedUntilRestart, undefined);
-  assert.throws(() => h.runner.update({ threadId: thread.id, snoozedUntil: 'later' }), /ISO time or "restart"/);
+  assert.throws(() => h.runner.update({ threadId: thread.id, snoozedUntil: 'later' }), /ISO time, "restart" or "release"/);
 });
 
 test('an archive says who did it, and Mike\'s verdict goes in the thread', () => {
@@ -770,6 +770,70 @@ test('startup recovery: mid-turn threads stop, approvals expire, queued text is 
   assert.equal(h2.adapter.last.opts.resume, true);
 });
 
+test("startup recovery: a subagent's card with no turn closes, and no turn is resumed for it", () => {
+  const h = makeHarness();
+  const { thread } = create(h, { permissionMode: 'ask' });
+  const s = h.adapter.last;
+  s.init();
+  s.result();
+  void s.sink.requestApproval({ name: 'Write', title: 'Write a.ts', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  const req = h.events(thread.id).at(-1) as any;
+  const turns = h.events(thread.id).filter((e) => e.type === 'turn.completed').length;
+  (h.runner as any).flush();
+  const h2 = h.restart();
+  const t = h2.runner.get(thread.id);
+  assert.equal(t.status, 'idle', 'nothing was cut short but the subagent');
+  const evs = h2.runner.events(thread.id).events;
+  const closed = evs.find((e) => e.type === 'approval.resolved') as any;
+  assert.equal(closed.approvalId, req.approvalId);
+  assert.equal(closed.decision, 'expired');
+  assert.equal(evs.filter((e) => e.type === 'turn.completed').length, turns, 'no turn to end');
+  assert.deepEqual(checkSequence(evs), []);
+});
+
+// Codex review: thread.json a step behind the log, so the card looks open.
+test("startup recovery: a card answered on disk keeps its answer", async () => {
+  const h = makeHarness();
+  const { thread } = create(h, { permissionMode: 'ask' });
+  const s = h.adapter.last;
+  s.init();
+  s.result();
+  const answer = s.sink.requestApproval({ name: 'Write', title: 'Write a.ts', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  const req = h.events(thread.id).at(-1) as any;
+  const runner = h.runner as any;
+  runner.flush();
+  const stale = fs.readFileSync(path.join(h.cfg.home, 'threads', thread.id, 'thread.json'), 'utf8');
+  h.runner.respondApproval({ threadId: thread.id, approvalId: req.approvalId, decision: 'allow' });
+  await answer;
+  runner.flush();
+  fs.writeFileSync(path.join(h.cfg.home, 'threads', thread.id, 'thread.json'), stale);
+  const h2 = h.restart();
+  const closed = h2.runner.events(thread.id).events.filter((e) => e.type === 'approval.resolved') as any[];
+  assert.deepEqual(closed.map((e) => e.decision), ['allow']);
+  assert.equal(h2.runner.get(thread.id).status, 'idle');
+});
+
+// Codex review: the parent's turn.completed reached the log, then a crash
+// before thread.json was saved: recovery trusted the log's turn to have closed
+// every card, and a subagent's stayed drawn as open for good.
+test("startup recovery: a subagent's card open when the turn ended on disk still closes", () => {
+  const h = makeHarness();
+  const { thread, turnId } = create(h, { permissionMode: 'ask' });
+  const s = h.adapter.last;
+  s.init();
+  void s.sink.requestApproval({ name: 'Write', title: 'Write a.ts', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  const req = h.events(thread.id).find((e) => e.type === 'approval.requested') as any;
+  // The event log has the turn's end, thread.json doesn't yet.
+  const runner = h.runner as any;
+  runner.flush();
+  const log = runner.store.log(thread.id);
+  log.append({ seq: log.lastSeq + 1, ts: new Date().toISOString(), threadId: thread.id, turnId, type: 'turn.completed', outcome: 'completed', durationMs: 1 });
+  const h2 = h.restart();
+  assert.equal(h2.runner.get(thread.id).status, 'idle');
+  const closed = h2.runner.events(thread.id).events.filter((e) => e.type === 'approval.resolved') as any[];
+  assert.deepEqual(closed.map((e) => e.approvalId), [req.approvalId]);
+});
+
 test('startup recovery: a message still waiting for its turn is kept as a note', () => {
   const h = makeHarness();
   const { thread, turnId } = create(h);
@@ -907,29 +971,27 @@ test('a turn the CLI starts by itself gets turn events, a running status and nee
   assert.equal(h.runner.hasIdleTimer(thread.id), true);
 });
 
-test("a message sent while a turn is only a background subagent's approval waits for that turn", async () => {
+test("a message sent while only a background subagent's card is open starts a turn at once, and the card stays", async () => {
   const h = makeHarness();
   const { thread } = create(h, { permissionMode: 'ask' });
   const s = h.adapter.last;
   s.init();
   s.result();
   h.runner.markSeen(thread.id, h.runner.get(thread.id).lastSeq);
-  // A background subagent asks for approval with no turn running: the
-  // runner opens a turn for the card, but the CLI isn't running one.
-  const ac = new AbortController();
-  const answer = s.sink.requestApproval({ name: 'Bash', title: 'npm test', input: {}, canAlwaysAllow: true, signal: ac.signal });
+  const started = h.events(thread.id).filter((e) => e.type === 'turn.started').length;
+  const answer = s.sink.requestApproval({ name: 'Bash', title: 'npm test', input: {}, canAlwaysAllow: true, signal: new AbortController().signal });
+  assert.equal(h.events(thread.id).filter((e) => e.type === 'turn.started').length, started, "a card isn't a turn");
   assert.equal(h.runner.get(thread.id).status, 'waiting');
   const { turnId: next } = h.runner.send(thread.id, 'while you wait');
-  assert.equal(s.sent.length, 1, 'nothing to join; waits');
+  assert.equal(s.sent.length, 2, "it isn't held back behind the card");
+  assert.equal(s.sent[1].id, next);
+  assert.equal(h.runner.get(thread.id).status, 'waiting', 'the card is still open');
   const approvalId = h.events(thread.id).find((e) => e.type === 'approval.requested').approvalId;
   h.runner.respondApproval({ threadId: thread.id, approvalId, decision: 'allow' });
-  await answer;
-  assert.equal(s.sent.length, 1, 'the turn goes on until the CLI runs one and ends it');
-  s.out({ kind: 'cliTurn' });
-  s.result('completed', 0, undefined, { own: true });
-  // That turn ended; the waiting message starts its own.
-  assert.equal(s.sent.length, 2);
-  assert.equal(s.sent[1].id, next);
+  assert.equal((await answer).decision, 'allow');
+  assert.equal(h.runner.get(thread.id).status, 'running', 'his message is still being answered');
+  s.result();
+  assert.equal(h.runner.get(thread.id).status, 'idle');
   assert.deepEqual(checkSequence(h.events(thread.id)), []);
 });
 
@@ -956,7 +1018,7 @@ test("a CLI turn that starts while the thread's message waits in the CLI doesn't
   assert.equal(h.runner.get(thread.id).status, 'idle');
 });
 
-test('a background subagent asking for approval with no turn running gets a turn and a card', async () => {
+test('a background subagent asking for approval with no turn running gets a card and no turn', async () => {
   const h = makeHarness();
   const { thread } = create(h, { permissionMode: 'ask' });
   const s = h.adapter.last;
@@ -966,37 +1028,127 @@ test('a background subagent asking for approval with no turn running gets a turn
   const req = h.events(thread.id).find((e) => e.type === 'approval.requested');
   assert.ok(req, 'the card is shown');
   assert.equal(req.itemId, undefined);
-  const started = h.events(thread.id).filter((e) => e.type === 'turn.started').at(-1);
-  assert.equal(req.turnId, started.turnId);
+  assert.equal(req.turnId, undefined);
+  assert.equal(h.events(thread.id).filter((e) => e.type === 'turn.started').length, 1);
   const t = h.runner.get(thread.id);
   assert.equal(t.status, 'waiting');
   assert.equal(t.needsYou, true);
   h.runner.respondApproval({ threadId: thread.id, approvalId: req.approvalId, decision: 'allow' });
   assert.equal((await answer).decision, 'allow');
-  assert.equal(h.runner.get(thread.id).status, 'running');
+  assert.equal(h.runner.get(thread.id).status, 'idle');
   // The subagent finishes; the CLI's own turn reports it, then ends.
   s.out({ kind: 'cliTurn', note: 'Agent "make a folder" completed' });
   s.text('m5:0', 'Made the folder.');
   s.out({ kind: 'result', result: { outcome: 'completed', durationMs: 5, own: true } });
-  assert.equal(h.events(thread.id).filter((e) => e.type === 'turn.started').length, 2, 'one turn for the request and the report');
   assert.equal(h.events(thread.id).at(-1).type, 'turn.completed');
   assert.equal(h.runner.get(thread.id).status, 'idle');
   assert.deepEqual(checkSequence(h.events(thread.id)), []);
 });
 
-test('interrupting a turn opened only for an approval ends it at once', async () => {
+// 7 Nov 2026, thread 7a98a6fd: two subagents' cards waited half an hour with
+// Mike away, then the parent's next turn ended and took them with it. The CLI
+// then told the parent he had stopped them.
+test("a subagent's card outlives its parent's turn, and can still be answered", async () => {
+  const h = makeHarness();
+  const { thread } = create(h, { permissionMode: 'auto' });
+  const s = h.adapter.last;
+  s.init();
+  const answer = s.sink.requestApproval({ name: 'Write', title: 'Write a.ts', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  let settled = false;
+  void answer.then(() => (settled = true));
+  s.result();
+  await tick();
+  assert.equal(settled, false, 'the turn ending leaves it open');
+  const req = h.events(thread.id).find((e) => e.type === 'approval.requested');
+  assert.ok(!h.events(thread.id).some((e) => e.type === 'approval.resolved'));
+  const t = h.runner.get(thread.id);
+  assert.equal(t.status, 'waiting', "still waiting on him, not finished");
+  assert.equal(t.needsYou, true);
+  h.runner.markSeen(thread.id, t.lastSeq);
+  assert.equal(h.runner.get(thread.id).needsYou, true, 'reading the thread leaves it in Needs you');
+  // A later turn of the CLI's own, opened and ended, leaves it open too.
+  s.out({ kind: 'cliTurn' });
+  assert.equal(h.runner.get(thread.id).status, 'waiting');
+  s.out({ kind: 'result', result: { outcome: 'completed', durationMs: 5, own: true } });
+  assert.equal(settled, false);
+  h.runner.respondApproval({ threadId: thread.id, approvalId: req.approvalId, decision: 'allow' });
+  assert.equal((await answer).decision, 'allow');
+  assert.equal(h.runner.get(thread.id).status, 'idle');
+  assert.deepEqual(checkSequence(h.events(thread.id)), []);
+});
+
+test("the agent's own card still closes with its turn, and says the turn ended", async () => {
+  const h = makeHarness();
+  const { thread } = create(h, { permissionMode: 'ask' });
+  const s = h.adapter.last;
+  s.init();
+  const answer = s.sink.requestApproval({ toolUseId: 't1', name: 'Bash', title: 'ls', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  s.result();
+  const a = await answer;
+  assert.equal(a.decision, 'expired');
+  assert.equal(a.message, 'The turn ended.');
+  assert.equal(a.stopped, undefined, 'nobody stopped it');
+  assert.equal(h.runner.get(thread.id).status, 'idle');
+});
+
+test("Stop closes a subagent's card with no turn running, and it's the only thing that says stopped", async () => {
   const h = makeHarness();
   const { thread } = create(h, { permissionMode: 'ask' });
   const s = h.adapter.last;
   s.init();
   s.result();
-  const answer = s.sink.requestQuestion({ questions: [{ question: 'Which?', multiSelect: false, options: [{ label: 'A' }] }], signal: new AbortController().signal });
-  h.runner.interrupt(thread.id);
-  assert.equal((await answer).answers, null);
-  const done = h.events(thread.id).at(-1);
-  assert.equal(done.type, 'turn.completed');
-  assert.equal(done.outcome, 'interrupted');
+  const answer = s.sink.requestApproval({ name: 'Write', title: 'Write a.ts', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  const question = s.sink.requestQuestion({ questions: [{ question: 'Which?', multiSelect: false, options: [{ label: 'A' }] }], signal: new AbortController().signal });
+  h.runner.interrupt(thread.id, { byMike: true });
+  const a = await answer;
+  assert.equal(a.decision, 'expired');
+  assert.equal(a.stopped, true);
+  const q = await question;
+  assert.equal(q.answers, null);
+  assert.equal(q.stopped, true, 'a question stops its asker too');
   assert.equal(h.runner.get(thread.id).status, 'idle');
+  assert.deepEqual(checkSequence(h.events(thread.id)), []);
+});
+
+test("an agent's or the runner's stop isn't told to the agent as Mike's", async () => {
+  const h = makeHarness();
+  const { thread } = create(h, { permissionMode: 'ask' });
+  const s = h.adapter.last;
+  s.init();
+  const answer = s.sink.requestApproval({ name: 'Write', title: 'Write a.ts', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  h.runner.interrupt(thread.id);
+  const a = await answer;
+  assert.equal(a.decision, 'expired');
+  assert.equal(a.stopped, undefined);
+});
+
+test("a subagent's card closes when its CLI goes, with no turn running", async () => {
+  const h = makeHarness();
+  const { thread } = create(h, { permissionMode: 'ask' });
+  const s = h.adapter.last;
+  s.init();
+  s.result();
+  const answer = s.sink.requestApproval({ name: 'Write', title: 'Write a.ts', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  s.kill();
+  const a = await answer;
+  assert.equal(a.decision, 'expired');
+  assert.equal(a.message, 'The CLI stopped.');
+  assert.equal(a.stopped, undefined);
+  assert.equal(h.runner.get(thread.id).status, 'idle', 'nothing left to wait for');
+});
+
+test("a card answered with no turn and nothing running starts the idle countdown", async () => {
+  const h = makeHarness();
+  const { thread } = create(h, { permissionMode: 'ask' });
+  const s = h.adapter.last;
+  s.init();
+  s.result();
+  const answer = s.sink.requestApproval({ name: 'Write', title: 'Write a.ts', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  assert.equal(h.runner.hasIdleTimer(thread.id), false, "it won't let go of a CLI with a card open");
+  const req = h.events(thread.id).find((e) => e.type === 'approval.requested');
+  h.runner.respondApproval({ threadId: thread.id, approvalId: req.approvalId, decision: 'deny' });
+  await answer;
+  assert.equal(h.runner.hasIdleTimer(thread.id), true);
 });
 
 test('an interrupted turn the CLI never ends is ended after a grace period', async () => {
@@ -1881,6 +2033,95 @@ test('needs you: an interrupted turn, or one without archive, leaves the thread 
   endTurnCall(s, 't2', { needs: 'nothing' });
   s.result('completed');
   assert.equal(h.runner.get(thread.id).archivedAt, undefined);
+});
+
+test('a scheduled run puts an archived thread back in the archive when it ends with nothing for Mike', () => {
+  const h = makeHarness();
+  const { thread } = create(h);
+  let s = h.adapter.last;
+  s.init();
+  endTurnCall(s, 't1', { needs: 'nothing' });
+  s.result('completed');
+  h.runner.update({ threadId: thread.id, archived: true });
+  assert.ok(h.runner.get(thread.id).archivedAt);
+
+  // Nothing new: it comes out for the run, then goes back as Mike left it.
+  h.runner.send(thread.id, 'Check for a reply', [], { origin: 'schedule', scheduleId: 'sch_1' });
+  assert.equal(h.runner.get(thread.id).archivedAt, undefined, 'out of the archive while it runs');
+  s = h.adapter.last;
+  s.init();
+  endTurnCall(s, 't2', { needs: 'nothing' });
+  s.result('completed');
+  let t = h.runner.get(thread.id);
+  assert.ok(t.archivedAt, 'back in the archive');
+  assert.equal(t.archivedBy, 'mike');
+  assert.ok(h.events(thread.id).some((e) => e.type === 'system.note' && /back in the archive/i.test(String(e.text))), 'says why');
+
+  // A run that needs him stays in the inbox.
+  h.runner.send(thread.id, 'Check for a reply', [], { origin: 'schedule', scheduleId: 'sch_1' });
+  s = h.adapter.last;
+  s.init();
+  endTurnCall(s, 't3', { needs: 'you', asks: [{ action: 'Send the reply?' }] });
+  s.result('completed');
+  t = h.runner.get(thread.id);
+  assert.equal(t.archivedAt, undefined, 'stays out when it needs Mike');
+
+  // So does one Mike wrote into, even if it then ends with nothing.
+  h.runner.update({ threadId: thread.id, archived: true });
+  h.runner.send(thread.id, 'Check for a reply', [], { origin: 'schedule', scheduleId: 'sch_1' });
+  s = h.adapter.last;
+  s.init();
+  h.runner.send(thread.id, 'also tell me the size');
+  endTurnCall(s, 't4', { needs: 'nothing' });
+  s.result('completed');
+  assert.equal(h.runner.get(thread.id).archivedAt, undefined, 'his message keeps it out');
+
+  // And a scheduled message to a thread in the inbox never archives it.
+  s = h.adapter.last;
+  endTurnCall(s, 't5', { needs: 'nothing' });
+  s.result('completed');
+  h.runner.send(thread.id, 'Check for a reply', [], { origin: 'schedule', scheduleId: 'sch_1' });
+  s = h.adapter.last;
+  endTurnCall(s, 't6', { needs: 'nothing' });
+  s.result('completed');
+  assert.equal(h.runner.get(thread.id).archivedAt, undefined, 'only one that came out of the archive goes back');
+});
+
+test('a scheduled run that asks Mike something, or is stopped, keeps the thread out even after a later run finds nothing', () => {
+  const h = makeHarness();
+  const { thread } = create(h);
+  let s = h.adapter.last;
+  s.init();
+  endTurnCall(s, 't1', { needs: 'nothing' });
+  s.result('completed');
+  h.runner.update({ threadId: thread.id, archived: true });
+
+  // Run A asks him something while run B waits in the queue: B finding
+  // nothing mustn't archive A's question.
+  h.runner.send(thread.id, 'Check A', [], { origin: 'schedule', scheduleId: 'sch_a' });
+  s = h.adapter.last;
+  s.init();
+  h.runner.send(thread.id, 'Check B', [], { origin: 'schedule', scheduleId: 'sch_b', queue: true });
+  endTurnCall(s, 't2', { needs: 'you', asks: [{ action: 'Send the reply?' }] });
+  s.result('completed');
+  s = h.adapter.last;
+  endTurnCall(s, 't3', { needs: 'nothing' });
+  s.result('completed');
+  assert.equal(h.runner.get(thread.id).archivedAt, undefined, "B doesn't archive A's question");
+
+  // Stopped: it stays out, and the next run that finds nothing leaves it there.
+  h.runner.update({ threadId: thread.id, archived: true });
+  h.runner.send(thread.id, 'Check again', [], { origin: 'schedule', scheduleId: 'sch_a' });
+  s = h.adapter.last;
+  s.init();
+  h.runner.interrupt(thread.id);
+  s.result('interrupted');
+  assert.equal(h.runner.get(thread.id).archivedAt, undefined);
+  h.runner.send(thread.id, 'Keep going', [], { origin: 'runner' });
+  s = h.adapter.last;
+  endTurnCall(s, 't4', { needs: 'nothing' });
+  s.result('completed');
+  assert.equal(h.runner.get(thread.id).archivedAt, undefined, 'a stopped run leaves no mark behind');
 });
 
 test('needs you: the card survives a reload of the thread record', () => {

@@ -10,6 +10,14 @@ final class RemoteThreadsTests: XCTestCase {
         try JSONDecoder().decode(RemoteThreads.self, from: Data(E.json(object).utf8))
     }
 
+    /// Mike's runner order (backend API 58), the same one the phone sets,
+    /// for Settings > Runners. An older runner has none: nil, not empty.
+    func testCarriesTheRunnerOrder() throws {
+        XCTAssertEqual(try decode(["runners": [], "threads": [], "order": ["r_m5", "r_bruce"]]).order, ["r_m5", "r_bruce"])
+        XCTAssertNil(try decode(["runners": [], "threads": []]).order)
+        XCTAssertNil(try decode(["runners": [], "threads": [], "order": "nonsense"]).order)
+    }
+
     func testDecodesTolerantly() throws {
         let list = try decode([
             "runners": [
@@ -306,5 +314,13 @@ final class RemoteClientsTests: XCTestCase {
         let summary = try JSONDecoder().decode(RemoteThread.self, from: Data(json.utf8)).summary
         XCTAssertEqual(ProjectMark.place(summary), "misc")
         XCTAssertEqual(ProjectMark.lineTip(summary), "You: try the GPU route")
+    }
+
+    func testAToolResultSaysWhereItsOutputCanBeAskedFor() throws {
+        let json = #"{"itemId":"relay-5","ok":true,"text":"The output is kept on bruce.","truncated":false,"images":[],"heldBack":{"seq":5}}"#
+        let held = try JSONDecoder().decode(ToolResult.self, from: Data(json.utf8))
+        XCTAssertEqual(held.heldBackSeq, 5)
+        let plain = try JSONDecoder().decode(ToolResult.self, from: Data(#"{"itemId":"i","ok":true,"text":"x","truncated":false,"images":[]}"#.utf8))
+        XCTAssertNil(plain.heldBackSeq)
     }
 }

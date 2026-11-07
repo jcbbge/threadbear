@@ -7,7 +7,7 @@
 # its data folder.
 #
 #   Tools/dev-app.sh start [--mock [--fixtures DIR]...] [--home DIR]
-#                          [--appearance light|dark] [--size WxH] [--id NAME]
+#                          [--appearance light|dark] [--size WxH] [--bear-date 2026-12-24T23:00] [--id NAME]
 #   Tools/dev-app.sh do '<json>'... [--timeout S]
 #   Tools/dev-app.sh shot <file.png> [--sheet] [--settings]   (the sheet over it, the Settings window, or with both the sheet over Settings)
 #   Tools/dev-app.sh menu <file.png> '{"x":854,"y":19}'   (a real menu, opened and captured; realMenu in app/README.md)
@@ -80,6 +80,10 @@ die() {
   if [ -n "$CLEANUP_ID" ]; then
     local id="$CLEANUP_ID"
     CLEANUP_ID=""
+    # Its folder going while the start ran means something else cleaned it
+    # up, which used to leave only "tail: ...: No such file or directory".
+    [ -f "$(instance_dir "$id")/instance" ] ||
+      echo "dev-app: $id's folder was removed while it was starting (another dev-app.sh, or a stop of it); start again" >&2
     stop_one "$id" >/dev/null 2>&1 || true
   fi
   exit 1
@@ -124,7 +128,7 @@ load_instance() {
   [ -f "$dir/instance" ] || die "no instance $1 (Tools/dev-app.sh status lists them)"
   I_ID="$1"; I_DIR="$dir"
   I_PID=""; I_MOCK_PID=""; I_DATA=""; I_BUNDLE=""; I_BUNDLE_ID=""; I_RUNNER=""
-  I_THREAD=""; I_CHECKOUT=""; I_CREATED=0; I_STARTED=0
+  I_THREAD=""; I_CHECKOUT=""; I_CREATED=0; I_STARTED=0; I_STARTER=""; I_STARTER_SINCE=""
   while IFS='=' read -r key value; do
     case "$key" in
       pid) I_PID="$value" ;;
@@ -137,6 +141,8 @@ load_instance() {
       checkout) I_CHECKOUT="$value" ;;
       created) I_CREATED="$value" ;;
       started) I_STARTED="$value" ;;
+      starter) I_STARTER="$value" ;;
+      starter_since) I_STARTER_SINCE="$value" ;;
     esac
   done <"$dir/instance"
   I_LOG="$dir/automation.log"
@@ -172,6 +178,17 @@ home_runner_running() {
   pid="$(printf '%s' "$raw" | sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p')"
   [ -n "$pid" ] || pid="$(printf '%s' "$raw" | tr -dc '0-9')"
   alive "$pid"
+}
+
+# When a process started, as ps tells it: with the pid, it names one
+# process, so a pid reused since doesn't pass for the one recorded.
+started_at() { ps -p "$1" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//'; }
+
+# The dev-app.sh that's starting or rebuilding this instance is still at it
+# (building, usually). start writes its pid and start time with the first
+# lines of the instance, rebuild before it stops the old app.
+starter_running() {
+  alive "$I_STARTER" && [ -n "$I_STARTER_SINCE" ] && [ "$(started_at "$I_STARTER")" = "$I_STARTER_SINCE" ]
 }
 
 # "yours", or the thread and checkout that started it.
@@ -227,13 +244,21 @@ default_id() {
 
 # Cleans up instances whose app has quit: the caller's straight away, other
 # threads' once they've been quiet for a while (their log may be wanted).
-# A start still under way (no pid yet) is left for 10 minutes.
+# A start still under way (no pid yet), or a rebuild, is left alone while
+# the dev-app.sh doing it is running, however long its build takes: with a load of 150
+# one took over 20 minutes, and another thread's start reaped it at 10 and
+# its own start died at the end (6 Nov). One whose dev-app.sh has gone
+# (killed before it could clean up, or from an older dev-app.sh that didn't
+# record itself) is left for 10 minutes.
 reap() {
   local id now; now="$(date +%s)"
   find "$BUILD_LOGS" -name '*.log' -mtime +1 -delete 2>/dev/null || true
   for id in $(all_ids); do
     load_instance "$id"
     app_running && continue
+    # A start, or a rebuild between quitting the old app and launching the
+    # new one (its pid is the old app's then).
+    starter_running && continue
     if [ -z "$I_PID" ]; then
       [ $(( now - I_CREATED )) -gt 600 ] || continue
     elif ! is_mine; then
@@ -320,7 +345,7 @@ show_build_errors() {
 build_binary() {
   mkdir -p "$BUILD_LOGS"
   local log="$BUILD_LOGS/$1.log"
-  if ! swift build --package-path "$APP_ROOT" --product Threadbear >"$log" 2>&1; then
+  if ! swift build --disable-keychain --package-path "$APP_ROOT" --product Threadbear >"$log" 2>&1; then
     show_build_errors "$log"
     return 1
   fi
@@ -376,7 +401,7 @@ launch_app() {
 }
 
 cmd_start() {
-  local mode="" home="" appearance="" size="" fixtures=()
+  local mode="" home="" appearance="" size="" bear_date="" fixtures=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --mock) mode=mock ;;
@@ -384,6 +409,7 @@ cmd_start() {
       --home) home="${2:?--home needs a folder}"; shift ;;
       --appearance) appearance="${2:?--appearance needs light or dark}"; shift ;;
       --size) size="${2:?--size needs WxH}"; shift ;;
+      --bear-date) bear_date="${2:?--bear-date needs a date, like 2026-12-24T23:00}"; shift ;;
       --id) ID="${2:?--id needs a name}"; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown option for start: $1" ;;
@@ -433,7 +459,12 @@ cmd_start() {
     echo "thread=$OWNER_THREAD"
     echo "checkout=$CHECKOUT"
     echo "created=$(date +%s)"
-  } >"$dir/instance"
+    # So reap leaves it alone while this start is under way.
+    echo "starter=$$"
+    echo "starter_since=$(started_at $$)"
+  } >"$dir/instance.tmp"
+  # Whole, or a reap reading it half written finds no created or starter.
+  mv "$dir/instance.tmp" "$dir/instance"
   CLEANUP_ID="$ID"
   trap 'die "start failed"' ERR
   load_instance "$ID"
@@ -494,6 +525,8 @@ cmd_start() {
       --automation-idle-quit "$IDLE_QUIT_SECONDS"
     [ -z "$appearance" ] || printf '%s\n' --appearance "$appearance"
     [ -z "$size" ] || printf '%s\n' --window-size "$size"
+    # The date the bear goes by: its Santa hat, and bedtime under an empty Inbox.
+    [ -z "$bear_date" ] || printf '%s\n' -ThreadbearBearDate "$bear_date"
   } >"$dir/app.args"
   launch_app
   trap - ERR
@@ -631,6 +664,9 @@ cmd_rebuild() {
   echo "Building the debug app..."
   # The running app stays up if the build fails.
   build_binary "$I_ID" || exit 1
+  # So reap leaves it while the old app's gone and the new one isn't up.
+  set_field starter "$$"
+  set_field starter_since "$(started_at $$)"
   # Before the quit: the mock checks app.pid every 2 s and exits once that
   # app is gone, and a check landing between the quit and the removal used
   # to take the mock (and its state) down with the old build. A missing

@@ -55,6 +55,12 @@ UPLOAD=1 ios/scripts/appstore-upload.sh   # the real thing; note the build numbe
 node ios/scripts/appstore-submit.mjs <build>   # waits for processing, attaches it, manual release
 ```
 
+With `UPLOAD=1` the script skips `altool --validate-app`, as the upload validates the build
+itself (on 7 Nov altool sat silent for 8+ minutes; the upload took two). `VALIDATE=1` runs it
+anyway, and it's stopped with a warning after `VALIDATE_TIMEOUT` seconds (300). If a run stopped
+after archiving, `UPLOAD=1 BUILD_NUMBER=<build> ios/scripts/appstore-upload.sh` uploads the archive
+already in `/tmp/threadbear-appstore/<build>` without building it again.
+
 The upload script refuses an archive that mentions a Convex deployment, has the Debug-only launch
 arguments, isn't on production APNs or has no privacy manifest.
 
@@ -82,6 +88,7 @@ sometimes won't.
 
 ## Once it's approved
 
-Release it by hand in App Store Connect, then in `site/site.mjs` set `APP_STORE_URL` to
+Release it once Mike says to: `node ios/scripts/appstore-release.mjs <version> --release` (without
+`--release` it only says where review is up to), or the button in App Store Connect. Then in `site/site.mjs` set `APP_STORE_URL` to
 `https://apps.apple.com/app/id<Apple ID>` and `APP_STORE_LIVE` to `true`, and `npm run deploy` in
 `site/`.

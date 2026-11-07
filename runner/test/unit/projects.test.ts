@@ -646,6 +646,13 @@ test('the librarian keeps its line on where the thread is up to as the thread\'s
 test('a quiet catch-up is skipped with no model call, and what it said counts towards the next', async () => {
   const s = setup({ models: () => reply({ projects: [], why: 'A one-off' }) });
   const { h, create, finish, librarian, asked } = s;
+  // From local noon: the day's counts roll over at local midnight, and the
+  // fake clock's 12:00 UTC start is 23:00 in Sydney, an hour from it.
+  const noon = new Date(h.clock.now());
+  noon.setHours(12, 0, 0, 0);
+  if (noon.getTime() < h.clock.now()) noon.setDate(noon.getDate() + 1);
+  h.clock.advance(noon.getTime() - h.clock.now());
+  await tick(8);
   const { thread } = create('Work on the app');
   h.clock.advance(FIRST_MESSAGE_MS);
   await tick(8);

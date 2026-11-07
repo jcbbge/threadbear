@@ -100,7 +100,7 @@ test('inside a thread, tb will not delete, interrupt, snooze or archive that thr
     // Its own approval cards are Mike's, through tb approve and a raw call alike.
     void h.adapter.sessions.find((x) => x.opts.threadId === self.id)!.sink.requestApproval({ name: 'Bash', title: 'rm -rf build', input: { command: 'rm -rf build' }, canAlwaysAllow: true, signal: new AbortController().signal });
     const approvalId = h.events(self.id).find((e) => e.type === 'approval.requested').approvalId;
-    for (const args of [['approve', self.id, approvalId, 'allow'], ['answer', self.id.slice(0, 8), approvalId, 'yes'], ['rpc', 'approvals.respond', JSON.stringify({ threadId: self.id, approvalId, decision: 'allow' })]]) {
+    for (const args of [['approve', self.id, approvalId, 'allow'], ['answer', self.id.slice(0, 8), approvalId, 'yes'], ['rpc', 'approvals.respond', JSON.stringify({ threadId: self.id, approvalId, decision: 'allow' })], ['rpc', 'plans.approve', JSON.stringify({ threadId: self.id, itemId: 'tu-plan' })]]) {
       const t = tb(h, url, args, inThread);
       assert.equal(await t.exited, 1, args[0]);
       assert.match(t.out(), /own card; the user answers it/, args[0]);

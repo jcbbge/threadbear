@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		BB0000000000000000000301 /* ThreadbearKit in Frameworks */ = {isa = PBXBuildFile; productRef = BB0000000000000000000401 /* ThreadbearKit */; };
 		BB0000000000000000000303 /* Sentry in Frameworks */ = {isa = PBXBuildFile; productRef = BB0000000000000000000402 /* Sentry */; };
+		BB0000000000000000000304 /* whisper in Frameworks */ = {isa = PBXBuildFile; productRef = BB0000000000000000000403 /* whisper */; };
 		BB0000000000000000000302 /* NotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000103 /* NotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -87,6 +88,7 @@
 			files = (
 				BB0000000000000000000301 /* ThreadbearKit in Frameworks */,
 				BB0000000000000000000303 /* Sentry in Frameworks */,
+				BB0000000000000000000304 /* whisper in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -153,6 +155,7 @@
 			packageProductDependencies = (
 				BB0000000000000000000401 /* ThreadbearKit */,
 				BB0000000000000000000402 /* Sentry */,
+				BB0000000000000000000403 /* whisper */,
 			);
 			productName = Threadbear;
 			productReference = BB0000000000000000000101 /* Threadbear.app */;
@@ -208,6 +211,7 @@
 			packageReferences = (
 				BB0000000000000000000201 /* XCLocalSwiftPackageReference "ThreadbearKit" */,
 				BB0000000000000000000202 /* XCLocalSwiftPackageReference "../app/SentryBinary" */,
+				BB0000000000000000000203 /* XCLocalSwiftPackageReference "WhisperBinary" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = BB0000000000000000000502 /* Products */;
@@ -283,7 +287,7 @@
 				);
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MARKETING_VERSION = 1.0.2;
+				MARKETING_VERSION = 1.0.4;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
@@ -306,7 +310,7 @@
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MARKETING_VERSION = 1.0.2;
+				MARKETING_VERSION = 1.0.4;
 				SDKROOT = iphoneos;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
@@ -472,6 +476,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../app/SentryBinary;
 		};
+		BB0000000000000000000203 /* XCLocalSwiftPackageReference "WhisperBinary" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = WhisperBinary;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -482,6 +490,10 @@
 		BB0000000000000000000402 /* Sentry */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = Sentry;
+		};
+		BB0000000000000000000403 /* whisper */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = whisper;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

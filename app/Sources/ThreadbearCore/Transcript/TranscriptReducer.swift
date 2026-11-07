@@ -83,6 +83,13 @@ public struct TranscriptModel: Sendable {
     /// decreases, so the rows for items from `n` on are a binary search away.
     private var rowStarts: [Int] = []
     private var planRowForTurn: [String: String] = [:]
+    /// "Plan first": the approved plan card that takes the steps the agent
+    /// then works through (plan.updated), and the turn it does so in (nil
+    /// until it starts: Codex's goes ahead in the next turn). Approval
+    /// requests for a plan card's ExitPlanMode call, which get no row.
+    private var planTakingSteps: String?
+    private var planStepsTurn: String?
+    private var planApprovals: Set<String> = []
     /// Rows of commands Mike ran from a chip (an action.run with no
     /// trigger): left out of the turn's line of work before them, so what
     /// he pressed shows where he pressed it. A hook's run (a trigger) folds
@@ -100,11 +107,17 @@ public struct TranscriptModel: Sendable {
     /// What Mike has written in each card's Something else boxes, by the
     /// card's seq, kept here for the same reason.
     public private(set) var askNotes: [Int: [Int: AskNote]] = [:]
+    /// Other runners' requests for a thread, read by approval id, so a
+    /// rebuild keeps them on their cards.
+    public private(set) var startRequests: [String: StartRequest] = [:]
     /// The follow-ups Mike ticked on each done card, by the card's seq,
     /// kept here for the same reason.
     public private(set) var nextPicks: [Int: Set<Int>] = [:]
     /// The follow-ups with their "?" on, by card seq.
     public private(set) var nextExplains: [Int: Set<Int>] = [:]
+    /// The runner's loose-ends check for a done card (protocol "Loose
+    /// ends"), from the thread's summary, kept here for the same reason.
+    public private(set) var looseEnds: LooseEnds?
     /// Each turn's last error row, to learn the turn's `errorKind`.
     private var errorRowForTurn: [String: String] = [:]
     private var turnStarts: [String: Date] = [:]
@@ -122,6 +135,9 @@ public struct TranscriptModel: Sendable {
     private var completedTurns: Set<String> = []
     /// Turns with a summary from end_turn: their other messages are work.
     private var summarizedTurns: Set<String> = []
+    /// Turns with a One reply final message: like a summary, it's the
+    /// reply, so the turn gets no changes card either.
+    private var repliedTurns: Set<String> = []
     /// Edit and Write tool items per turn, in order, for the changes card.
     private var editsByTurn: [String: [String]] = [:]
     /// The seq each tool row's result came at, by row id: a message written
@@ -390,6 +406,21 @@ public struct TranscriptModel: Sendable {
         return refreshRows()
     }
 
+    /// Another runner's request was read for the card `approvalId`.
+    public mutating func setStartRequest(_ approvalId: String, _ request: StartRequest) -> TranscriptChange {
+        guard startRequests[approvalId] != request else { return TranscriptChange() }
+        startRequests[approvalId] = request
+        let id = "ap:\(approvalId)"
+        guard itemIndex[id] != nil else { return TranscriptChange() }
+        update(id) { content in
+            if case .approval(var item) = content {
+                item.startRequest = request
+                content = .approval(item)
+            }
+        }
+        return refreshRows()
+    }
+
     /// Mike wrote or pasted in the Something else boxes on the card from `seq`.
     public mutating func setAskNotes(_ seq: Int, _ notes: [Int: AskNote]) -> TranscriptChange {
         guard askNotes[seq, default: [:]] != notes else { return TranscriptChange() }
@@ -402,6 +433,26 @@ public struct TranscriptModel: Sendable {
             }
         }
         return refreshRows()
+    }
+
+    /// The thread's summary has a new loose-ends check (or none): it goes
+    /// on the done card it's for.
+    public mutating func setLooseEnds(_ check: LooseEnds?) -> TranscriptChange {
+        guard check != looseEnds else { return TranscriptChange() }
+        let old = looseEnds
+        looseEnds = check
+        var touched = false
+        for seq in Set([old?.seq, check?.seq].compactMap { $0 }) {
+            guard let cardId = asksRowForSeq[seq] else { continue }
+            update(cardId) { content in
+                if case .asks(var card) = content, card.isDone {
+                    card.looseEnds = check?.seq == seq ? check?.ends : nil
+                    content = .asks(card)
+                }
+            }
+            touched = true
+        }
+        return touched ? refreshRows() : TranscriptChange()
     }
 
     /// Mike ticked (or unticked) follow-ups on the done card from `seq`.
@@ -440,6 +491,9 @@ public struct TranscriptModel: Sendable {
         items = []
         itemIndex = [:]
         planRowForTurn = [:]
+        planTakingSteps = nil
+        planStepsTurn = nil
+        planApprovals = []
         pressedRuns = []
         asksRowForSeq = [:]
         openAsksRow = nil
@@ -451,6 +505,7 @@ public struct TranscriptModel: Sendable {
         hidden = Self.hiddenRanges(events)
         completedTurns = []
         summarizedTurns = []
+        repliedTurns = []
         editsByTurn = [:]
         resultSeqs = [:]
         pendingCards = [:]
@@ -606,6 +661,7 @@ public struct TranscriptModel: Sendable {
 
         case .assistantText(let itemId, let text, _, let narration, _, let final):
             streaming[itemId] = nil
+            if final, let turnId { repliedTurns.insert(turnId) }
             let id = "a:\(itemId)"
             let thought = "r:\(itemId)"
             if itemIndex[id] == nil, let i = itemIndex[thought], case .reasoning(let live) = items[i].content, live.isStreaming {
@@ -757,13 +813,21 @@ public struct TranscriptModel: Sendable {
             }
             noteEdit(id, turnId: turnId)
 
+        case .approvalRequested(let request) where request.name == "ExitPlanMode" && itemIndex["pl:" + (request.itemId ?? "")] != nil:
+            // Claude's plan waiting on its ExitPlanMode call: the plan card
+            // is its card. Still pending, so Return in an empty composer
+            // approves it and the turn reads as waiting on Mike.
+            pendingCards["ap:\(request.approvalId)"] = turnId ?? ""
+            planApprovals.insert(request.approvalId)
+            tailDirty = true
+
         case .approvalRequested(let request):
             let id = "ap:\(request.approvalId)"
             // A subagent's tools have no item id, and no row of their own.
             let toolId = request.itemId.flatMap { $0.isEmpty ? nil : "t:" + $0 }
             if let toolId { approvalForTool[toolId] = id }
             let shown = toolId.map { itemIndex[$0] != nil } ?? false
-            append(TranscriptRow(id: id, seq: seq, turnId: turnId, content: .approval(ApprovalItem(request: request, root: root, toolShown: shown))))
+            append(TranscriptRow(id: id, seq: seq, turnId: turnId, content: .approval(ApprovalItem(request: request, root: root, toolShown: shown, startRequest: startRequests[request.approvalId]))))
             pendingCards[id] = turnId ?? ""
             tailDirty = true
 
@@ -794,6 +858,10 @@ public struct TranscriptModel: Sendable {
             }
 
         case .approvalResolved(let resolution):
+            if planApprovals.remove(resolution.approvalId) != nil {
+                pendingCards["ap:\(resolution.approvalId)"] = nil
+                tailDirty = true
+            }
             for id in ["ap:\(resolution.approvalId)", "q:\(resolution.approvalId)", "s:\(resolution.approvalId)"] where itemIndex[id] != nil {
                 pendingCards[id] = nil
                 tailDirty = true
@@ -814,9 +882,40 @@ public struct TranscriptModel: Sendable {
                 }
             }
 
+        case .planProposed(let itemId, let text):
+            let id = "pl:\(itemId)"
+            planTakingSteps = nil
+            if itemIndex[id] != nil {
+                update(id) { $0 = .planCard(PlanCard(itemId: itemId, text: text)) }
+            } else {
+                append(TranscriptRow(id: id, seq: seq, turnId: turnId, content: .planCard(PlanCard(itemId: itemId, text: text))))
+            }
+
+        case .planResolved(let itemId, let go):
+            let id = "pl:\(itemId)"
+            update(id) { content in
+                if case .planCard(var card) = content {
+                    card.state = go ? .approved : .sentBack
+                    content = .planCard(card)
+                }
+            }
+            if go, itemIndex[id] != nil {
+                planTakingSteps = id
+                planStepsTurn = turnId
+            }
+
         case .planUpdated(let entries):
             let key = turnId ?? "seq\(seq)"
-            if let id = planRowForTurn[key], itemIndex[id] != nil {
+            if let id = planTakingSteps, itemIndex[id] != nil {
+                // The approved plan's own steps: its card becomes the checklist.
+                planRowForTurn[key] = id
+                update(id) { content in
+                    if case .planCard(var card) = content {
+                        card.entries = entries
+                        content = .planCard(card)
+                    }
+                }
+            } else if let id = planRowForTurn[key], itemIndex[id] != nil {
                 update(id) { $0 = .plan(entries) }
             } else {
                 let id = "p:\(seq)"
@@ -826,6 +925,7 @@ public struct TranscriptModel: Sendable {
 
         case .turnStarted(let wokeBy):
             let key = turnId ?? ""
+            if planTakingSteps != nil, planStepsTurn == nil { planStepsTurn = key }
             openTurn = key
             startedTurns.insert(key)
             if let date = Self.date(event.ts) { turnStarts[key] = date }
@@ -842,6 +942,10 @@ public struct TranscriptModel: Sendable {
             finishStreaming()
             let key = completion.turnId.isEmpty ? (turnId ?? "seq\(seq)") : completion.turnId
             completedTurns.insert(key)
+            if planTakingSteps != nil, planStepsTurn == key {
+                planTakingSteps = nil
+                planStepsTurn = nil
+            }
             if let date = Self.date(event.ts) { lastTurnEnd = date }
             if let turnId { completedTurns.insert(turnId) }
             if let open = openTurn, open == key || open == turnId || completion.turnId.isEmpty {
@@ -865,14 +969,14 @@ public struct TranscriptModel: Sendable {
                 // picked there and sent from the composer (Mike, 28 Oct).
                 if completion.outcome == .completed, completion.needs == "you", !completion.asks.isEmpty {
                     let cardId = "ak:\(seq)"
-                    append(TranscriptRow(id: cardId, seq: seq, turnId: turnId ?? completion.turnId, content: .asks(AsksCard(seq: seq, asks: completion.asks, picks: askPicks[seq] ?? [:], notes: askNotes[seq] ?? [:]))))
+                    append(TranscriptRow(id: cardId, seq: seq, turnId: turnId ?? completion.turnId, content: .asks(AsksCard(seq: seq, asks: completion.asks, ticked: Set(completion.asks.indices.filter { completion.asks[$0].ticked }), picks: askPicks[seq] ?? [:], notes: askNotes[seq] ?? [:]))))
                     asksRowForSeq[seq] = cardId
                     openAsksRow = cardId
                 } else if completion.outcome == .completed, completion.needs == "nothing" {
                     // The done card: goes, as an asks card does, once Mike
                     // replies or the next turn ends.
                     let cardId = "ak:\(seq)"
-                    append(TranscriptRow(id: cardId, seq: seq, turnId: turnId ?? completion.turnId, content: .asks(AsksCard(seq: seq, asks: [], next: completion.next, pickedNext: nextPicks[seq] ?? [], explainNext: nextExplains[seq] ?? []))))
+                    append(TranscriptRow(id: cardId, seq: seq, turnId: turnId ?? completion.turnId, content: .asks(AsksCard(seq: seq, asks: [], next: completion.next, pickedNext: nextPicks[seq] ?? [], explainNext: nextExplains[seq] ?? [], looseEnds: looseEnds?.seq == seq ? looseEnds?.ends : nil))))
                     asksRowForSeq[seq] = cardId
                     openAsksRow = cardId
                 }
@@ -903,6 +1007,10 @@ public struct TranscriptModel: Sendable {
             result.itemId = itemId
             if run.trigger == nil { pressedRuns.insert("t:\(itemId)") }
             append(TranscriptRow(id: "t:\(itemId)", seq: seq, turnId: turnId, content: .tool(ToolItem(itemId: itemId, call: call, result: result, root: root))))
+
+        case .buttonUpdated:
+            // No row: the reply that links it draws it (ReplyButtons).
+            break
 
         case .unknown:
             break
@@ -940,6 +1048,7 @@ public struct TranscriptModel: Sendable {
     static func isWork(_ row: TranscriptRow) -> Bool {
         switch row.content {
         case .tool(let tool): return !isTakenEndTurn(tool)
+        case .note where row.content.isWakeNote: return false
         case .reasoning, .note: return true
         case .approval(let item): return item.isAllowed
         default: return false
@@ -1070,12 +1179,6 @@ public struct TranscriptModel: Sendable {
     /// needs.ts, BULLETS_ONLY).
     private func reply(of turn: [Int]) -> Set<Int> {
         let text = textItem
-        // One reply: the agent's message after end_turn is the reply, and
-        // nothing else the turn wrote competes with it (docs/protocol.md,
-        // "One reply"). So a reply can't be lost to a narration block or a
-        // length rule, the reasons for everything below.
-        let finals = turn.filter { text($0)?.isFinal == true }
-        if !finals.isEmpty { return Set(finals) }
         // A message sent into the turn (the runner's "the app restarted")
         // starts a fresh answer, so only an end_turn after it ends this
         // one: on 30 Oct 2026 a restart landed between end_turn and the
@@ -1085,10 +1188,27 @@ public struct TranscriptModel: Sendable {
             if case .user = items[k].content { return true }
             return false
         }).map { $0 + 1 } ?? 0
-        let end = turn[fresh...].firstIndex { k in
+        // The last end_turn that gave a card, not one that only added
+        // archive or snooze ("Added: ..."). A second card after the same
+        // message only comes once a background task finishing has woken
+        // the agent (runner needs.ts, WakeRead), and the work after it is
+        // the turn's latest: on 7 Nov 2026 the report after a backgrounded
+        // `tb land` was refused, under a "landing now" card (thread 46de9389).
+        let end = turn[fresh...].lastIndex { k in
+            if case .tool(let tool) = items[k].content { return Self.isTakenEndTurn(tool) && tool.result?.text.hasPrefix("Added:") != true }
+            return false
+        } ?? turn[fresh...].firstIndex { k in
             if case .tool(let tool) = items[k].content { return Self.isTakenEndTurn(tool) }
             return false
         } ?? turn.count
+        // One reply: the agent's message after end_turn is the reply, and
+        // nothing else the turn wrote competes with it (docs/protocol.md,
+        // "One reply"). So a reply can't be lost to a narration block or a
+        // length rule, the reasons for everything below. One between the
+        // fresh answer's start and its last card belongs to a card that
+        // was replaced after a wake.
+        let finals = turn.indices.filter { p in text(turn[p])?.isFinal == true && !(fresh..<end).contains(p) }.map { turn[$0] }
+        if !finals.isEmpty { return Set(finals) }
         let beforeEnd = turn[..<end]
         // After the last step's row and after its result, as a message can
         // land between a call and its result. A message sent into the
@@ -1102,7 +1222,9 @@ public struct TranscriptModel: Sendable {
         let final = beforeEnd.filter { k in
             text(k).map { !$0.isSummary } == true && k > (steps.last ?? Int.min) && items[k].seq > lastResult
         }
-        if let summary = turn.last(where: { text($0)?.isSummary == true }) {
+        // The last card's own summary: one a wake replaced says what was
+        // true before it (from Codex's review).
+        if let summary = turn[(end < turn.count ? end : 0)...].last(where: { text($0)?.isSummary == true }) {
             // A narration block is only a paraphrase of what the agent
             // wrote, so it never beats the bullets: one about a list of 13
             // names for Paws showed instead of them (30 Oct 2026).
@@ -1142,11 +1264,29 @@ public struct TranscriptModel: Sendable {
     /// (the poster it was asked for is the answer), the footer and the card.
     /// The runner's messages fold in: they're how the work carried on. The
     /// note an edit of Mike's leaves stays, as it says what he did.
+    /// A background subagent's card still waiting (no tool of the agent's to
+    /// point at). It's drawn at the end of the transcript rather than where
+    /// it came in: it stays open across turns, so that spot can be folded
+    /// into a finished turn or scrolled far above the latest reply, and the
+    /// thread would sit in Needs you with nothing to answer in sight (7 Nov
+    /// 2026). Once answered it goes back to its place. In the turn it came
+    /// in, while that's running, its place is fine, and floating it would
+    /// split the run of work around it.
+    private func isFloatingCard(_ k: Int) -> Bool {
+        guard pendingCards[items[k].id] != nil else { return false }
+        if let turn = items[k].turnId, turn == openTurn { return false }
+        switch items[k].content {
+        case .approval(let item): return (item.request.itemId ?? "").isEmpty
+        case .question(let item): return (item.request.itemId ?? "").isEmpty
+        default: return false
+        }
+    }
+
     private func staysOut(_ k: Int, replies: Set<Int>) -> Bool {
-        if replies.contains(k) || items[k].id.hasPrefix("rw:") { return true }
+        if replies.contains(k) || items[k].id.hasPrefix("rw:") || items[k].content.isWakeNote { return true }
         switch items[k].content {
         case .user(let message): return !message.isFromRunner
-        case .error, .footer, .asks, .review, .gap: return true
+        case .error, .footer, .asks, .review, .gap, .planCard: return true
         case .images(_, _, let generated): return generated
         case .tool(let tool): return Self.isTakenEndTurn(tool) || pressedRuns.contains(items[k].id)
         default: return false
@@ -1324,7 +1464,7 @@ public struct TranscriptModel: Sendable {
                 // Every row of a finished turn starts at its first item, so
                 // a change anywhere in it rebuilds it whole (runStart).
                 let replies = replies(in: turn)
-                let folded = turn.filter { !staysOut($0, replies: replies) }
+                let folded = turn.filter { !staysOut($0, replies: replies) && !isFloatingCard($0) }
                 // The line of work goes above the reply, even when the reply
                 // came first: a turn that only answered has its summary
                 // folded under it (reply(of:)).
@@ -1341,6 +1481,7 @@ public struct TranscriptModel: Sendable {
                 let gaps = dividers(in: turn, replies: replies)
                 for k in turn {
                     let row = items[k]
+                    if isFloatingCard(k) { continue }
                     if k == groupAt, let first = folded.first {
                         let lead = items[first]
                         let id = "g:" + lead.id
@@ -1379,7 +1520,9 @@ public struct TranscriptModel: Sendable {
                         // A turn that ended with a summary has no changes
                         // card: the summary says what changed, and the
                         // edits are still in the folded work (Mike, 30 Oct).
-                        if !stretch.contains(where: summarizedTurns.contains), let card = changedFiles(turns: stretch) {
+                        // One reply's final message counts too: it replaced
+                        // the summary, and the card came back with it (6 Nov).
+                        if !stretch.contains(where: { summarizedTurns.contains($0) || repliedTurns.contains($0) }), let card = changedFiles(turns: stretch) {
                             out.append(derived("cf:" + card.turnId, seq: row.seq, turnId: row.turnId, .changes(card)))
                             starts.append(turn.lowerBound)
                         }
@@ -1398,6 +1541,10 @@ public struct TranscriptModel: Sendable {
                     }
                 }
                 i = turn.upperBound
+                continue
+            }
+            if isFloatingCard(i) {
+                i += 1
                 continue
             }
             if isWork(item) {
@@ -1443,14 +1590,20 @@ public struct TranscriptModel: Sendable {
                 i += 1
             }
         }
+        let floating = workingLine ? pendingCards.keys.compactMap { itemIndex[$0] }.filter(isFloatingCard).sorted() : []
+        for k in floating {
+            out.append(items[k])
+            starts.append(items.count)
+        }
         if workingLine, let turn = openTurn, !pendingCards.values.contains(turn) {
             let status = WorkingStatus(turnId: turn, startedAt: turnStarts[turn])
             out.append(derived("w:" + turn, seq: lastSeq, turnId: turn, .working(status)))
             starts.append(items.count)
-        } else if workingLine, openTurn == nil, !background.isEmpty {
+        } else if workingLine, openTurn == nil, !background.isEmpty, floating.isEmpty {
             // Between turns with sub-agents or jobs still going: the thread
             // is still being worked on, and this says so where the working
-            // line would be.
+            // line would be. Not under a card a sub-agent is waiting on,
+            // where "working" would be wrong.
             out.append(derived("bg:", seq: lastSeq, turnId: nil, .background(BackgroundStatus(tasks: background))))
             starts.append(items.count)
         }
@@ -1467,6 +1620,13 @@ public struct TranscriptModel: Sendable {
 
     /// The files a turn changed, from its Edit and Write calls that didn't
     /// fail, each with its edits' line counts added up.
+    /// Claude's plan mode writes its plan to ~/.claude/plans/<name>.md. That's
+    /// the CLI's own note, shown as the plan card; "Edited 1 file" for it,
+    /// in a turn that changed nothing of the project's, read as a change.
+    static func isPlanFile(_ path: String) -> Bool {
+        path.contains("/.claude/plans/") && path.hasSuffix(".md")
+    }
+
     private func changedFiles(turn: String) -> ChangedFiles? {
         changedFiles(turns: [turn])
     }
@@ -1482,7 +1642,7 @@ public struct TranscriptModel: Sendable {
         for id in ids {
             guard let i = itemIndex[id], case .tool(let tool) = items[i].content, !tool.failed else { continue }
             // Every file a tool changed: a Codex patch can touch several.
-            for diff in tool.effectiveDiffs where !diff.hunks.isEmpty {
+            for diff in tool.effectiveDiffs where !diff.hunks.isEmpty && !Self.isPlanFile(diff.path) {
                 let path = diff.path.isEmpty ? tool.title : diff.path
                 let stats = DiffBuilder.stats(diff)
                 if var file = files[path] {

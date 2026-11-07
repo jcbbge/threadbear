@@ -19,6 +19,9 @@ enum RowMetrics {
     /// One line of work: a group summary, a tool call, a thinking block.
     static var workHeight: CGFloat { zoomed(32) }
     static var workingHeight: CGFloat { zoomed(34) }
+    /// The bear beside a "Woke up" note, and all the room it takes.
+    static var wokenBearSide: CGFloat { zoomed(18) }
+    static var wokenBearRoom: CGFloat { wokenBearSide + zoomed(6) }
     static var bubblePadH: CGFloat { zoomed(14) }
     static var bubblePadV: CGFloat { zoomed(10) }
     static var bubbleRadius: CGFloat { zoomed(18) }
@@ -176,21 +179,43 @@ final class RenderCache: @unchecked Sendable {
     /// a render depends on: tables of different widths with the column at
     /// its widest share renders, so a sidebar drag or a scroller appearing
     /// costs nothing.
-    static func key(_ row: TranscriptRow, expanded: Bool, showAll: Bool = false, width: CGFloat) -> NSString {
+    static func key(_ row: TranscriptRow, expanded: Bool, showAll: Bool = false, width: CGFloat, localPictures: Bool = true) -> NSString {
         let open = openLevel(row, expanded: expanded, showAll: showAll)
-        return "\(row.id)|\(row.version)|\(open)|\(row.inGroup ? 1 : 0)|\(Int(RowMetrics.column(tableWidth: width).width))|\(TypeScale.percent)" as NSString
+        return "\(row.id)|\(row.version)|\(open)|\(row.inGroup ? 1 : 0)|\(Int(RowMetrics.column(tableWidth: width).width))|\(TypeScale.percent)|\(richStamp(row))|\(buttonStamp(row))\(localPictures ? "" : "|away")" as NSString
     }
 
-    func cached(_ row: TranscriptRow, expanded: Bool, showAll: Bool = false, width: CGFloat) -> RowRender? {
-        cache.object(forKey: Self.key(row, expanded: expanded, showAll: showAll, width: width))
+    /// A reply with a ```mermaid or ```html box renders again when one is
+    /// drawn or flipped to its source; every other row keys on -1.
+    static func richStamp(_ row: TranscriptRow) -> Int {
+        guard case .assistant(let item) = row.content, RichBlocks.mayHoldRich(item.text) else { return -1 }
+        return RichBlocks.shared.generation
     }
 
-    func render(_ row: TranscriptRow, expanded: Bool, showAll: Bool = false, width: CGFloat) -> RowRender {
-        let key = Self.key(row, expanded: expanded, showAll: showAll, width: width)
+    /// A reply that links a reply button renders again when a button
+    /// changes (made, pressed, failed, a press on its way).
+    static func buttonStamp(_ row: TranscriptRow) -> Int {
+        guard case .assistant(let item) = row.content, ReplyButtons.mayHold(item.text) else { return -1 }
+        return ReplyButtons.shared.generation
+    }
+
+    static func holdsButtons(_ row: TranscriptRow) -> Bool { buttonStamp(row) != -1 }
+
+    /// Whether a row is drawn differently once its rich blocks change.
+    static func holdsRich(_ row: TranscriptRow) -> Bool { richStamp(row) != -1 }
+
+    /// `localPictures`: false for another Mac's thread (MarkdownRenderer.localPictures).
+    func cached(_ row: TranscriptRow, expanded: Bool, showAll: Bool = false, width: CGFloat, localPictures: Bool = true) -> RowRender? {
+        cache.object(forKey: Self.key(row, expanded: expanded, showAll: showAll, width: width, localPictures: localPictures))
+    }
+
+    func render(_ row: TranscriptRow, expanded: Bool, showAll: Bool = false, width: CGFloat, localPictures: Bool = true) -> RowRender {
+        let key = Self.key(row, expanded: expanded, showAll: showAll, width: width, localPictures: localPictures)
         if let hit = cache.object(forKey: key) { return hit }
-        let render = RowRenderer.render(row, expanded: Self.effectiveExpanded(row, expanded),
-                                        showAll: Self.effectiveShowAll(row, expanded: expanded, showAll: showAll),
-                                        tableWidth: width, measurer: .current)
+        let render = MarkdownRenderer.withLocalPictures(localPictures) {
+            RowRenderer.render(row, expanded: Self.effectiveExpanded(row, expanded),
+                               showAll: Self.effectiveShowAll(row, expanded: expanded, showAll: showAll),
+                               tableWidth: width, measurer: .current)
+        }
         store(render, key: key, row: row, open: Self.openLevel(row, expanded: expanded, showAll: showAll), width: width)
         return render
     }
@@ -209,13 +234,13 @@ final class RenderCache: @unchecked Sendable {
 
     /// Renders rows across all cores. Used before showing a thread or
     /// paging in older rows, so the main thread only reads the cache.
-    func prepare(_ rows: [TranscriptRow], expanded: Set<String>, width: CGFloat) {
+    func prepare(_ rows: [TranscriptRow], expanded: Set<String>, width: CGFloat, localPictures: Bool = true) {
         func showAll(_ row: TranscriptRow) -> Bool { row.kind == .diff && expanded.contains(DiffPreview.allKey(row.id)) }
-        let missing = rows.filter { cached($0, expanded: expanded.contains($0.id), showAll: showAll($0), width: width) == nil }
+        let missing = rows.filter { cached($0, expanded: expanded.contains($0.id), showAll: showAll($0), width: width, localPictures: localPictures) == nil }
         guard !missing.isEmpty else { return }
         DispatchQueue.concurrentPerform(iterations: missing.count) { index in
             let row = missing[index]
-            _ = render(row, expanded: expanded.contains(row.id), showAll: showAll(row), width: width)
+            _ = render(row, expanded: expanded.contains(row.id), showAll: showAll(row), width: width, localPictures: localPictures)
         }
     }
 
@@ -390,7 +415,7 @@ enum RowRenderer {
             let inner = width - RowMetrics.cardPad * 2 - RowMetrics.accentBar
             let title = approvalTitleText(item)
             let titleSize = measurer.measure(title, width: inner)
-            let payload = approvalPayload(item.request)
+            let payload = item.isStartRequest ? startRequestPayload(item.startRequest) : approvalPayload(item.request)
             let payloadSize = measurer.measure(payload, width: inner - RowMetrics.boxPad * 2)
             let height = RowMetrics.cardPad * 2 + titleSize.height + zoomed(10) + payloadSize.height + RowMetrics.boxPad * 2 + zoomed(12) + RowMetrics.buttonHeight
             return RowRender(height: vertical + zoomed(4) + height, text: title, textSize: titleSize, detail: payload, detailSize: payloadSize)
@@ -443,6 +468,17 @@ enum RowRenderer {
         case .review:
             return RowRender(height: vertical + RowMetrics.cardPad * 2 + zoomed(22 + 4 + 20 + 10) + RowMetrics.buttonHeight)
 
+        case .planCard(let card):
+            let inner = width - RowMetrics.cardPad * 2
+            let title = planCardTitle(card)
+            // Room left for the ⓘ and "Waiting for you" beside it.
+            let titleSize = measurer.measure(title, width: inner - zoomed(150))
+            let body = planCardBody(card, expanded: expanded)
+            let bodySize = measurer.measure(body, width: inner)
+            var height = RowMetrics.cardPad * 2 + titleSize.height + zoomed(8) + bodySize.height
+            if PlanCardLayout.hasFooter(card) { height += zoomed(12) + RowMetrics.buttonHeight }
+            return RowRender(height: vertical + zoomed(4) + height, text: title, textSize: titleSize, detail: body, detailSize: bodySize)
+
         case .plan(let entries):
             let text = planText(entries)
             let size = measurer.measure(text, width: width - RowMetrics.cardPad * 2)
@@ -457,8 +493,11 @@ enum RowRenderer {
                 return RowRender(height: RowMetrics.workHeight, text: header, textSize: header.size())
             }
             let text = NSAttributedString(string: note, attributes: Theme.text(Theme.smallFont, color: Theme.quietText, line: TypeScale.scaled(17), alignment: .center))
-            let size = measurer.measure(text, width: width)
-            return RowRender(height: vertical + size.height, text: text, textSize: size)
+            // A wake note's bear sits left of the words, and they stay
+            // centred, so they leave its room on both sides.
+            let woke = row.content.isWakeNote
+            let size = measurer.measure(text, width: woke ? width - 2 * RowMetrics.wokenBearRoom : width)
+            return RowRender(height: vertical + (woke ? max(size.height, RowMetrics.wokenBearSide) : size.height), text: text, textSize: size)
 
         case .error(let message, let kind):
             let text = NSMutableAttributedString(string: message, attributes: Theme.text(color: .systemRed))
@@ -995,6 +1034,7 @@ enum RowRenderer {
     /// "Write release.sh?" and, for a file, its folder after it, dimmed, as
     /// file rows show it. The card's tooltip has the whole path.
     static func approvalTitleText(_ item: ApprovalItem) -> NSAttributedString {
+        if item.isStartRequest { return startRequestTitle(item.startRequest) }
         var attributes = Theme.text(Theme.cardTitleFont, line: TypeScale.scaled(20))
         let output = NSMutableAttributedString(string: ApprovalText.title(item.request), attributes: attributes)
         if let path = ApprovalText.filePath(item.request) {
@@ -1017,26 +1057,87 @@ enum RowRenderer {
 
     /// The command, the start of what would be written to a file, the page,
     /// or the tool's input, in a monospaced block. The file's name and
-    /// folder are in the title above it.
+    /// folder are in the title above it. A command and a tool's input are
+    /// shown whole, every line and field, as Allow allows all of them: the
+    /// card grows to fit (Daybreak, 7 Nov 2026, a long command's tail was
+    /// cut off after 12 lines). The runner refuses a call too long to show.
     static func approvalPayload(_ request: ApprovalRequest) -> NSAttributedString {
         let input = request.input
         if let command = input["command"]?.stringValue {
-            return mono(clampLines(command, 12), .labelColor)
+            // Where it runs and any network it asks for (a Codex card's)
+            // are part of what Allow allows; a reason or description isn't.
+            let output = NSMutableAttributedString(attributedString: mono(command, .labelColor))
+            let extra = ToolPresentation.fields(input, whole: true).filter { !["command", "description", "reason"].contains($0.key) }
+            if !extra.isEmpty {
+                output.append(mono("\n", .labelColor))
+                output.append(fieldsText(extra))
+            }
+            return output
         }
-        if ApprovalText.filePath(request) != nil {
+        // Another MCP server's tool with a path is shown by all its fields,
+        // below: its content is what Allow allows.
+        if !request.name.hasPrefix("mcp__"), ApprovalText.filePath(request) != nil {
             let call = ToolCall(itemId: request.approvalId, name: request.name, kind: request.name == "Write" ? .write : .edit,
                                 title: request.title, input: input)
             if let diff = DiffBuilder.diff(forTool: call), !diff.hunks.isEmpty {
-                return diffText([diff], maxLines: 8, inset: 0).0
+                // A file Threadbear runs as code, or can't rule out, shows
+                // every line it writes: a hook past the eighth line is still a hook.
+                let code = request.title.contains("Threadbear runs this file as code")
+                    || request.title.contains("Threadbear can't tell whether this file runs as code")
+                return diffText([diff], maxLines: code ? 1_000_000 : 8, inset: 0).0
             }
             return mono(ToolPresentation.shortTitle(ApprovalText.filePath(request) ?? "", limit: 300), Theme.quietText)
         }
-        if let url = input["url"]?.stringValue {
+        if !request.name.hasPrefix("mcp__"), let url = input["url"]?.stringValue {
             return mono(url, .labelColor)
         }
-        let fields = ToolPresentation.fields(input)
-        if fields.isEmpty { return mono(clampLines(request.title, 10), .labelColor) }
-        return fieldsText(Array(fields.prefix(8)))
+        let fields = ToolPresentation.fields(input, whole: true)
+        if fields.isEmpty { return mono(request.title, .labelColor) }
+        return fieldsText(fields)
+    }
+
+    /// Another runner asking for a thread (docs/protocol.md, "Asking
+    /// another runner"): who's asking and where it would start, from the
+    /// request as it was filed, never the card's own words.
+    static func startRequestTitle(_ info: StartRequest?) -> NSAttributedString {
+        let titleAttributes = Theme.text(Theme.cardTitleFont, line: TypeScale.scaled(20))
+        let quiet = Theme.text(Theme.detailFont, color: Theme.quietText, line: TypeScale.scaled(19))
+        guard let info else { return NSAttributedString(string: "Another machine wants to start a thread", attributes: titleAttributes) }
+        if let error = info.error {
+            let output = NSMutableAttributedString(string: "Couldn't read this request", attributes: titleAttributes)
+            output.append(NSAttributedString(string: "\n" + error, attributes: quiet))
+            return output
+        }
+        let place = info.startsOn.map { $0.isSelf ? "this Mac" : $0.name } ?? "this Mac"
+        let output = NSMutableAttributedString(string: "\(info.request.runnerName) wants to start a thread on \(place)", attributes: titleAttributes)
+        var notes: [String] = []
+        if info.target == nil { notes.append("It asked for \u{201C}\(info.request.target)\u{201D}, which isn't one of your machines.") }
+        if let why = info.request.why?.trimmingCharacters(in: .whitespacesAndNewlines), !why.isEmpty { notes.append(why) }
+        if !notes.isEmpty { output.append(NSAttributedString(string: "\n" + notes.joined(separator: "\n"), attributes: quiet)) }
+        return output
+    }
+
+    /// The folder, access and model it would start with, then the whole
+    /// brief: what Mike allows is all of it.
+    static func startRequestPayload(_ info: StartRequest?) -> NSAttributedString {
+        let quiet = Theme.text(Theme.detailFont, color: Theme.quietText, line: TypeScale.scaled(19))
+        guard let info, info.error == nil else { return NSAttributedString(string: info == nil ? "Reading the request\u{2026}" : "", attributes: quiet) }
+        let r = info.request
+        let access: String
+        switch r.permissionMode {
+        case "ask": access = "Asks before edits"
+        case "auto": access = "Auto"
+        case "plan": access = "Plan first"
+        case nil, "", "full": access = "Full access"
+        // The runner refuses a mode it doesn't know rather than starting
+        // on full access, so the card says what was asked, not "Full".
+        case let other?: access = "Unknown (\(other))"
+        }
+        var facts = ["Folder: \(r.cwd?.isEmpty == false ? r.cwd! : "the usual one")", "Access: \(access)"]
+        if let model = r.model, !model.isEmpty { facts.append("Model: \(model)\(r.effort.map { ", \($0)" } ?? "")") }
+        let output = NSMutableAttributedString(string: facts.joined(separator: "\n") + "\n\n", attributes: quiet)
+        output.append(NSAttributedString(string: r.text, attributes: Theme.text(Theme.detailFont, color: .labelColor, line: TypeScale.scaled(19))))
+        return output
     }
 
     /// A question's text: card title weight, quieter once it's answered so
@@ -1108,15 +1209,42 @@ enum RowRenderer {
     /// "2 of 5 steps done", then the steps. Every card starts with a
     /// one-line title; without one the plan read as an orphaned box of
     /// struck-through lines.
+    /// The plan card's title: "Plan", or how far along its steps are.
+    static func planCardTitle(_ card: PlanCard) -> NSAttributedString {
+        let title = card.entries.isEmpty ? PlanCardText.split(card.text).title ?? "Plan" : PlanSummary.title(card.entries)
+        return NSAttributedString(string: title, attributes: [.font: Theme.changesTitleFont, .foregroundColor: NSColor.labelColor])
+    }
+
+    /// What the plan card shows: the plan (its start, until it's opened),
+    /// or once approved its checklist, with the plan under it when opened.
+    static func planCardBody(_ card: PlanCard, expanded: Bool) -> NSAttributedString {
+        let text = PlanCardText.split(card.text).body
+        let plan = MarkdownRenderer.render(expanded ? text : PlanCardText.preview(text).text).string
+        guard !card.entries.isEmpty else { return plan }
+        let out = NSMutableAttributedString(attributedString: planSteps(card.entries))
+        if expanded {
+            out.append(NSAttributedString(string: "\n\n", attributes: [.font: Theme.bodyFont]))
+            out.append(plan)
+        }
+        return out
+    }
+
     static func planText(_ entries: [PlanEntry]) -> NSAttributedString {
         let (titleStyle, titleOffset) = Theme.lines(TypeScale.workLine, font: Theme.changesTitleFont, spacing: zoomed(8))
         let output = NSMutableAttributedString(string: PlanSummary.title(entries), attributes: [
             .font: Theme.changesTitleFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: titleStyle, .baselineOffset: titleOffset,
         ])
+        output.append(NSAttributedString(string: "\n", attributes: [.font: Theme.changesTitleFont, .paragraphStyle: titleStyle]))
+        output.append(planSteps(entries))
+        return output
+    }
+
+    /// A plan's steps, each ticked, under way or still to do.
+    static func planSteps(_ entries: [PlanEntry]) -> NSAttributedString {
+        let output = NSMutableAttributedString()
         let font = Theme.bodyFont
         let (style, offset) = Theme.lines(TypeScale.scaled(22), font: font, spacing: zoomed(4), head: zoomed(24), first: 0)
         style.tabStops = [NSTextTab(textAlignment: .left, location: zoomed(24))]
-        output.append(NSAttributedString(string: "\n", attributes: [.font: Theme.changesTitleFont, .paragraphStyle: titleStyle]))
         for (index, entry) in entries.enumerated() {
             if index > 0 { output.append(NSAttributedString(string: "\n", attributes: [.font: font, .paragraphStyle: style, .baselineOffset: offset])) }
             let (mark, color, textColor): (String, NSColor, NSColor) = switch entry.status {
@@ -1520,11 +1648,18 @@ enum RowRenderer {
         return output
     }
 
+    /// Where a paged card's page number is in its text: the 2 of "2 of 3",
+    /// which `asksHeading` sets off with non-breaking spaces, so an ask's
+    /// own "2 of 3" further on isn't taken for it.
+    static func pageNumberRange(in text: String) -> NSRange? {
+        guard let match = text.range(of: "\u{00A0}\u{00A0}[0-9]+ of [0-9]+\u{00A0}\u{00A0}", options: .regularExpression) else { return nil }
+        let found = text[match].drop { !$0.isNumber }.prefix { $0.isNumber }
+        return NSRange(found.startIndex..<found.endIndex, in: text)
+    }
+
     /// The done card: the agent said nothing waits on Mike, so it says
-    /// Done, with Archive (`archive`) at the right of that line, which
-    /// opens a menu asking how it went before it archives (Mike picked
-    /// that from mockups, 5 Nov, so a sweep can tell a thread he put away
-    /// on purpose from one that was just cleared). Any follow-ups it suggested sit under "Or carry on", one
+    /// Done, with Archive (`archive`, as ⌘E does) at the right of that
+    /// line. Any follow-ups it suggested sit under "Or carry on", one
     /// row each with a tick circle, and a click ticks or unticks one
     /// (`next:<n>`): ticked ones go with his next message, so he can pick
     /// several and add to them (30 Oct). Mike found
@@ -1551,18 +1686,30 @@ enum RowRenderer {
             .paragraphStyle: lineStyle, .baselineOffset: titleOffset,
         ]
         output.append(symbol("checkmark", label: "Done", font: title, attributes: titleAttributes, color: .systemGreen))
-        output.append(NSAttributedString(string: " Done\t", attributes: titleAttributes))
-        // The ▾ says it opens a menu: Archive asks how it went first.
-        output.append(NSAttributedString(string: "\u{00A0}\u{00A0}\u{00A0}Archive\u{00A0}\u{00A0}\u{25BE}\u{00A0}\u{00A0}\u{00A0}", attributes: [
+        output.append(NSAttributedString(string: " Done", attributes: titleAttributes))
+        // The runner checked and found nothing left (protocol "Loose
+        // ends"): said beside Done, so Archive reads as safe without
+        // asking the agent first (the nightly retro, 6 Nov).
+        let ends = card.isOpen ? card.looseEnds : nil
+        if let ends, !ends.contains(where: { !$0.isBooked }) {
+            let small = Theme.smallFont
+            output.append(NSAttributedString(string: "\u{00A0}\u{00A0}\u{00A0}Nothing left open", attributes: [
+                .font: small, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: lineStyle, .baselineOffset: Theme.baselineOffset(height, font: small),
+            ]))
+        }
+        output.append(NSAttributedString(string: "\t", attributes: titleAttributes))
+        output.append(NSAttributedString(string: "\u{00A0}\u{00A0}\u{00A0}Archive\u{00A0}\u{00A0}\u{00A0}", attributes: [
             .font: button, .foregroundColor: AskButtonStyle.plain.textColor, .paragraphStyle: lineStyle, .baselineOffset: buttonOffset,
             .tbAction: "archive", .tbButton: AskButtonStyle.plain.rawValue,
         ]))
-        guard card.isOpen, !card.next.isEmpty else { return output }
+        guard card.isOpen else { return output }
         let small = Theme.smallFont
         // The rows and their label sit in by the hover fill's padding, as
         // the text view clips anything drawn left of its text.
         let inset = rowInset
         let (labelStyle, labelOffset) = Theme.lines(TypeScale.scaled(19), font: small, before: zoomed(10), head: inset)
+        if let ends, !ends.isEmpty { output.append(looseEndsText(ends, inset: inset, labelStyle: labelStyle, labelOffset: labelOffset)) }
+        guard !card.next.isEmpty else { return output }
         output.append(NSAttributedString(string: "\nOr carry on", attributes: [
             .font: small, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: labelStyle, .baselineOffset: labelOffset,
         ]))
@@ -1589,6 +1736,44 @@ enum RowRenderer {
         }
         return output
     }
+
+    /// The done card's loose ends (protocol "Loose ends"): what the runner
+    /// found still open, under "Still open", one line each. A thread one
+    /// links to it; a booked check-in says when it comes back, and alone
+    /// sits under "Coming back", as it doesn't stop an archive. Plain
+    /// lines, not buttons: the Land chip above the composer lands a branch.
+    private static func looseEndsText(_ ends: [LooseEnd], inset: CGFloat, labelStyle: NSParagraphStyle, labelOffset: CGFloat) -> NSAttributedString {
+        let output = NSMutableAttributedString()
+        let small = Theme.smallFont
+        let open = ends.contains { !$0.isBooked }
+        output.append(NSAttributedString(string: open ? "\nStill open" : "\nComing back", attributes: [
+            .font: small, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: labelStyle, .baselineOffset: labelOffset,
+        ]))
+        let font = Theme.bodyFont
+        let words = inset + ceil(font.pointSize * 1.2) + zoomed(8)
+        let (rowStyle, rowOffset) = Theme.lines(TypeScale.bodyLine, font: font, spacing: zoomed(4), before: zoomed(4), head: words, first: inset)
+        rowStyle.tabStops = [NSTextTab(textAlignment: .left, location: words)]
+        // Open ones first, then the check-ins.
+        for end in ends.filter({ !$0.isBooked }) + ends.filter(\.isBooked) {
+            output.append(NSAttributedString(string: "\n", attributes: [.font: font, .paragraphStyle: rowStyle]))
+            var attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor, .paragraphStyle: rowStyle, .baselineOffset: rowOffset]
+            output.append(end.isBooked
+                ? symbol("clock", label: "Booked", font: font, attributes: attributes)
+                : symbol("exclamationmark.circle", label: "Still open", font: font, attributes: attributes, color: .systemOrange))
+            var text = end.text
+            if end.isBooked, let when = end.at.flatMap(ISO8601.parse) { text = "\(bookedFormat.string(from: when)): \(text)" }
+            if let id = end.threadId, let url = URL(string: "thread:\(id)") { attributes[.link] = url }
+            output.append(NSAttributedString(string: "\t" + text, attributes: attributes))
+        }
+        return output
+    }
+
+    /// "Fri 13 Nov, 9:30 am", for when a booked check-in comes back.
+    private static let bookedFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("EEE d MMM h:mm a")
+        return f
+    }()
 
     /// How far a follow-up row's words sit in from its hover fill.
     static var rowInset: CGFloat { zoomed(8) }

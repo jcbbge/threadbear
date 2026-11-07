@@ -7,6 +7,6 @@ public enum DockBadge {
     }
 
     public static func label(for threads: some Sequence<ThreadSummary>, now: Date) -> String? {
-        label(needsYou: ThreadSections.build(threads, now: now).needsYou.count)
+        label(needsYou: ThreadSections.needsYouCount(threads, now: now))
     }
 }

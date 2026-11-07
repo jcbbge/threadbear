@@ -58,6 +58,24 @@ public struct ThreadProject: Sendable, Hashable, Codable, Identifiable {
     enum CodingKeys: String, CodingKey { case id, title, by, pinned, at, why }
 }
 
+extension Array where Element == ThreadProject {
+    /// A thread's projects once Mike's add and remove have landed: what he
+    /// adds is pinned, as the runner's `threads.setProjects` does, so a click
+    /// shows at once. `title` names a project that's being added; one it
+    /// doesn't know is left to the runner's reply.
+    public func changing(add: [String], remove: [String], title: (String) -> String?, now: Date = Date()) -> [ThreadProject] {
+        var projects = filter { !remove.contains($0.id) }
+        for id in add {
+            if let index = projects.firstIndex(where: { $0.id == id }) {
+                projects[index].pinned = true
+            } else if let title = title(id) {
+                projects.append(ThreadProject(id: id, title: title, by: .mike, pinned: true, at: now))
+            }
+        }
+        return projects
+    }
+}
+
 /// A grouping above folders that carries goals, state and notes forward.
 public struct Project: Sendable, Hashable, Decodable, Identifiable {
     public var id: String
@@ -497,6 +515,16 @@ public struct LibrarianStatus: Sendable, Hashable, Decodable {
     /// on the API (they use the logins' room, not money).
     public var tokensToday: Int
     public var notionalTodayUsd: Double
+
+    /// The status as it will be once a pause or resume has landed, so the
+    /// button and switch change at once. A librarian that's off stays off:
+    /// pausing doesn't change why it can't run.
+    public func setting(paused: Bool) -> LibrarianStatus {
+        var status = self
+        status.paused = paused
+        if state != .off { status.state = paused ? .paused : current == nil ? .idle : .working }
+        return status
+    }
 
     public init(state: State = .idle, reason: String? = nil, paused: Bool = false, current: LibrarianJob? = nil,
                 queue: [LibrarianJob] = [], recent: [LibrarianEntry] = [], looksToday: Int = 0, spentTodayUsd: Double = 0,

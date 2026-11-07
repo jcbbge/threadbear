@@ -64,7 +64,7 @@ struct AppUpdatePopover: View {
                 // Not while a newer main builds: the line is about that.
                 Button("Show the Log") {
                     app.updatePopoverShown = false
-                    NSWorkspace.shared.open(URL(fileURLWithPath: AppUpdater.logPath))
+                    OpenGate.openOwn(URL(fileURLWithPath: AppUpdater.logPath))
                 }
                 .tip("Open the update build's log, to see why it failed")
             }
@@ -95,7 +95,7 @@ struct UpdatesPanel: View {
                         Button("Restart to Update") { updater.restartToUpdate() }
                             .tip("Quit and reopen on the new version. Running threads carry on in the runner.")
                     } else if side.failed {
-                        Button("Show the Log") { NSWorkspace.shared.open(URL(fileURLWithPath: AppUpdater.logPath)) }
+                        Button("Show the Log") { OpenGate.openOwn(URL(fileURLWithPath: AppUpdater.logPath)) }
                             .tip("Open the update build's log, to see why it failed")
                     }
                 }
@@ -143,17 +143,29 @@ struct UpdatesPanel: View {
                     section("From Mike") {
                         line(text)
                         if upstream.available, let release = upstream.release {
-                            ForEach(release.subjects.prefix(5), id: \.self) { subject in
-                                Text(subject)
-                                    .font(.system(size: zoomed(11)))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                            // Mike's plain-words notes, or commit subjects
+                            // from a release made before there were any.
+                            ForEach(Array(UpdatesText.releaseLines(release).enumerated()), id: \.offset) { _, group in
+                                if let heading = group.heading {
+                                    Text(heading)
+                                        .font(.system(size: zoomed(11), weight: .medium))
+                                        .padding(.top, zoomed(2))
+                                }
+                                ForEach(Array(group.lines.enumerated()), id: \.offset) { _, line in
+                                    Text(line)
+                                        .font(.system(size: zoomed(11)))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
                             }
                             HStack(spacing: zoomed(8)) {
                                 Button("Bring Them In") { app.bringInUpstream(upstream) }
                                     .tip("Start a thread that merges Mike's release into your main. It asks before it lands.")
                                 Button("Let's Discuss") { app.bringInUpstream(upstream, discuss: true) }
                                     .tip("Start a thread that talks the release through against your own changes first, and changes nothing until you say")
+                                if app.creatingThread {
+                                    SpinnerMark(color: .secondaryLabelColor).frame(width: zoomed(11), height: zoomed(11))
+                                }
                             }
                             .disabled(app.creatingThread)
                         }
@@ -210,6 +222,7 @@ struct CliSection: View {
                     Spacer()
                     Button("Check now") { app.checkClis() }
                         .buttonStyle(.borderless)
+                        .busy(app.isBusy(BusyKey.checkClis))
                         .tip("Look for new versions of the CLIs now")
                         .font(.system(size: zoomed(11)))
                 }
@@ -233,6 +246,7 @@ private struct CliRow: View {
                 if let title = CliText.updateTitle(cli) {
                     Button(title) { app.updateCli(cli.provider, force: cli.status == "held") }
                         .controlSize(.small)
+                        .busy(app.isBusy(BusyKey.updateCli(cli.provider)))
                         .tip(cli.status == "held" ? "Install it even though the check held it back" : "Install the new version now")
                 }
             }
@@ -269,11 +283,14 @@ private struct CliRow: View {
                 .controlSize(.small)
                 .fixedSize()
                 .foregroundStyle(.secondary)
+                // It already says the new setting (`setCliPolicy`).
+                .disabled(app.isBusy(BusyKey.cliPolicy(cli.provider)))
                 .tip("Whether new versions install by themselves")
                 Spacer()
                 if let back = CliText.goBackTitle(cli), let previous = cli.previousVersion {
                     Button(back) { app.updateCli(cli.provider, version: previous) }
                         .buttonStyle(.borderless)
+                        .busy(app.isBusy(BusyKey.updateCli(cli.provider)))
                         .tip("Go back to the version you had before the last update")
                         .font(.system(size: zoomed(11)))
                 }

@@ -1,6 +1,8 @@
 // The relay's records: installs and the daily counts (schema.ts).
 import { ConvexError, v } from 'convex/values';
 import { internalMutation, internalQuery, type MutationCtx } from './_generated/server';
+import { MAX_REASONS, reasonKey } from './reasons';
+import { countVersions, storedVersion } from './versions';
 
 // Per install, so one runaway backend can't flood anyone's phone or Apple.
 export const SENDS_PER_HOUR = 120;
@@ -38,7 +40,7 @@ export const registerVerified = internalMutation({
     if (registeredToday >= REGISTRATIONS_PER_DEPLOYMENT_PER_DAY) throw new ConvexError({ kind: 'busy', message: 'this deployment registered too often today; try again tomorrow' });
     const installKey = 'k_' + randomHex(24);
     const now = Date.now();
-    const fields = { keyHash: await sha256(installKey), lastSeenAt: now, ...(version ? { version: version.slice(0, 40) } : {}), deployment, registeredDay: today, registeredToday: registeredToday + 1 };
+    const fields = { keyHash: await sha256(installKey), lastSeenAt: now, ...(version !== undefined ? { version: storedVersion(version) } : {}), deployment, registeredDay: today, registeredToday: registeredToday + 1 };
     let installId: string;
     if (existing) {
       installId = existing.installId;
@@ -75,23 +77,30 @@ export const admit = internalMutation({
     const fresh = now - row.hourStart >= 3_600_000;
     const sends = fresh ? 0 : row.hourSends;
     if (sends >= SENDS_PER_HOUR) return 'limited';
-    await ctx.db.patch(row._id, { lastSeenAt: now, hourStart: fresh ? now : row.hourStart, hourSends: sends + 1, ...(version ? { version: version.slice(0, 40) } : {}) });
+    await ctx.db.patch(row._id, { lastSeenAt: now, hourStart: fresh ? now : row.hourStart, hourSends: sends + 1, ...(version !== undefined ? { version: storedVersion(version) } : {}) });
     return 'ok';
   },
 });
 
 export const counted = internalMutation({
-  args: { ok: v.boolean() },
+  args: { ok: v.boolean(), status: v.optional(v.number()), reason: v.optional(v.string()) },
   returns: v.null(),
-  handler: async (ctx, { ok }) => {
+  handler: async (ctx, { ok, status, reason }) => {
     const today = day();
     const counts = await ctx.db
       .query('days')
       .withIndex('by_day', (q) => q.eq('day', today))
       .unique();
     const add = { sends: ok ? 1 : 0, failed: ok ? 0 : 1 };
-    if (counts) await ctx.db.patch(counts._id, { sends: counts.sends + add.sends, failed: counts.failed + add.failed });
-    else await ctx.db.insert('days', { day: today, registrations: 0, ...add });
+    const reasons = { ...(counts?.reasons ?? {}) };
+    if (!ok) {
+      let key = reasonKey(status ?? 0, reason);
+      if (!(key in reasons) && Object.keys(reasons).length >= MAX_REASONS) key = 'other';
+      reasons[key] = (reasons[key] ?? 0) + 1;
+    }
+    const tally = ok ? {} : { reasons };
+    if (counts) await ctx.db.patch(counts._id, { sends: counts.sends + add.sends, failed: counts.failed + add.failed, ...tally });
+    else await ctx.db.insert('days', { day: today, registrations: 0, ...add, ...tally });
     return null;
   },
 });
@@ -99,19 +108,20 @@ export const counted = internalMutation({
 // For Mike: `npx convex run relay:stats --prod`.
 export const stats = internalQuery({
   args: {},
-  returns: v.object({ installs: v.number(), activeLast7Days: v.number(), versions: v.record(v.string(), v.number()), days: v.array(v.object({ day: v.string(), sends: v.number(), failed: v.number(), registrations: v.number() })) }),
+  returns: v.object({ installs: v.number(), activeLast7Days: v.number(), versions: v.record(v.string(), v.number()), days: v.array(v.object({ day: v.string(), sends: v.number(), failed: v.number(), registrations: v.number(), reasons: v.optional(v.record(v.string(), v.number())) })) }),
   handler: async (ctx) => {
     const weekAgo = Date.now() - 7 * 86_400_000;
     let installs = 0;
     let active = 0;
-    const versions: Record<string, number> = {};
+    const seen: (string | undefined)[] = [];
     for await (const i of ctx.db.query('installs')) {
       installs++;
       if (i.lastSeenAt >= weekAgo) active++;
-      const key = i.version ?? 'unknown';
-      versions[key] = (versions[key] ?? 0) + 1;
+      seen.push(i.version);
     }
-    const days = (await ctx.db.query('days').withIndex('by_day').order('desc').take(14)).map(({ day, sends, failed, registrations }) => ({ day, sends, failed, registrations }));
+    // In a Map, and anything stored before the rule as "other" (versions.ts).
+    const versions = countVersions(seen);
+    const days = (await ctx.db.query('days').withIndex('by_day').order('desc').take(14)).map(({ day, sends, failed, registrations, reasons }) => ({ day, sends, failed, registrations, ...(reasons ? { reasons } : {}) }));
     return { installs, activeLast7Days: active, versions, days };
   },
 });

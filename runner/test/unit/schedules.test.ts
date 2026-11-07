@@ -10,6 +10,7 @@ import { ErrorCode, RpcError } from '../../src/protocol.ts';
 import { nullLogger } from '../../src/log.ts';
 import { readRunnerJson } from '../../src/config.ts';
 import { toOwnedScheduleDoc, SCHEDULE_POOLS_API_VERSION } from '../../src/sync.ts';
+import { keptCheckFile } from '../../src/schedule-check.ts';
 
 const MIN = 60_000;
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -456,6 +457,34 @@ function backendScheduler(h: ReturnType<typeof makeHarness>, self = M5, home = h
   return sched;
 }
 
+// From the cross-lab review of the raising-access fix (6 Nov 2026): each
+// update copies the record, so two at once lost the earlier one's change.
+test('two updates at once both land: a rename after a lowering keeps it lowered', async () => {
+  const h = makeHarness();
+  const sched = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, zone: () => 'UTC', self: M5, syncOn: true });
+  sched.start();
+  const b = fakeBackend(h.clock, [M5, BRUCE]);
+  const be = b.for('m5-a', M5.id);
+  let slow = false;
+  await sched.attach({
+    ...be,
+    save: async (sc) => {
+      if (slow && sc.permissionMode === 'ask') await new Promise((r) => setTimeout(r, 30));
+      return be.save(sc);
+    },
+  });
+  await tick();
+  const sc = await sched.create({ text: 'Tidy', cron: '@daily', title: 'Daily' });
+  slow = true;
+  const lowered = sched.update({ scheduleId: sc.id, permissionMode: 'ask' });
+  const renamed = sched.update({ scheduleId: sc.id, title: 'Daily 2' });
+  await Promise.all([lowered, renamed]);
+  const now = await sched.find(sc.id);
+  assert.deepEqual([now.permissionMode, now.title], ['ask', 'Daily 2']);
+  assert.equal(b.rows.get(sc.id)?.permissionMode, 'ask');
+  sched.stop();
+});
+
 test('meeting a backend moves schedules.json up once, then the file is only its copy', async () => {
   const h = makeHarness();
   const { thread } = idleThread(h);
@@ -511,6 +540,106 @@ test('a due run is claimed, so two runner processes under one id send it once', 
   assert.equal(row.claim, undefined, 'the claim is let go once it ran');
   old.stop();
   now.stop();
+});
+
+test('a check\'s output survives a handover in the backend too, and is sent once by the next runner', async () => {
+  const h = makeHarness();
+  const b = fakeBackend(h.clock, [M5]);
+  // A check that keeps state: prints its news once.
+  const seen: string[] = [];
+  let told = false;
+  const runCheck = async (p: { command: string }) => {
+    seen.push(p.command);
+    if (told) return { ok: true as const, output: '' };
+    told = true;
+    return { ok: true as const, output: 'fork: 3 new commits' };
+  };
+  // Both releases share the runner's data dir, as in a real handover.
+  const make = () => {
+    const s = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, zone: () => 'UTC', self: M5, syncOn: true, checksOn: () => true, runCheck });
+    s.start();
+    return s;
+  };
+  const old = make();
+  await old.attach(b.for('m5-old', M5.id));
+  const sc = await old.create({ text: 'Look at the forks', title: 'Fork watch', at: iso(h.clock.now() + MIN), check: 'fork-watch' });
+  await tick();
+  h.runner.refuseNewTurns('The runner is restarting; send again in a moment.');
+  h.clock.advance(MIN);
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(seen.length, 1, 'the check ran');
+  assert.equal(b.rows.get(sc.id)?.claim, undefined, 'the refused run let its claim go');
+  assert.equal(b.rows.get(sc.id)?.runs, 0);
+  old.stop();
+
+  h.runner.refusing = undefined;
+  const next = make();
+  await next.attach(b.for('m5-new', M5.id));
+  for (let i = 0; i < 5; i++) await tick();
+  h.clock.advance(MIN);
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(seen.length, 1, 'not run again');
+  const t = h.runner.list(['inbox', 'snoozed', 'archived']).find((x) => x.title === 'Fork watch');
+  assert.ok(t, 'sent');
+  assert.match(h.events(t.id).find((e) => e.type === 'user.message').text, /3 new commits/);
+  assert.equal(b.rows.get(sc.id)?.runs, 1);
+  next.stop();
+});
+
+test('a backend schedule deleted while its check runs sends nothing', async () => {
+  const h = makeHarness();
+  const b = fakeBackend(h.clock, [M5]);
+  let finish!: (r: { ok: true; output: string }) => void;
+  const s = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, zone: () => 'UTC', self: M5, syncOn: true, checksOn: () => true, runCheck: () => new Promise((r) => (finish = r)) });
+  s.start();
+  await s.attach(b.for('m5', M5.id));
+  const sc = await s.create({ text: 'Look', title: 'Fork watch', cron: '*/5 * * * *', check: 'fork-watch' });
+  await tick();
+  h.clock.advance(5 * MIN);
+  for (let i = 0; i < 5; i++) await tick();
+  await s.delete(sc.id);
+  for (let i = 0; i < 5; i++) await tick();
+  finish({ ok: true, output: 'news' });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(h.runner.list(['inbox', 'snoozed', 'archived']).filter((x) => x.title === 'Fork watch').length, 0);
+  assert.ok(!fs.existsSync(keptCheckFile(h.home, sc.id, 'fork-watch')));
+  s.stop();
+});
+
+test('a backend run uses the schedule as it is once its claim comes back, not as it was', async () => {
+  const h = makeHarness();
+  const b = fakeBackend(h.clock, [M5]);
+  const seen: string[] = [];
+  const s = new Scheduler({
+    runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, zone: () => 'UTC', self: M5, syncOn: true, checksOn: () => true,
+    runCheck: async (p) => {
+      seen.push(p.command);
+      return { ok: true, output: '' };
+    },
+  });
+  s.start();
+  // Claims held until let go, as a slow backend would.
+  const real = b.for('m5', M5.id);
+  let letGo: (() => void) | undefined;
+  const slow: ScheduleBackend = { ...real, claim: (id, kind, expect) => new Promise((r) => (letGo = () => void real.claim(id, kind, expect).then(r))) };
+  await s.attach(slow);
+  const sc = await s.create({ text: 'Look', title: 'Fork watch', cron: '*/5 * * * *', check: 'check-a' });
+  await tick();
+  // A's news, kept from a send a restart refused.
+  fs.mkdirSync(path.join(h.home, 'schedule-checks'), { recursive: true });
+  fs.writeFileSync(keptCheckFile(h.home, sc.id, 'check-a'), JSON.stringify({ check: 'check-a', at: 'x', extra: '\n\nnews from a' }));
+  h.clock.advance(5 * MIN);
+  for (let i = 0; i < 5; i++) await tick();
+  assert.ok(letGo, 'claiming');
+  // Changed while the claim is out.
+  await s.update({ scheduleId: sc.id, check: 'check-b' });
+  for (let i = 0; i < 5; i++) await tick();
+  letGo!();
+  for (let i = 0; i < 10; i++) await tick();
+  assert.deepEqual(seen, ['check-b']);
+  assert.equal(h.runner.list(['inbox', 'snoozed', 'archived']).filter((x) => x.title === 'Fork watch').length, 0, "a's news isn't sent as b's");
+  assert.ok(fs.existsSync(keptCheckFile(h.home, sc.id, 'check-a')), 'and is still kept for a');
+  s.stop();
 });
 
 test('runners.list gives each runner\'s version, start and whether it\'s updating, for the Runners panel', async () => {
@@ -673,3 +802,78 @@ test("schedules a runner key can't bring up stay on this Mac, running from its o
   assert.equal(s.list().length, 1, 'nothing lost');
   s.stop();
 });
+
+// Daybreak, 6 Nov 2026 ("Schedule refresh can run a secondary runner's job on
+// the primary"): the main Mac claims its schedule; while the claim or its
+// check is out, Mike deletes it and a runner key saves a schedule of its own
+// under the same id (same check, its own words, Full access). The main Mac's
+// subscription has every runner's rows, so the new row turns up under the
+// claimed id. Nothing is sent for it: what was claimed is gone.
+async function replaceUnderClaim(b: ReturnType<typeof fakeBackend>, id: string, how: 'secondary' | 'owner') {
+  const old = structuredClone(b.rows.get(id)!);
+  delete old.claim;
+  await b.for('phone', M5.id).remove(id);
+  const evil = { ...old, title: 'ATTACKER JOB', text: 'ATTACKER INSTRUCTIONS', permissionMode: 'full' as const };
+  if (how === 'secondary') await b.for('bruce', BRUCE.id).save({ ...evil, runnerId: BRUCE.id });
+  // Mike making a new one under the old id (his own key may): a new
+  // schedule all the same, not the one claimed.
+  else await b.for('phone', M5.id).save({ ...evil, createdAt: iso(Date.parse(old.createdAt) + 1) });
+}
+
+for (const how of ['secondary', 'owner'] as const) {
+  test(`a schedule replaced under its id while its check runs isn't sent as the claimed one (${how})`, async () => {
+    const h = makeHarness();
+    const b = fakeBackend(h.clock, [M5, BRUCE]);
+    let finish: ((r: { ok: true; output: string }) => void) | undefined;
+    const s = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, zone: () => 'UTC', self: M5, syncOn: true, checksOn: () => true, runCheck: () => new Promise((r) => (finish = r)) });
+    s.start();
+    await s.attach(b.for('m5', M5.id));
+    const sc = await s.create({ text: 'Benign', title: 'BENIGN JOB', cron: '*/5 * * * *', check: 'news-check', permissionMode: 'ask' });
+    await tick();
+    h.clock.advance(5 * MIN);
+    for (let i = 0; i < 5; i++) await tick();
+    assert.ok(finish, 'its check is running, under the claim');
+    await replaceUnderClaim(b, sc.id, how);
+    for (let i = 0; i < 5; i++) await tick();
+    finish!({ ok: true, output: 'news' });
+    for (let i = 0; i < 10; i++) await tick();
+    const made = h.runner.list(['inbox', 'snoozed', 'archived']);
+    assert.equal(made.filter((t) => t.title === 'ATTACKER JOB').length, 0, 'the replacement is not sent');
+    assert.ok(!made.some((t) => h.events(t.id).some((e) => e.type === 'user.message' && /ATTACKER/.test(e.text))));
+    assert.ok(!made.some((t) => t.permissionMode === 'full' && t.schedule?.id === sc.id), 'nothing in Full access from it');
+    if (how === 'secondary') assert.equal(b.rows.get(sc.id)?.lastRun, undefined, "and nothing recorded on the other runner's row");
+    s.stop();
+  });
+
+  test(`a requested run whose schedule is replaced while the claim is out isn't sent (${how})`, async () => {
+    const h = makeHarness();
+    const b = fakeBackend(h.clock, [M5, BRUCE]);
+    const s = backendScheduler(h);
+    const real = b.for('m5', M5.id);
+    let letGo: (() => void) | undefined;
+    // The claim lands at once; only its answer is slow to come back.
+    const slow: ScheduleBackend = {
+      ...real,
+      claim: (id, kind, expect) => {
+        const landed = real.claim(id, kind, expect);
+        return kind === 'request' ? new Promise((r) => (letGo = () => void landed.then(r))) : landed;
+      },
+    };
+    await s.attach(slow);
+    const sc = await s.create({ text: 'Benign', title: 'BENIGN JOB', cron: '0 0 1 1 *', permissionMode: 'ask' });
+    await tick();
+    // Run now from another Mac: a request the M5 claims.
+    await b.for('bruce', BRUCE.id).requestRun(sc.id, iso(h.clock.now()));
+    for (let i = 0; i < 5; i++) await tick();
+    assert.ok(letGo, 'claiming the request');
+    await replaceUnderClaim(b, sc.id, how);
+    // The replacement asks for a run too, so the old request's claim could
+    // be taken for it.
+    for (let i = 0; i < 5; i++) await tick();
+    letGo!();
+    for (let i = 0; i < 10; i++) await tick();
+    const made = h.runner.list(['inbox', 'snoozed', 'archived']);
+    assert.equal(made.filter((t) => t.title === 'ATTACKER JOB' || t.title === 'BENIGN JOB').length, 0, 'nothing is sent for it');
+    s.stop();
+  });
+}

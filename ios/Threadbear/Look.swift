@@ -151,6 +151,8 @@ struct SectionHeading: View {
     /// For a heading that folds: whether it's folded and how many rows
     /// that hides (nil: not known yet).
     var fold: Fold?
+    /// Goes up to give the icon one small bounce (a thread tucked in).
+    var bounce = 0
 
     struct Fold {
         var folded: Bool
@@ -161,6 +163,7 @@ struct SectionHeading: View {
         HStack(spacing: 6) {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .medium))
+                .symbolEffect(.bounce, value: bounce)
                 .frame(width: 16)
             Text(title)
                 .font(.subheadline.weight(.semibold))

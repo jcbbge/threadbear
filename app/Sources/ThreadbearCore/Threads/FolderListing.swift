@@ -53,7 +53,9 @@ public struct FolderContents: Sendable, Equatable, Decodable {
                 path: FolderListing.join(parent, name),
                 isFolder: item.isFolder ?? false,
                 hidden: item.hidden ?? name.hasPrefix("."),
-                size: item.size.map { Int($0) },
+                // Another runner sends it: a size that isn't a whole number of
+                // bytes is none, not Int(_:) trapping on 1e100 (Daybreak, 7 Nov).
+                size: item.size.flatMap { $0.wholeCount() },
                 modifiedAt: item.modifiedAt.flatMap(FolderListing.date)
             )
         }

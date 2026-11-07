@@ -211,6 +211,8 @@ before(() => {
   fs.copyFileSync(path.join(import.meta.dirname, 'fake-runner.mjs'), path.join(rdir, 'src', 'main.ts'));
   // rpc-client.mjs and the fake runner both answer the auth challenge with it.
   fs.copyFileSync(path.join(RUNNER, 'src', 'rpc-auth.ts'), path.join(rdir, 'src', 'rpc-auth.ts'));
+  // deploy-backend.mjs reads this Mac's Convex credential with it.
+  fs.copyFileSync(path.join(RUNNER, 'src', 'convex-admin.ts'), path.join(rdir, 'src', 'convex-admin.ts'));
   fs.writeFileSync(path.join(rdir, 'bin', 'tb'), '#!/usr/bin/env node\n');
   const pkg = { name: 'fake-runner', version: '9.9.9', private: true, type: 'module', scripts: { typecheck: 'true', test: 'true' } };
   fs.writeFileSync(path.join(rdir, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
@@ -370,7 +372,7 @@ test("the real runner's label is refused for a sandbox, and a thread is spotted 
     assert.match(r.stderr, /--now would stop the runner this thread runs on/);
     r = sh('install-runner.sh', ['--home', home, '--label', LABEL]);
     assert.equal(r.status, 1, out(r));
-    assert.match(r.stderr, /Ask Mike to run it from a terminal/);
+    assert.match(r.stderr, /Ask the user to run it from a terminal/);
     // THREADBEAR_HOME pointed at a dev runner doesn't switch the guard off.
     r = sh('install-runner.sh', ['--home', home, '--label', LABEL], { THREADBEAR_THREAD_ID: 't', THREADBEAR_HOME: path.join(root, 'dev-home') });
     assert.equal(r.status, 1, out(r));
@@ -396,7 +398,7 @@ test("inside a thread, a resume the runner won't send is said rather than promis
   }
   assert.equal(r.status, 0, out(r));
   assert.match(r.stdout, /The runner restarts when this turn ends, but it won't carry this thread on afterwards: fake: resumed too often\.\n/);
-  assert.match(r.stdout, /End your turn now, and say in your reply that Mike has to message this thread once the runner is back/);
+  assert.match(r.stdout, /End your turn now, and say in your reply that the user has to message this thread once the runner is back/);
   assert.doesNotMatch(r.stdout, /resumes this thread with/);
   const id = current();
   setBusy([]);
@@ -426,7 +428,7 @@ test('--now never cuts other threads short from a thread, and a thread hears abo
   assert.equal(r.status, 1, out(r));
   assert.match(r.stderr, /^--now would cut short 1 other thread's work/);
   assert.match(r.stderr, /t-other/);
-  assert.match(r.stderr, /ask Mike to run this from a terminal with --now --force/);
+  assert.match(r.stderr, /ask the user to run this from a terminal with --now --force/);
   // From a terminal it takes --force, which isn't offered.
   r = deploy(['--now', '--skip-checks']);
   assert.equal(r.status, 1, out(r));
@@ -950,7 +952,7 @@ test('no deploy to a LaunchAgent that runs a checkout, or to none', () => {
     // From a thread of that runner it's Mike's to do, not the agent's.
     r = sh('deploy-runner.sh', ['--home', home3, '--label', label, '--dry-run'], { THREADBEAR_THREAD_ID: 't', THREADBEAR_RUNNER_HOME: home3 });
     assert.equal(r.status, 1, out(r));
-    assert.match(r.stderr, /Mike has to switch it to releases once, from a terminal/);
+    assert.match(r.stderr, /the user has to switch it to releases once, from a terminal/);
     assert.match(r.stderr, /Don't run that from a thread/);
     r = sh('deploy-runner.sh', ['--home', home3, '--label', `${LABEL}.none`, '--dry-run']);
     assert.equal(r.status, 1, out(r));
@@ -974,7 +976,7 @@ test('install-runner.sh guards: sandbox labels, and not from inside its own thre
   assert.match(r.stderr, /give a second runner its own --home/);
   r = sh('install-runner.sh', ['--home', home, '--label', LABEL], { THREADBEAR_THREAD_ID: 'thread-1', THREADBEAR_HOME: home });
   assert.equal(r.status, 1);
-  assert.match(r.stderr, /Ask Mike to run it from a terminal/);
+  assert.match(r.stderr, /Ask the user to run it from a terminal/);
   // THREADBEAR_HOME doesn't pick install-runner.sh's data dir; saying so
   // beats reinstalling the real runner.
   // (--print, so a broken guard could only print the real runner's plist.)

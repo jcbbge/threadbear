@@ -43,6 +43,7 @@ struct ProjectsHome: View {
                         Label("New project", systemImage: "plus")
                     }
                     .fixedSize()
+                    .busy(app.isBusy(BusyKey.newProject))
                     .tip("Make a new project")
                 }
                 if all.isEmpty {

@@ -231,8 +231,11 @@ test('history: keeps a sample on a move of half a point, a reset, or every 30 mi
     [
       ['five_hour', [80, 79.4, 100, 100]],
       ['weekly', [50, 49, 49]],
+      // A model's own week goes out with its title, after the main two.
+      ['weekly_model', [50, 50]],
     ],
   );
+  assert.equal(rows[2].title, 'Weekly Fable');
   assert.equal(rows[0].samples[1][0], NOW + 120_000);
   // Saved (a few seconds after a burst) and read back.
   clock.advance(10_000);
@@ -241,7 +244,7 @@ test('history: keeps a sample on a move of half a point, a reset, or every 30 mi
   // Older than 8 days goes.
   clock.advance(9 * 24 * HOUR_MS);
   again.observe('a', usage(90, 40));
-  assert.deepEqual(again.rows(0).map((r) => r.samples.length), [1, 1]);
+  assert.deepEqual(again.rows(0).map((r) => r.samples.length), [1, 1, 1]);
 });
 
 test('history: UsageStore feeds it, and a draining runner writes nothing', () => {
@@ -279,6 +282,7 @@ test('usage.stats: the shape, days filtering both, and bad days', async () => {
   assert.deepEqual(all.limits, [
     { accountId: 'claude-a', kind: 'five_hour', samples: [[NOW, 80]] },
     { accountId: 'claude-a', kind: 'weekly', samples: [[NOW, 50]] },
+    { accountId: 'claude-a', kind: 'weekly_model', title: 'Weekly Fable', samples: [[NOW, 50]] },
   ]);
   const one = m({ days: 1 }) as { tokens: { hours: unknown[] }[] };
   assert.equal(one.tokens[0].hours.length, 1);

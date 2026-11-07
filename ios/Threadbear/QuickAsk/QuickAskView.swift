@@ -194,7 +194,7 @@ private struct TimingSheet: View {
                             .foregroundStyle(row.label.hasPrefix(" ") ? .secondary : .primary)
                     }
                 } footer: {
-                    Text("\(timing.trigger.label) · \(timing.transcriber). The answer goes to the archive server on your tailnet, then into a thread on your Mac.")
+                    Text("\(timing.trigger.label) · \(timing.transcriber). The question goes to your Ask server, and the answer into a thread on your Mac.")
                 }
             }
             .font(.subheadline)
@@ -312,7 +312,7 @@ struct QuickAskSettingsSection: View {
     var body: some View {
         @Bindable var settings = quick.settings
         Section {
-            TextField("Archive server", text: $settings.baseURLString)
+            TextField("Server address", text: $settings.baseURLString)
                 .textContentType(.URL)
                 .keyboardType(.URL)
                 .textInputAutocapitalization(.never)
@@ -348,9 +348,13 @@ struct QuickAskSettingsSection: View {
             }
         }
         .alert("Ask", isPresented: $showingAbout) {
+            // There's no public server yet (Mike's is Agent Archive), so this is how anyone else gets one.
+            Button("How to set one up") {
+                LinkGate.shared.openOwn(URL(string: "https://github.com/mikecann/threadbear/blob/main/docs/ask-server.md")!)
+            }
             Button("OK", role: .cancel) {}
         } message: {
-            Text("Press the Action button (set it to Threadbear's Ask shortcut), say a question, and hear the answer from your Agent Archive server. It needs Tailscale on this phone. Each answer is kept as a thread on your Mac, so you can carry on there.")
+            Text("Press the Action button (set it to Threadbear's Ask shortcut), say a question, and hear the answer from your own Ask server. Each answer is kept as a thread on your Mac, so you can carry on there.")
         }
     }
 }

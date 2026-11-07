@@ -201,8 +201,8 @@ final class AccountUsageTests: XCTestCase {
     }
 
     func testExtraLinesKeepOnlyWhatDecidesSomething() {
-        // Mike's gmail account: Fable's own week has more room than the
-        // whole week, so it's left out; the allowance and the spend are one line.
+        // Mike's gmail account: Fable's own week has a meter, not a line;
+        // the allowance and the spend are one line.
         var gmail = usage(90, 16, weeklyReset: at(day: 30, 1))
         gmail.windows += [
             UsageWindow(kind: "weekly_model", title: "Weekly Fable", remainingPercent: 96, resetsAt: at(day: 30, 1)),
@@ -210,15 +210,17 @@ final class AccountUsageTests: XCTestCase {
         ]
         XCTAssertEqual(AccountUsageText.extraLines(gmail, notice: "$48.85 extra usage spent", now: now, calendar: calendar),
                        ["$48.85 extra usage spent · $250 allowance: $132.79 left"])
-        // A model limit tighter than the main windows is the one that bites.
+        // A model's own week has its own meter in the panel, so it's never
+        // a line here, however tight.
         var tight = usage(90, 60)
         tight.windows.append(UsageWindow(kind: "weekly_model", title: "Weekly Fable", remainingPercent: 5, resetsAt: at(day: 29, 13)))
-        XCTAssertEqual(AccountUsageText.extraLines(tight, notice: nil, now: now, calendar: calendar), ["Weekly Fable 5% left, resets Thu 1 pm"])
-        XCTAssertEqual(AccountUsageText.extraLines(usage(90, 60), notice: nil, now: now, calendar: calendar), [])
-        // Resetting with the weekly window, shown just above it: the reset isn't said twice.
-        var same = usage(nil, 60, weeklyReset: at(day: 29, 13))
-        same.windows.append(UsageWindow(kind: "weekly_model", title: "Weekly Fable", remainingPercent: 5, resetsAt: at(day: 29, 13)))
-        XCTAssertEqual(AccountUsageText.extraLines(same, notice: nil, now: now, calendar: calendar), ["Weekly Fable 5% left"])
+        XCTAssertEqual(AccountUsageText.extraLines(tight, notice: nil, now: now, calendar: calendar), [])
+        XCTAssertEqual(AccountUsageText.modelWeeks(tight).map(\.title), ["Weekly Fable"])
+        XCTAssertEqual(AccountUsageText.modelWeeks(usage(90, 60)), [])
+        // A bare bucket tighter than the main windows still is.
+        var codexTight = usage(nil, 60)
+        codexTight.windows.append(UsageWindow(kind: "other", title: "GPT-6.1-Sol", remainingPercent: 5))
+        XCTAssertEqual(AccountUsageText.extraLines(codexTight, notice: nil, now: now, calendar: calendar), ["GPT-6.1-Sol 5% left"])
         // Codex's credits come in the notice; a window repeating them doesn't say them again.
         var codex = usage(nil, 89)
         codex.windows.append(UsageWindow(kind: "other", title: "Credits", remainingPercent: 100, detail: "64,390 credits"))

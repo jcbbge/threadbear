@@ -42,7 +42,8 @@ export type SecretCheckCounts = {
   rulesOnly: number;
 };
 export type SecretCheckStatus = SecretCheckCounts & {
-  state: 'off' | 'unsupported' | 'unavailable' | 'on';
+  // starting: on here, and hasn't had its first look yet (RUN_EVERY_MS after a start).
+  state: 'off' | 'unsupported' | 'starting' | 'unavailable' | 'on';
   reason?: string;
   lastRunAt?: string;
   skippedOnBattery?: number;
@@ -153,8 +154,10 @@ export class SecretCheck {
     else if ((deps.platform ?? process.platform) !== 'darwin') {
       this.state = 'unsupported';
       this.reason = "Apple's on-device model is only on a Mac";
-    } else this.state = 'unavailable';
-    if (this.state === 'unavailable') this.load();
+    } else {
+      this.state = 'starting';
+      this.load();
+    }
   }
 
   private freshCounts(): SecretCheckCounts {

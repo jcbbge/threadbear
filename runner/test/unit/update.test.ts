@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { tmpDir } from '../helpers/fakes.ts';
 import { FakeClock } from '../../src/clock.ts';
+import type { UpdateFailure } from '../../src/fix-update.ts';
 import { nullLogger } from '../../src/log.ts';
 import { CHECK_INTERVAL_MS, FIRST_CHECK_MS, SOON_MS, RunnerUpdater, launcherDiffers, launchAgentBehind, launcherSourcesHash, appOfExecutable, updateDir, watchMainRef, decideUpdate, failedAlready, releaseTreeAt, syncClone, updateFilePath, type UpdateDeps } from '../../src/update.ts';
 import type { ReleaseJson } from '../../src/release.ts';
@@ -203,6 +204,29 @@ test('a change to main is built and a restart asked for; the next check sees the
   await new Promise((r) => setImmediate(r));
   await new Promise((r) => setImmediate(r));
   assert.equal(h.deploys, 1);
+});
+
+test('a failed build or backend deploy goes to a fix thread instead of the notice, and to the notice when that fails', async () => {
+  const failures: UpdateFailure[] = [];
+  let handle: () => boolean = () => true;
+  const h = harness({}, { onFailed: (f) => (failures.push(f), handle()) });
+  h.deployResult = { ok: false, error: 'Unit tests failed' };
+  h.u.start();
+  await h.u.check();
+  assert.equal(h.notices.length, 0, 'no banner');
+  assert.equal(failures.length, 1);
+  assert.deepEqual({ ...failures[0], logFile: undefined }, { kind: 'build', commit: 'c2', short: 'c2', subject: 'Steering', error: 'Unit tests failed', logFile: undefined });
+  assert.equal(h.u.status().state, 'failed', 'the failure still shows in status');
+  // The backend at a newer main, and a thread that can't be started.
+  h.main = { commit: 'c3', short: 'c3', subject: 'Schema', tree: 'y+b+c+d' };
+  h.backendResult = { ok: false, error: 'convex deploy failed' };
+  handle = () => {
+    throw new Error('no thread');
+  };
+  await h.u.check();
+  assert.equal(failures.at(-1)!.kind, 'backend');
+  assert.equal(h.notices.length, 1);
+  assert.match(h.notices[0], /Convex backend couldn't be deployed at main c3/);
 });
 
 test('main at the same tree, or only tests and docs changed, is left alone', async () => {

@@ -23,10 +23,23 @@ directly, so it works with the Mac asleep: whatever you send waits in
   (accent while working, orange for Needs you, red for Failed) and the
   same section headings. The accent is the system blue the Mac's accent
   is.
+- The mic on new threads and replies (`Threadbear/Dictation.swift`,
+  `DictateButton.swift`) uses Apple's speech
+  recognition or Whisper, asked on the first tap (Settings › Dictation
+  after). Whisper is whisper.cpp's prebuilt framework (`WhisperBinary/`,
+  the release Voice Type on the Mac runs) with large-v3-turbo q8_0, an
+  874 MB background download into Application Support
+  (`Threadbear/Whisper/`), on the GPU. It records while listening and types
+  it all out on stop; Apple's fills in until the download's done. Whisper gets a
+  word list as its prompt, as Voice Type does ("Convex, Claude."):
+  `DictationWords` has defaults, Settings › Dictation › Words edits them,
+  and `-ThreadbearAddWords "A, B"` at launch adds some. Debug builds take `-WhisperTestWAV
+  <path>` to transcribe a file at launch and print it (the simulator runs
+  it on the CPU, as its Metal can't map the model: about 50 s a clip).
 - `Threadbear/`: the SwiftUI app. iOS 18, so the XS Max runs it too.
 - `scripts/sim-shots.sh [dir] [--dark]`: screenshots on sample data in the
   simulator (`-ThreadbearFake`, `-ThreadbearOpen <threadId>`,
-  `-ThreadbearCompose <text>`, `-ThreadbearSearch <text>`, `-ThreadbearLong` for a very long thread, "long", `-ThreadbearSecret` for one waiting on a secret card, "secret"), on a 6.9" iPhone, so they're App Store sized.
+  `-ThreadbearCompose <text>`, `-ThreadbearSearch <text>`, `-ThreadbearLong` for a very long thread, "long", `-ThreadbearSecret` for one waiting on a secret card, "secret", `-ThreadbearShortInbox` for one row in the inbox and one of each put away, `-ThreadbearEmptyInbox` for none, `-ThreadbearFinishSoon` for the running thread's turn to end after 14 s, `-ThreadbearSlowAnswers` for answers to cards to take 3 s to land, `-ThreadbearRefuseAnswers` for them then to be refused), on a 6.9" iPhone, so they're App Store sized.
 - `scripts/sim.sh [boot|stop]`: this worktree's own simulator, for
   `sim-shots.sh` and any repro of your own. It prints the id; use that
   rather than picking a simulator from `simctl list`, and `stop` it when

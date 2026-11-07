@@ -83,8 +83,15 @@ export function memoryBackend() {
   const get = (row: Row, f: string) => f.split('.').reduce<any>((a, k) => a?.[k], row);
   const cmp = (a: unknown, b: unknown) => (a === b ? 0 : a === undefined ? -1 : b === undefined ? 1 : (a as any) < (b as any) ? -1 : 1);
 
-  // Rows read by queries (what Convex's read limits count), for tests that a function reads only what it should.
-  const counter = { reads: 0 };
+  // Rows read by queries (what Convex's read limits count), for tests that a
+  // function reads only what it should, and their bytes (as JSON, close to
+  // Convex's own size), for its 16 MiB a mutation.
+  const counter = { reads: 0, bytes: 0 };
+  const read = (r: Row) => {
+    counter.reads++;
+    counter.bytes += Buffer.byteLength(JSON.stringify(r));
+  };
+  const find = (id: string) => Object.values(tables).flat().find((x) => x._id === id) ?? null;
   const db = {
     query(table: string) {
       const preds: ((r: Row) => boolean)[] = [];
@@ -122,28 +129,42 @@ export function memoryBackend() {
         },
         async first() {
           const r = rows()[0] ?? null;
-          if (r) counter.reads++;
+          if (r) read(r);
           return r;
         },
         async unique() {
           const r = rows();
-          counter.reads += r.length;
+          r.forEach(read);
           if (r.length > 1) throw new Error(`convex-memory: unique() found ${r.length} rows in ${table}`);
           return r[0] ?? null;
         },
         async collect() {
           const r = rows();
-          counter.reads += r.length;
+          r.forEach(read);
           return r;
         },
         async take(n: number) {
+          // Convex refuses a count that isn't a whole number.
+          if (!Number.isInteger(n) || n < 0) throw new Error(`convex-memory: take(${n})`);
           const r = rows().slice(0, n);
-          counter.reads += r.length;
+          r.forEach(read);
           return r;
+        },
+        // A page in the index's order, its cursor the last row's key, as
+        // Convex's are: rows deleted along the way don't shift the next page.
+        async paginate({ numItems, cursor }: { numItems: number; cursor: string | null }) {
+          const keyOf = (r: Row) => [...order.map((f) => get(r, f)), r._creationTime];
+          const after = (k: unknown[], c: unknown[]) => k.reduce<number>((acc, x, i) => acc || cmp(x, c[i]), 0) > 0;
+          const last = cursor ? (JSON.parse(cursor) as unknown[]) : undefined;
+          const all = rows().filter((r) => !last || after(keyOf(r), last));
+          const page = all.slice(0, numItems);
+          page.forEach(read);
+          const end = page.at(-1);
+          return { page, isDone: page.length >= all.length, continueCursor: end ? JSON.stringify(keyOf(end)) : (cursor ?? '') };
         },
         async *[Symbol.asyncIterator]() {
           for (const r of rows()) {
-            counter.reads++;
+            read(r);
             yield r;
           }
         },
@@ -155,11 +176,14 @@ export function memoryBackend() {
       all(table).push({ ...doc, _id, _creationTime: next } as Row);
       return _id;
     },
+    // A get counts toward the bytes, not the rows (reads() is queries' rows).
     async get(id: string) {
-      return Object.values(tables).flat().find((r) => r._id === id) ?? null;
+      const r = find(id);
+      if (r) counter.bytes += Buffer.byteLength(JSON.stringify(r));
+      return r;
     },
     async patch(id: string, p: Record<string, unknown>) {
-      const row = await db.get(id);
+      const row = find(id);
       if (!row) throw new Error(`convex-memory: no row ${id}`);
       for (const [k, x] of Object.entries(p)) {
         if (x === undefined) delete row[k];
@@ -167,7 +191,7 @@ export function memoryBackend() {
       }
     },
     async replace(id: string, doc: Record<string, unknown>) {
-      const row = await db.get(id);
+      const row = find(id);
       if (!row) throw new Error(`convex-memory: no row ${id}`);
       for (const k of Object.keys(row)) if (k !== '_id' && k !== '_creationTime') delete row[k];
       Object.assign(row, doc);
@@ -200,6 +224,8 @@ export function memoryBackend() {
     deleted,
     scheduled,
     reads: () => counter.reads,
+    bytesRead: () => counter.bytes,
+    resetReads: () => ((counter.reads = 0), (counter.bytes = 0)),
   };
 }
 

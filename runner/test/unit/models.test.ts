@@ -187,6 +187,21 @@ test('settings: update saves to runner.json, applies at once, and a bad field ch
   assert.equal(s.cfg.idleMs, 10 * 60_000, 'a refused update changed nothing');
 });
 
+test("settings: bringIn is every 5 days until changed, and keeps the rest of runner.json's releases", () => {
+  const s = settingsSetup();
+  assert.equal(s.svc.get().bringIn, 5);
+  const file = path.join(s.home, 'runner.json');
+  fs.writeFileSync(file, JSON.stringify({ releases: { publish: false, signingKey: '~/k' } }));
+  for (const v of [3, 'important', 'off'] as const) {
+    const r = s.methods['settings.update']({ bringIn: v }) as { settings: any };
+    assert.equal(r.settings.bringIn, v);
+  }
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).releases, { publish: false, signingKey: '~/k', bringIn: 'off' });
+  for (const bad of [0, 2.5, 'weekly', true]) {
+    assert.throws(() => s.methods['settings.update']({ bringIn: bad }), (e: RpcError) => e.code === ErrorCode.badParams, String(bad));
+  }
+});
+
 test('settings: a fresh runner.json means the Claude pool and no private folders', () => {
   const cfg = loadConfig({ THREADBEAR_HOME: tmpDir() });
   assert.deepEqual(cfg.models, { pool: 'claude', privateFolders: [] });

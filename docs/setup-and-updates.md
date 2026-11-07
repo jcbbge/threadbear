@@ -75,7 +75,8 @@ Archive moved off Convex because of reads and writes, not storage).
 **Self-hosted as an option:** the same functions run on Convex's open source backend on
 your own machine, served over Tailscale. It's a setting in setup, not a fork. The phone
 then needs Tailscale on, and it can't reach a sleeping Mac unless the backend lives on an
-always-on machine.
+always-on machine. Built 7 Nov (docs/self-hosting.md): `setup --self-hosted`, with no
+phone notifications, as the push relay only reaches Convex cloud.
 
 ### 2.2 Setup: one command
 
@@ -117,13 +118,24 @@ changing someone's Threadbear uses the lowest layer that does the job:
 **Releases, not Mike's main.** Mike's `main` moves dozens of times a day. Once a day,
 Mike's own runner tags the newest commit it has been running as its last good release
 for at least six hours, as `release/YYYY-MM-DD`, if anything changed since the last tag.
-The tag is signed with Mike's SSH signing key and pushed to GitHub. The tag's message
-lists the changes since the last tag, which is what the app shows.
+It also waits until GitHub's checks (the Xcode 26 builds) have passed on that exact
+commit, as the runner staying up says nothing about the apps building. Nothing else
+pushes main, so the runner pushes a settled main to GitHub first if it isn't there yet. A release held
+back says why in `tb status` and the Updates panel, and goes out on the next hourly look
+once the checks are green. The tag is signed with Mike's SSH signing key and pushed to GitHub. The tag's message
+starts with plain-words notes ("What's new:", a few lines Opus writes from the commits
+on Mike's runner, for people who use Threadbear rather than work on it), then lists
+every commit since the last tag. The app's Updates panel shows the notes, and the
+commit subjects only for a release from before there were notes. If the model call
+fails, the release goes out without notes.
 
 **Signed, because it's code that runs as you.** Setup pins Mike's public key
 (`scripts/release-signers`) into the data folder. The runner ignores any release tag that
 doesn't verify against that pinned copy, so a change to the key in the repo (or a hijacked
-GitHub account) can't push code onto everyone's Mac.
+GitHub account) can't push code onto everyone's Mac. Only an SSH signature by that key
+counts (a PGP or X.509 one never does, whatever gpg would say), a release name keeps the
+tag it first verified with, and the bring-in thread merges the commit id that was checked,
+not a ref name a later fetch could move.
 
 - **Your own changes ship as they do today.** Commit to `main` (or ask a thread to) and
   the runner and the app rebuild themselves.
@@ -135,6 +147,14 @@ GitHub account) can't push code onto everyone's Mac.
   (docs/bringing-in-updates.md is its brief). Asking is the default (Mike, 29 Oct),
   because a merge can quietly undo something you changed on purpose. Merging by
   itself when nothing clashes and the checks pass could be a setting later.
+- **A thread every 5 days, not a nag** (Mike, 6 Nov). Rather than a banner
+  or a badge, the runner starts the Bring Them In thread itself every 5 days
+  when there's a release waiting (`runner/src/bring-in.ts`). It merges and
+  runs the checks before it asks, so it reaches the inbox as one decision.
+  Never more than one: a newer release goes to the open thread. A commit of
+  Mike's with an `Important: <why>` trailer (a security or data fix) starts
+  one straight away. Settings › General › Updates from Mike changes how
+  often (a number of days, only important ones, or never).
 - **Merging by intent, not just by text.** Git does most of a merge. For the rest,
   the merge thread reads why each side changed (your commits since the last release
   you brought in, and Mike's in the release) and puts your change back onto Mike's new
@@ -184,12 +204,14 @@ everyday things. Tailscale is the default for everything that's machine to machi
   website each one shows as a grey box of the right size, and loads only as you scroll
   to it, several at once (Mike, 28 Oct). When the Mac's asleep the box says "on your
   Mac" instead.
-- **A second runner:** Tinker Desk (plan step 6) writes to the same backend and shows up
-  on the phone and the website straight away. The Mac app talks to it over the tailnet,
-  so its threads can be steered from the laptop.
+- **A second runner:** built and supported (section 4, step 7). It writes to the same
+  backend and shows up on the phone and the website straight away. This proposal had the
+  Mac app reach it over the tailnet; today the first Mac's app reads and steers it through
+  Convex, so it needs no Tailscale, and Tailscale only adds the direct link in
+  Settings > Runners.
 - **A self-hosted backend**, for anyone who picks that option (2.1).
-- **Setup checks Tailscale** is installed and logged in, and says what you lose without
-  it (the heavy bits on the phone, a second runner) rather than refusing.
+- **Setup checks Tailscale** is installed and logged in, and says what it adds rather
+  than refusing.
 
 ## 3. What Mike needs to decide
 
@@ -245,8 +267,13 @@ it public is Mike's call, once he's happy for others to use it.
    thread (docs/bringing-in-updates.md); `tb land` never rebases a merge; setup forks
    and pins the key.
 6. The heavy bits over Tailscale for the phone and the website.
-7. Tinker Desk as a second runner on the same backend.
-8. Self-hosted backend as a setup option.
+7. Done 29 Oct: a second runner on the same backend, on Bruce rather than Tinker Desk.
+   Each one has its own key since 5 Nov (docs/protocol.md, "Runner keys"). Any number of
+   Macs or Linux servers can join: INSTALL.md sets them up.
+8. Done 7 Nov: self-hosted backend as a setup option (`setup --self-hosted`,
+   docs/self-hosting.md). Docker on the same Mac, served with `tailscale serve`,
+   phone notifications off. Convex cloud stays the default and the one we
+   recommend everywhere.
 
 Steps 1 and 2 are useful to Mike straight away. 3 to 5 are what make it installable by
 other people. The landing page already says "Threadbear makes a Convex deployment in

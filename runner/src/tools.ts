@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Hunk, PlanEntry, ToolKind } from './protocol.ts';
+import { MAYBE_RUNS_AS_CODE, RUNS_AS_CODE } from './code-writes.ts';
 import { LIMITS } from './protocol.ts';
 import { applyReplace, diffLines } from './diff.ts';
+import { firstLineSafely, safeEnd } from './safe-cut.ts';
 
 const KINDS: Record<string, ToolKind> = {
   Bash: 'command',
@@ -69,9 +71,8 @@ function str(v: unknown): string {
 }
 
 function firstLine(s: string, max = 100): string {
-  const line = s.split('\n').find((l) => l.trim() !== '') ?? '';
-  const t = line.trim();
-  return t.length > max ? t.slice(0, max - 1) + '…' : t;
+  // Never through a secret: a title goes to Convex (safe-cut.ts).
+  return firstLineSafely(s, max, '…');
 }
 
 const realpaths = new Map<string, string>();
@@ -200,7 +201,7 @@ function threadbearTitle(tool: string, input: Record<string, unknown>): string {
 export function truncateInput(input: unknown): Record<string, unknown> {
   const walk = (v: unknown, depth: number): unknown => {
     if (typeof v === 'string') {
-      return v.length > LIMITS.toolInputString ? v.slice(0, LIMITS.toolInputString) + '\n[truncated]' : v;
+      return v.length > LIMITS.toolInputString ? v.slice(0, safeEnd(v, LIMITS.toolInputString)) + '\n[truncated]' : v;
     }
     if (depth > 8 || v === null || typeof v !== 'object') return v;
     if (Array.isArray(v)) return v.map((x) => walk(x, depth + 1));
@@ -210,6 +211,88 @@ export function truncateInput(input: unknown): Record<string, unknown> {
   };
   const r = walk(input ?? {}, 0);
   return r && typeof r === 'object' && !Array.isArray(r) ? (r as Record<string, unknown>) : { value: r };
+}
+
+// What an approval card shows of a call's input. The strings that decide
+// what Mike is allowing (`decisive`: a command, or every string of a call
+// that acts for the agent elsewhere) go whole, never cut: Allow on a card
+// that shows the start of a command runs all of it (Daybreak, 7 Nov 2026).
+// One longer than an event takes (LIMITS.toolInputString) is `tooLong`, and
+// the caller refuses the call with no card. The rest are cut as
+// truncateInput cuts them (a Write's content shows as a diff anyway).
+export function cardInput(input: Record<string, unknown>, decisive: readonly string[] | 'all'): { input: Record<string, unknown>; tooLong?: string } {
+  let tooLong: string | undefined;
+  const whole = (v: unknown, where: string, depth: number): unknown => {
+    if (typeof v === 'string') {
+      if (v.length > LIMITS.toolInputString) tooLong ??= where;
+      return v;
+    }
+    if (v === null || typeof v !== 'object') return v;
+    // Deeper than a card lays out: not something to allow unread either.
+    if (depth > 8) {
+      tooLong ??= where;
+      return v;
+    }
+    if (Array.isArray(v)) return v.map((x, i) => whole(x, `${where}[${i}]`, depth + 1));
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, whole(x, `${where}.${k}`, depth + 1)]));
+  };
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input ?? {})) {
+    out[k] = decisive === 'all' || decisive.includes(k) ? whole(v, k, 1) : truncateInput({ v }).v;
+  }
+  return tooLong ? { input: out, tooLong } : { input: out };
+}
+
+// Whether the one line the phone and another Mac's view of this runner
+// show of an approval (sync.ts, inputSummary) is all of what allowing it
+// does, so it may be allowed from there. A command must fit that line
+// whole, on a small phone too; a threadbear tool acting elsewhere, or
+// Codex asking for more access, never does, as its words are more than one
+// line. Those cards offer only Deny there, and an allow from there is
+// refused (Runner.respondApproval). An edit shows its path, as before.
+export const REMOTE_COMMAND_CHARS = 160;
+// What such a card says there, and what an allow from there is told.
+export const REMOTE_ALLOW_REFUSED = "It's too long to show in full here, so it can only be allowed in the Mac app connected straight to its runner.";
+// `cwd` is the thread's folder: a command that runs anywhere else, or asks
+// for the network, has more to it than its line (Codex review, 7 Nov 2026).
+// An edit of a file that runs as code shows all it writes on the Mac, and
+// only its path here (its title says it is one), so it counts too.
+export function remoteCardShowsAll(name: string, input: Record<string, unknown>, cwd?: string, title = ''): boolean {
+  if (name === 'permissions' || title.includes(RUNS_AS_CODE) || title.includes(MAYBE_RUNS_AS_CODE)) return false;
+  const fits = (v: string) => v.trim().length <= REMOTE_COMMAND_CHARS && !/[\r\n]/.test(v.trim());
+  // An MCP tool's arguments say what it does (a threadbear tool's own ask,
+  // in Ask mode, or any other server's), a `command` among them or not:
+  // whole only when its one string that isn't an id is the line shown, and short.
+  if (name.startsWith('mcp__')) {
+    // Only ours are known to be ids; another server's `id` can be what it acts on.
+    const ids = name.startsWith('mcp__threadbear__') ? ID_KEYS : new Set<string>();
+    const values = Object.entries(input).filter(([k, v]) => v !== undefined && v !== null && !ids.has(k));
+    if (values.some(([, v]) => typeof v === 'object')) return false;
+    const words = values.map(([, v]) => String(v)).filter((v) => v.trim());
+    return words.length === 0 || (words.length === 1 && summaryField(input) === words[0] && fits(words[0]!));
+  }
+  if (typeof input.command === 'string') {
+    if (input.network !== undefined || (typeof input.cwd === 'string' && input.cwd !== cwd)) return false;
+    return fits(input.command);
+  }
+  return true;
+}
+const ID_KEYS = new Set(['threadId', 'id', 'scheduleId', 'project']);
+
+// The string a remote card's one line is made from (sync.ts inputSummary):
+// the command, the path, or the first string in the input.
+export function summaryField(input: Record<string, unknown>): string | undefined {
+  for (const k of ['command', 'file_path', 'path', 'url', 'pattern', 'query']) {
+    const v = input[k];
+    if (typeof v === 'string' && v.trim()) return v;
+  }
+  for (const v of Object.values(input)) if (typeof v === 'string' && v.trim()) return v;
+  return undefined;
+}
+
+// What the agent is told when a call is refused for that.
+export function tooLongForCard(where: string): string {
+  return `Not run: \`${where}\` is longer than an approval card shows in full (${Math.round(LIMITS.toolInputString / 1024)} KB), and the user can only allow what they can read. Split it into shorter steps.`;
 }
 
 // Diff for an Edit/MultiEdit/Write call computed from its input and the

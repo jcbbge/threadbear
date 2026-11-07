@@ -148,15 +148,15 @@ nonisolated enum AskFailure: Error, Equatable, Sendable {
         }
     }
 
-    /// In words for the screen. Questions only ever go to the archive server here.
+    /// In words for the screen. Questions only ever go to the user's Ask server here.
     var message: String {
         switch self {
         case .noToken:
-            return "There's no token for the archive server yet. Add one in Settings."
+            return "There's no token for your Ask server yet. Add one in Settings."
         case .badBaseURL:
             return "The server address in Settings doesn't look right."
         case .unauthorized:
-            return "The archive server didn't accept the token. Check it in Settings."
+            return "Your Ask server didn't accept the token. Check it in Settings."
         case .outOfCredit:
             return "The server is out of credit."
         case .rateLimited(let detail):
@@ -170,8 +170,8 @@ nonisolated enum AskFailure: Error, Equatable, Sendable {
         case .timedOut:
             return "The server took too long to answer. Try again."
         case .unreachable:
-            // The archive server is only on the tailnet.
-            return "Couldn't reach the archive server. Is Tailscale on?"
+            // Servers are often on a private network or VPN (Mike's is on his tailnet).
+            return "Couldn't reach your Ask server. Is this phone on its network or VPN?"
         case .network(let detail):
             return "Couldn't reach the server: \(detail)"
         case .cutOff:

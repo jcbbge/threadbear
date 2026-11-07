@@ -10,6 +10,7 @@ import { patiently } from '../helpers/patience.ts';
 import { WebSocket, WebSocketServer } from 'ws';
 import crypto from 'node:crypto';
 import net from 'node:net';
+import fs from 'node:fs';
 import { authProof, isNonce, newNonce } from '../../src/rpc-auth.ts';
 
 const TOKEN = 'test-token-0123456789';
@@ -653,6 +654,37 @@ test('threads.panelShown clears the thread\'s panel request, and goes to a drain
   }
 });
 
+// Every request that names a thread goes to the draining runner holding it.
+// patches.trust wasn't on the list, so pressing Trust on a thread that was
+// finishing its turn on the old runner during an update said "Thread not
+// found" (Mike, 7 Nov). This reads the methods from rpc.ts so a new one
+// can't miss the list again.
+test('every request about a thread reaches the draining runner that has it', async () => {
+  const src = fs.readFileSync(new URL('../../src/rpc.ts', import.meta.url), 'utf8');
+  const named = new Set<string>();
+  for (const block of src.split(/\n\s*case '/).slice(1)) {
+    const method = block.slice(0, block.indexOf("'"));
+    const body = block.slice(0, block.search(/\n\s*(case '|default:)/) >>> 0);
+    if (/'threadId'/.test(body)) named.add(method);
+  }
+  // Only this connection's own subscription list; nothing to pass on.
+  named.delete('threads.unsubscribe');
+  assert.ok(named.has('patches.trust') && named.has('actions.run'), [...named].join(', '));
+  const calls: string[] = [];
+  const remote = { owns: (id: string) => id === 'away-3', call: async (_id: string, method: string) => { calls.push(method); return {}; }, summaries: () => [], search: async () => [] };
+  const { server, url } = await serve({ remote: remote as any });
+  const c = await RunnerClient.connect(url, TOKEN);
+  try {
+    // threads.showPanel only goes on with a Mac app to show it.
+    await c.call('hello', { client: 'threadbear-mac' });
+    for (const method of named) await c.call(method, { threadId: 'away-3' }).catch((e) => assert.fail(`${method}: ${e.message}`));
+    assert.deepEqual(calls.sort(), [...named].sort());
+  } finally {
+    c.close();
+    await server.close();
+  }
+});
+
 test('requests about a draining runner\'s thread go to it; a moved answer is handled here', async () => {
   const away = { id: 'away-1', title: 'Busy elsewhere', status: 'running', lastActivityAt: '2099-01-01T00:00:00.000Z' } as any;
   const calls: { threadId: string; method: string }[] = [];
@@ -695,4 +727,79 @@ test('requests about a draining runner\'s thread go to it; a moved answer is han
     c.close();
     await server.close();
   }
+});
+
+// THREADBEAR-F (7 Nov): a thread finishing its turn on a draining runner ran
+// list_schedules all, which looks up ~200 schedules' thread titles at once.
+// Each lookup asked the new runner for every thread's summary (2.8 MB with
+// 931 threads), so a dozen answers sat unsent in one tick and the new runner
+// closed the draining runner's link as "not reading". A lookup now asks for
+// its one thread, and an older runner that lists them all still works.
+test("a draining runner's lookups of other threads ask the new runner for just those", async () => {
+  const { h, server, port } = await serve({ closeBytes: 256 * 1024 });
+  const { PrimaryLink, primaryElsewhere } = await import('../../src/handover.ts');
+  const ids = Array.from({ length: 60 }, (_, i) => h.runner.create({ text: `thread ${i} ${'x'.repeat(2000)}`, accountId: 'claude-3' }).thread.id);
+  const link = new PrimaryLink('127.0.0.1', port, TOKEN);
+  const elsewhere = primaryElsewhere(link, { has: () => false });
+  try {
+    const found = await Promise.all(ids.map((id) => elsewhere.find(id)));
+    assert.deepEqual(found.map((t) => t?.id), ids);
+    assert.equal(await elsewhere.find('missing'), undefined);
+    // An older runner ignores ids and sends the lot; find still picks its own.
+    const old = primaryElsewhere({ call: async () => ({ threads: h.runner.list(['inbox', 'snoozed', 'archived']) }) } as any, { has: () => false });
+    assert.equal((await old.find(ids[3]))?.id, ids[3]);
+  } finally {
+    link.close();
+    await server.close();
+  }
+});
+
+test('threads.list with ids answers only those threads, here and on a draining runner', async () => {
+  const away = { id: 'away-1', title: 'Busy elsewhere', status: 'running', lastActivityAt: '2099-01-01T00:00:00.000Z' } as any;
+  const remote = { owns: (id: string) => id === away.id, call: async () => ({}), summaries: () => [away], search: async () => [] };
+  const { h, server, url } = await serve({ remote: remote as any });
+  const a = h.runner.create({ text: 'one', accountId: 'claude-3' }).thread;
+  h.runner.create({ text: 'two', accountId: 'claude-3' });
+  const archived = h.runner.create({ text: 'three', accountId: 'claude-3' }).thread;
+  h.runner.update({ threadId: archived.id, archived: true });
+  const c = await RunnerClient.connect(url, TOKEN);
+  try {
+    const ids = (r: { threads: { id: string }[] }) => r.threads.map((t) => t.id).sort();
+    assert.deepEqual(ids(await c.call('threads.list', { include: ['inbox', 'snoozed', 'archived'], ids: [a.id, away.id, archived.id, 'nope'] })), [a.id, archived.id, away.id].sort());
+    // include still applies.
+    assert.deepEqual(ids(await c.call('threads.list', { ids: [a.id, archived.id] })), [a.id]);
+    await assert.rejects(c.call('threads.list', { ids: 'x' }), (e: { code: number }) => e.code === -32602);
+  } finally {
+    c.close();
+    await server.close();
+  }
+});
+
+// The same on the tools' side (Codex's review of the fix): every tool that
+// takes a thread id listed all of them to resolve it, so a dozen parallel
+// read_thread calls on a draining runner were the same pile-up. A whole id
+// is looked up by itself; a prefix still needs the list.
+test("the agent tools resolve a whole thread id without listing every thread", async () => {
+  const h = makeHarness();
+  const { buildThreadbearTools } = await import('../../src/threadbear-mcp.ts');
+  const self = h.runner.create({ text: 'me', accountId: 'claude-3' }).thread;
+  const other = h.runner.create({ text: 'the other one', accountId: 'claude-3' }).thread;
+  let lists = 0;
+  const control = new Proxy(h.runner, {
+    get(target, key) {
+      const v = Reflect.get(target, key, target);
+      if (key === 'list') return (...a: unknown[]) => (lists++, (v as Function).apply(target, a));
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  const read = buildThreadbearTools(control as any, self.id).find((t) => t.name === 'read_thread')!;
+  const whole = await read.handler({ threadId: other.id } as never, {} as never);
+  assert.equal(whole.isError, undefined, JSON.stringify(whole));
+  assert.match(JSON.stringify(whole), /the other one/);
+  assert.equal(lists, 0);
+  const prefix = await read.handler({ threadId: other.id.slice(0, 8) } as never, {} as never);
+  assert.match(JSON.stringify(prefix), /the other one/);
+  assert.equal(lists, 1);
+  const missing = await read.handler({ threadId: '00000000-0000-0000-0000-000000000000' } as never, {} as never);
+  assert.equal(missing.isError, true);
 });

@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import ThreadbearCore
 
 @MainActor
@@ -9,6 +10,10 @@ protocol RowCellDelegate: AnyObject {
     /// `DiffPreview.allKey`.
     func showAllLines(_ key: String)
     func respond(approvalId: String, decision: ApprovalDecision, answers: [String: String]?, message: String?)
+    /// Another runner's request for a thread: read it for its card.
+    func loadStartRequest(_ approvalId: String)
+    /// The card's answer is on its way: a spinner, and no more clicks.
+    func isAnswering(_ approvalId: String) -> Bool
     func questionDraft(_ approvalId: String) -> [Int: Set<String>]
     func setQuestionDraft(_ approvalId: String, _ draft: [Int: Set<String>])
     /// A secret card (docs/protocol.md, "Secrets"): where its answer is,
@@ -21,7 +26,7 @@ protocol RowCellDelegate: AnyObject {
     /// A click on an asks card: `tick:<index>` or `reply:<index>`.
     func askAction(_ card: AsksCard, action: String)
     /// An ask's Something else box on the open card (AskAnswerBox): what's
-    /// in it changed, pictures were added to it, or Return sent.
+    /// in it changed, or pictures were added to it.
     func askNoteChanged(_ card: AsksCard, ask: Int, note: AskNote)
     func askNoteImages(_ card: AsksCard, ask: Int, urls: [URL])
     /// Pictures pasted, dropped or chosen in a box go in as chips: whether
@@ -29,21 +34,35 @@ protocol RowCellDelegate: AnyObject {
     func askPicturesAllowed(_ card: AsksCard) -> Bool
     func askImportPicture(_ card: AsksCard, url: URL) async -> ImageRef?
     func sendAnswers(_ card: AsksCard)
+    /// Return in ask `ask`'s box: on to the next unanswered ask, or send
+    /// (⌘Return, or nothing left unanswered).
+    func answerBoxReturn(_ card: AsksCard, ask: Int, command: Bool)
     func openReview(_ review: DesignReview)
+    /// Whether a "Woke up" note should play its bear waking up: only the
+    /// thread's newest, once, the first time it's seen after waking.
+    func claimWakeUp(rowId: String) -> Bool
     /// The pencil by one of Mike's messages: edit it and carry on from
     /// there (docs/protocol.md, "Editing a message").
     func editMessage(rowId: String)
     /// A work:, thread: or review: link in row `rowId`'s text (WorkLinks): open the
     /// step in that turn's working, or the other thread.
     func openThreadLink(_ url: URL, fromRow rowId: String)
+    /// A "Plan first" plan card: Go ahead approves it (plans.approve); Send
+    /// back puts Mike in the composer, as anything he writes sends it back.
+    func approvePlan(itemId: String)
+    func sendBackPlan()
     /// For a thread on another runner ("bruce"): its pictures are files
     /// on that Mac, fetched through this. Nil for this Mac's own.
     var remoteImages: RemoteImages? { get }
+    /// The thread the row is in, which its links are followed in.
+    var linkThreadId: String? { get }
 }
 
 extension RowCellDelegate {
     var remoteImages: RemoteImages? { nil }
+    var linkThreadId: String? { nil }
     func secretState(_ approvalId: String) -> SecretCardState { .ready }
+    func isAnswering(_ approvalId: String) -> Bool { false }
     func answerSecret(approvalId: String, _ answer: SecretAnswer) {}
     func secretEdited(_ approvalId: String) {}
     func askNoteChanged(_ card: AsksCard, ask: Int, note: AskNote) {}
@@ -51,9 +70,13 @@ extension RowCellDelegate {
     func askPicturesAllowed(_ card: AsksCard) -> Bool { false }
     func askImportPicture(_ card: AsksCard, url: URL) async -> ImageRef? { nil }
     func sendAnswers(_ card: AsksCard) {}
+    func answerBoxReturn(_ card: AsksCard, ask: Int, command: Bool) {}
     func openReview(_ review: DesignReview) {}
+    func claimWakeUp(rowId: String) -> Bool { false }
     func editMessage(rowId: String) {}
     func openThreadLink(_ url: URL, fromRow rowId: String) {}
+    func approvePlan(itemId: String) {}
+    func sendBackPlan() {}
 }
 
 /// Base for transcript cells: flipped, so layout reads top-down.
@@ -113,6 +136,8 @@ class RowCellView: NSTableCellView {
         super.prepareForReuse()
         pointer = nil
         updateHover()
+        // A recycled cell mustn't carry a lift on to some other row.
+        layer?.removeAnimation(forKey: SendLift.key)
     }
 
     #if DEBUG
@@ -257,6 +282,9 @@ final class TextRowCell: RowCellView {
     let phoneMark = NSButton()
     private var editable = false
     private var pointerInside = false
+    /// Left of the words of a "Woke up" note. Made the first time one's
+    /// shown, as hardly any text rows ever need it.
+    private var wokenBear: WokenBearView?
     /// The open card's Something else boxes, by ask, over the room its
     /// text leaves for them; kept while the cell is, so typing in one
     /// survives the card being laid out again around it.
@@ -333,6 +361,31 @@ final class TextRowCell: RowCellView {
         super.prepareForReuse()
         pointerInside = false
         updateEdit()
+    }
+
+    private func placeWokenBear(_ row: TranscriptRow, x: CGFloat, width: CGFloat, textSize: NSSize, changedRow: Bool) {
+        guard row.content.isWakeNote else {
+            if let wokenBear, !wokenBear.isHidden {
+                wokenBear.settle()
+                wokenBear.isHidden = true
+            }
+            return
+        }
+        let bear = wokenBear ?? {
+            let bear = WokenBearView()
+            addSubview(bear)
+            wokenBear = bear
+            return bear
+        }()
+        bear.isHidden = false
+        bear.tint = Theme.quietText
+        bear.hat = BearGeometry.wearsHat()
+        let side = RowMetrics.wokenBearSide
+        // Level with the first line, whatever the row's grown to.
+        let line = TypeScale.scaled(17)
+        bear.frame = NSRect(x: x + (width - textSize.width) / 2 - RowMetrics.wokenBearRoom, y: RowMetrics.rowTop + (line - side) / 2, width: side, height: side)
+        if changedRow { bear.settle() }
+        if delegate?.claimWakeUp(rowId: row.id) == true { bear.wakeUp() }
     }
 
     private func updateEdit() {
@@ -465,6 +518,7 @@ final class TextRowCell: RowCellView {
             textView.place(NSRect(x: x, y: top, width: width, height: render.textSize.height))
         }
 
+        placeWokenBear(row, x: x, width: width, textSize: render.textSize, changedRow: previousRowId != row.id)
         updateEdit()
         // A message the runner hasn't shown yet is drawn faded.
         let alpha: CGFloat = pending == nil ? 1 : 0.5
@@ -588,6 +642,87 @@ final class TextRowCell: RowCellView {
         for (index, button) in explainButtons where !shown.contains(index) && !button.isHidden { button.isHidden = true }
     }
 
+    /// Where the page number of a paged card's "‹ 2 of 3 ›" is drawn, in this
+    /// view. It's the first number in the text, on the heading line.
+    func pageNumberRect() -> NSRect? {
+        guard let storage = textView.textStorage, let layoutManager = textView.layoutManager, let container = textView.textContainer,
+              let range = RowRenderer.pageNumberRange(in: storage.string) else { return nil }
+        layoutManager.ensureLayout(for: container)
+        let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let rect = layoutManager.boundingRect(forGlyphRange: glyphs, in: container)
+        let full = textView.fullFrame
+        let origin = textView.textContainerOrigin
+        return rect.offsetBy(dx: full.minX + origin.x, dy: full.minY + origin.y)
+    }
+
+    /// The done card's tick draws itself on, as the sidebar row's does. The
+    /// tick is an attachment in the text, which can't animate, so a view of
+    /// the very same picture takes its exact place, revealed along the tick's
+    /// stroke, and the text's own is see-through until that's done. The same
+    /// picture so its green is the card's, and so nothing jumps at the swap:
+    /// the symbol effect, tried first, drew a slightly different tick.
+    func drawDoneTickOn() {
+        guard let storage = textView.textStorage, storage.length > 0,
+              let layoutManager = textView.layoutManager, let container = textView.textContainer,
+              let tick = storage.attribute(.attachment, at: 0, effectiveRange: nil) as? NSTextAttachment,
+              let image = tick.image else { return }
+        layoutManager.ensureLayout(for: container)
+        let glyph = layoutManager.glyphIndexForCharacter(at: 0)
+        let line = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        let at = layoutManager.location(forGlyphAt: glyph)
+        let full = textView.fullFrame
+        let origin = textView.textContainerOrigin
+        let size = tick.bounds.size
+        // A flipped text view: the attachment's picture sits on the line's
+        // baseline, whatever its bounds and the line's offset say. Filmed
+        // against the text's own, as it hops at the swap if this is out.
+        let view = NSImageView(frame: NSRect(x: full.minX + origin.x + line.minX + at.x,
+                                             y: full.minY + origin.y + line.minY + at.y - size.height,
+                                             width: size.width, height: size.height))
+        view.image = image
+        view.imageScaling = .scaleNone
+        view.wantsLayer = true
+        addSubview(view)
+        let clear = NSTextAttachment()
+        clear.image = NSImage(size: size)
+        clear.bounds = tick.bounds
+        storage.addAttribute(.attachment, value: clear, range: NSRange(location: 0, length: 1))
+        // The stroke of a tick, wide enough to uncover all of it by the end.
+        let stroke = CAShapeLayer()
+        stroke.frame = view.bounds
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: 0, y: size.height * 0.45))
+        path.addLine(to: CGPoint(x: size.width * 0.36, y: size.height * 0.1))
+        path.addLine(to: CGPoint(x: size.width, y: size.height))
+        stroke.path = path
+        stroke.fillColor = nil
+        stroke.strokeColor = NSColor.black.cgColor
+        stroke.lineWidth = size.height * 0.7
+        stroke.lineCap = .butt
+        stroke.lineJoin = .round
+        stroke.isGeometryFlipped = view.isFlipped
+        view.layer?.mask = stroke
+        let draw = CABasicAnimation(keyPath: "strokeEnd")
+        draw.fromValue = 0
+        draw.toValue = 1
+        draw.beginTime = CACurrentMediaTime() + Self.tickDelay
+        draw.duration = Self.tickDraw
+        draw.fillMode = .backwards
+        draw.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 0, 0.2, 1)
+        stroke.add(draw, forKey: "draw")
+        // The text's own comes back under it, then the view goes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.tickDelay + Self.tickDraw + 0.02) { [weak self, weak view, weak storage] in
+            defer { view?.removeFromSuperview() }
+            guard let self, let storage, storage.length > 0,
+                  storage.attribute(.attachment, at: 0, effectiveRange: nil) as? NSTextAttachment === clear else { return }
+            storage.addAttribute(.attachment, value: tick, range: NSRange(location: 0, length: 1))
+            self.textView.needsDisplay = true
+        }
+    }
+
+    private static let tickDelay: CFTimeInterval = 0.04
+    private static let tickDraw: CFTimeInterval = 0.26
+
     private func makeExplainButton(_ index: Int) -> NSButton {
         let button = PointerButton()
         button.isBordered = false
@@ -628,9 +763,9 @@ final class TextRowCell: RowCellView {
                 guard let self, let card = self.answerCard else { return nil }
                 return await self.delegate?.askImportPicture(card, url: url)
             })
-        box.onSend = { [weak self] in
+        box.onReturn = { [weak self] command in
             guard let self, let card = self.answerCard else { return }
-            self.delegate?.sendAnswers(card)
+            self.delegate?.answerBoxReturn(card, ask: index, command: command)
         }
         answerBoxes[index] = box
         addSubview(box)
@@ -1000,6 +1135,7 @@ final class WorkingRowCell: RowCellView {
 
     private func startIfVisible() {
         guard window != nil else { return }
+        bear.hat = BearGeometry.wearsHat()
         // A turn that's only just begun gets the bear popping up; scrolling
         // back to one that's been going a while doesn't.
         bear.start(fresh: startedAt.map { Date().timeIntervalSince($0) < 2 } ?? false)
@@ -1038,7 +1174,7 @@ final class WorkingRowCell: RowCellView {
 /// bear sits (a cub when sub-agents are out) rather than waves, nothing
 /// ticks, and the words say what's running.
 final class BackgroundRowCell: RowCellView {
-    let bear = NSImageView()
+    let bear: NSImageView = FirstClickImageView()
     let label = makeLabel()
 
     override init(frame frameRect: NSRect) {
@@ -1353,6 +1489,29 @@ final class PillButton: NSButton {
     }
 }
 
+/// The small spinner a card shows beside its buttons while its answer is
+/// on its way (ThreadSession.answering). Core Animation turns it, so a busy
+/// main thread doesn't stop it.
+enum Spinner {
+    static func make() -> NSProgressIndicator {
+        let s = NSProgressIndicator()
+        s.style = .spinning
+        s.controlSize = .small
+        s.isIndeterminate = true
+        s.isDisplayedWhenStopped = false
+        s.usesThreadedAnimation = true
+        return s
+    }
+
+    /// Shows it centred on the left of `at` (a point on the buttons' middle line), or hides it.
+    static func show(_ spinner: NSProgressIndicator, _ busy: Bool, at point: NSPoint) {
+        let side: CGFloat = 16
+        spinner.frame = NSRect(x: point.x, y: point.y - side / 2, width: side, height: side)
+        if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        spinner.isHidden = !busy
+    }
+}
+
 // MARK: - Approval card
 
 final class ApprovalRowCell: RowCellView {
@@ -1364,6 +1523,8 @@ final class ApprovalRowCell: RowCellView {
     let allow = PillButton(pill: "Allow", prominent: true, shortcut: "⏎")
     let always = PillButton(pill: "Always allow")
     let deny = PillButton(pill: "Deny")
+    /// Beside the buttons while the answer is on its way.
+    let spinner = Spinner.make()
     private var approvalId = ""
 
     override init(frame frameRect: NSRect) {
@@ -1372,7 +1533,7 @@ final class ApprovalRowCell: RowCellView {
             button.target = self
             button.action = action
         }
-        [card, titleView, payloadBox, payloadView, allow, always, deny].forEach(addSubview)
+        [card, titleView, payloadBox, payloadView, allow, always, deny, spinner].forEach(addSubview)
         allow.setTip("Let it do this once (Return)")
         always.setTip("Allow this, and anything like it for the rest of this thread")
         deny.setTip("Don't let it do this; the agent is told no")
@@ -1407,14 +1568,30 @@ final class ApprovalRowCell: RowCellView {
         y = payloadBox.frame.maxY + zoomed(12)
 
         // Allow first and filled; Deny last, on the right of the row.
-        let options = Set(item.request.options)
+        var options = Set(item.request.options)
+        // Another runner asking for a thread: Start it or Don't, once its
+        // request has been read (it may come with no options: the phone's
+        // row has none).
+        let start = item.isStartRequest
+        allow.title = start ? "Start it" : "Allow"
+        allow.shortcut = start ? nil : "⏎"
+        deny.title = start ? "Don't" : "Deny"
+        allow.setTip(start ? "Start this thread with this brief" : "Let it do this once (Return)")
+        deny.setTip(start ? "Don't start it; the asking thread is told no" : "Don't let it do this; the agent is told no")
+        if start {
+            options = item.startRequest.map { $0.error == nil ? [.allow, .deny] : [] } ?? []
+            if pending, item.startRequest == nil { delegate?.loadStartRequest(approvalId) }
+        }
         var buttonX = left
+        let busy = pending && delegate?.isAnswering(approvalId) == true
         for (button, option) in [(allow, ApprovalOption.allow), (always, .allowAlways), (deny, .deny)] {
             button.isHidden = !pending || !options.contains(option)
             guard !button.isHidden else { continue }
+            button.isEnabled = !busy
             button.frame = NSRect(x: buttonX, y: y, width: max(zoomed(76), button.fittingWidth), height: RowMetrics.buttonHeight)
             buttonX = button.frame.maxX + zoomed(8)
         }
+        Spinner.show(spinner, busy, at: NSPoint(x: buttonX + zoomed(2), y: y + RowMetrics.buttonHeight / 2))
     }
 
     override func releaseContent() {
@@ -1430,6 +1607,126 @@ final class ApprovalRowCell: RowCellView {
     @objc private func allowClicked() { delegate?.respond(approvalId: approvalId, decision: .allow, answers: nil, message: nil) }
     @objc private func alwaysClicked() { delegate?.respond(approvalId: approvalId, decision: .allowAlways, answers: nil, message: nil) }
     @objc private func denyClicked() { delegate?.respond(approvalId: approvalId, decision: .deny, answers: nil, message: nil) }
+}
+
+// MARK: - Plan card
+
+/// What the plan card has under its text: its buttons while it waits, and
+/// the toggle for a plan longer than its preview or behind its checklist.
+enum PlanCardLayout {
+    static func hasFooter(_ card: PlanCard) -> Bool {
+        card.state == .waiting || !card.entries.isEmpty || PlanCardText.preview(PlanCardText.split(card.text).body).clipped
+    }
+}
+
+/// "Plan first" (docs/protocol.md): the agent's plan for Mike to approve,
+/// which then becomes its checklist. Mike picked this from mockups (6 Nov):
+/// the plan in a card with Go ahead and Send back, the details behind the ⓘ.
+final class PlanCardCell: RowCellView {
+    static let info = "Plan first: the agent reads and plans, and changes nothing until you approve. "
+        + "Go ahead lets it start, in the permission mode the thread had before. "
+        + "Send back, or anything you write, asks it for another go."
+
+    let card = FillView()
+    let titleView = TranscriptTextView()
+    let status = NSTextField(labelWithString: "")
+    let info = NSHostingView(rootView: InfoTip(PlanCardCell.info))
+    let bodyView = TranscriptTextView()
+    /// Return in an empty composer approves it too, as Claude's plan is an
+    /// approval waiting (ComposerView).
+    let goAhead = PillButton(pill: "Go ahead", prominent: true)
+    let sendBack = PillButton(pill: "Send back…")
+    let toggle = PointerButton()
+    /// Go ahead is on its way (ThreadSession.answering).
+    let spinner = Spinner.make()
+    private var itemId = ""
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        goAhead.target = self
+        goAhead.action = #selector(goAheadClicked)
+        sendBack.target = self
+        sendBack.action = #selector(sendBackClicked)
+        toggle.isBordered = false
+        toggle.target = self
+        toggle.action = #selector(toggleClicked)
+        status.textColor = .secondaryLabelColor
+        status.alignment = .right
+        status.lineBreakMode = .byTruncatingTail
+        [card, titleView, status, info, bodyView, goAhead, sendBack, toggle, spinner].forEach(addSubview)
+        goAhead.setTip("Approve the plan and let it start")
+        sendBack.setTip("Tell it what to change; it plans again")
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func configure(row: TranscriptRow, render: RowRender, tableWidth: CGFloat, expanded: Bool) {
+        super.configure(row: row, render: render, tableWidth: tableWidth, expanded: expanded)
+        guard case .planCard(let plan) = row.content else { return }
+        itemId = plan.itemId
+        let (x, width) = RowMetrics.column(for: row, tableWidth: tableWidth)
+        let pad = RowMetrics.cardPad
+        let top = RowMetrics.rowTop + zoomed(2)
+        card.frame = NSRect(x: x, y: top, width: width, height: render.height - top - RowMetrics.rowBottom - zoomed(2))
+        card.set(fill: Theme.cardBackground, stroke: Theme.cardBorder, radius: RowMetrics.cardRadius)
+        let left = x + pad
+        let inner = width - pad * 2
+        var y = card.frame.minY + pad
+        titleView.place(NSRect(x: left, y: y, width: render.textSize.width + zoomed(4), height: render.textSize.height))
+        titleView.show(render.text ?? NSAttributedString(), width: render.textSize.width + zoomed(4))
+        let side = zoomed(19)
+        // Level with the title's first line: a long heading wraps.
+        let line = min(render.textSize.height, ceil(Theme.changesTitleFont.ascender - Theme.changesTitleFont.descender + Theme.changesTitleFont.leading))
+        info.frame = NSRect(x: titleView.frame.maxX + zoomed(4), y: y + (line - side) / 2, width: side, height: side)
+        status.stringValue = switch plan.state {
+        case .waiting: "Waiting for you"
+        case .sentBack: "Sent back"
+        case .approved: plan.entries.isEmpty ? "Approved" : ""
+        }
+        status.font = .systemFont(ofSize: TypeScale.label)
+        let statusWidth = ceil(status.attributedStringValue.size().width) + zoomed(4)
+        status.frame = NSRect(x: left + inner - statusWidth, y: y + (line - zoomed(17)) / 2, width: statusWidth, height: zoomed(17))
+        y += render.textSize.height + zoomed(8)
+        bodyView.place(NSRect(x: left, y: y, width: inner, height: render.detailSize.height))
+        bodyView.show(render.detail ?? NSAttributedString(), width: inner)
+        y += render.detailSize.height + zoomed(12)
+
+        let waiting = plan.state == .waiting
+        let busy = waiting && delegate?.isAnswering(plan.itemId) == true
+        var buttonX = left
+        for button in [goAhead, sendBack] {
+            button.isHidden = !waiting
+            guard waiting else { continue }
+            button.isEnabled = !busy
+            button.frame = NSRect(x: buttonX, y: y, width: max(zoomed(76), button.fittingWidth), height: RowMetrics.buttonHeight)
+            buttonX = button.frame.maxX + zoomed(8)
+        }
+        Spinner.show(spinner, busy, at: NSPoint(x: buttonX + zoomed(2), y: y + RowMetrics.buttonHeight / 2))
+        if busy { buttonX += zoomed(22) }
+        let clipped = PlanCardText.preview(PlanCardText.split(plan.text).body).clipped
+        let title: String? = !plan.entries.isEmpty ? (expanded ? "Hide plan" : "Show plan") : clipped ? (expanded ? "Show less" : "Show full plan") : nil
+        toggle.isHidden = title == nil
+        if let title {
+            toggle.attributedTitle = NSAttributedString(string: title, attributes: [.font: NSFont.systemFont(ofSize: TypeScale.label), .foregroundColor: NSColor.secondaryLabelColor])
+            let w = ceil(toggle.attributedTitle.size().width) + zoomed(8)
+            toggle.frame = NSRect(x: buttonX + (waiting ? zoomed(2) : -zoomed(4)), y: y, width: w, height: RowMetrics.buttonHeight)
+            toggle.setTip(expanded ? "Show less of it" : "Show the whole plan")
+        }
+    }
+
+    override func releaseContent() {
+        titleView.park()
+        bodyView.park()
+    }
+
+    override func updateSlices(force: Bool = false) {
+        titleView.updateSlice(force: force)
+        bodyView.updateSlice(force: force)
+    }
+
+    @objc private func goAheadClicked() { delegate?.approvePlan(itemId: itemId) }
+    @objc private func sendBackClicked() { delegate?.sendBackPlan() }
+    @objc private func toggleClicked() { delegate?.toggleExpanded(rowId: rowId) }
 }
 
 // MARK: - Question card
@@ -1460,6 +1757,7 @@ final class QuestionRowCell: RowCellView, NSTextFieldDelegate {
     let otherBox = FillView()
     let other = NSTextField()
     let send = PillButton(pill: "Send answer", prominent: true)
+    let spinner = Spinner.make()
     let answerIcon = Symbols.makeView()
     let answer = makeLabel()
     private var request: QuestionRequest?
@@ -1484,7 +1782,7 @@ final class QuestionRowCell: RowCellView, NSTextFieldDelegate {
         send.target = self
         send.action = #selector(sendClicked)
         send.setTip("Send your answers to the agent")
-        [card, otherBox, other, send, answerIcon, answer].forEach(addSubview)
+        [card, otherBox, other, send, answerIcon, answer, spinner].forEach(addSubview)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -1548,6 +1846,7 @@ final class QuestionRowCell: RowCellView, NSTextFieldDelegate {
             let height = Theme.workLabelHeight
             answer.frame = NSRect(x: textX, y: y + (RowMetrics.answerHeight - height) / 2, width: left + inner - textX + RowMetrics.labelInset, height: height)
             answer.setTip(resolution.message ?? "")
+            Spinner.show(spinner, false, at: .zero)
         } else {
             otherBox.frame = NSRect(x: left, y: y, width: inner, height: RowMetrics.otherFieldHeight)
             updateOtherBox()
@@ -1581,8 +1880,10 @@ final class QuestionRowCell: RowCellView, NSTextFieldDelegate {
         guard let request else { return }
         let draft = delegate?.questionDraft(request.approvalId) ?? [:]
         let typed = other.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ready = !Self.answers(for: request, chosen: draft, typed: typed).isEmpty
+        let busy = delegate?.isAnswering(request.approvalId) == true
+        let ready = !busy && !Self.answers(for: request, chosen: draft, typed: typed).isEmpty
         if send.isEnabled != ready { send.isEnabled = ready }
+        Spinner.show(spinner, busy && !send.isHidden, at: NSPoint(x: send.frame.maxX + zoomed(10), y: send.frame.midY))
     }
 
     /// Places each question's views, reusing the ones already made. An

@@ -39,7 +39,7 @@ let package = Package(
             path: "Sources/Threadbear",
             // Big pictures (the Librarian's page). Looked up through Art,
             // never Bundle.module, which stops the app if the bundle's missing.
-            resources: [.copy("Resources/Art")],
+            resources: [.copy("Resources/Art"), .copy("Resources/Rich")],
             // The AppKit side renders and measures text off the main thread
             // with non-Sendable TextKit objects confined to one thread each;
             // Swift 5 mode keeps that from drowning in Sendable errors.
@@ -51,11 +51,17 @@ let package = Package(
             dependencies: ["ThreadbearCore"],
             path: "Tests/ThreadbearCoreTests"
         ),
+        // Ends a test run that reaches a real modal (ModalGuard.m says why).
+        // Linked only into the tests below, never the app.
+        .target(
+            name: "ModalGuard",
+            path: "Tests/ModalGuard"
+        ),
         // AppKit-side checks (the composer, transcript text, renders,
         // AppModel's drafts) against the app target itself.
         .testTarget(
             name: "ThreadbearAppTests",
-            dependencies: ["Threadbear", "ThreadbearCore"],
+            dependencies: ["Threadbear", "ThreadbearCore", "ModalGuard"],
             path: "Tests/ThreadbearAppTests",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

@@ -6,7 +6,7 @@ import Foundation
 /// Back Tap (through Shortcuts) run.
 nonisolated struct QuickAskIntent: AppIntent {
     static let title: LocalizedStringResource = "Ask"
-    static let description = IntentDescription("Opens Threadbear listening for a question, and answers it out loud from your Agent Archive.")
+    static let description = IntentDescription("Opens Threadbear listening for a question, and answers it out loud from your Ask server.")
 
     /// iOS 18. From iOS 26 `supportedModes` takes over.
     static let openAppWhenRun = true

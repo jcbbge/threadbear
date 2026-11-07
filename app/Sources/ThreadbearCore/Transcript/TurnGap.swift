@@ -32,7 +32,7 @@ public struct TurnGap: Sendable, Hashable {
 
     /// How long, in the words someone would say it.
     public static func later(_ milliseconds: Double) -> String {
-        let seconds = max(0, Int((milliseconds / 1000).rounded()))
+        let seconds = max(0, Int(saturating: (milliseconds / 1000).rounded()))
         if seconds < 60 { return seconds < 2 ? "Moments later" : "\(seconds)s later" }
         let minutes = Int((Double(seconds) / 60).rounded())
         if minutes < 60 { return "\(minutes) min later" }

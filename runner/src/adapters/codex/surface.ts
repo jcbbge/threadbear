@@ -109,6 +109,7 @@ export const REFUSED_SERVER_REQUESTS = ['account/chatgptAuthTokens/refresh', 'at
 const FIELDS: Record<string, string[]> = {
   agentMessage: ['text', 'phase'],
   reasoning: ['summary'],
+  plan: ['text'],
   commandExecution: ['command', 'cwd', 'processId', 'source', 'status', 'commandActions', 'aggregatedOutput', 'exitCode', 'durationMs'],
   fileChange: ['changes', 'status'],
   mcpToolCall: ['server', 'tool', 'status', 'arguments', 'result', 'error'],
@@ -137,7 +138,7 @@ export const TYPE_FIELDS: Record<string, string[]> = {
   ThreadStartParams: ['cwd', 'model', 'approvalPolicy', 'approvalsReviewer', 'sandbox', 'config', 'dynamicTools'],
   ThreadResumeParams: ['threadId', 'cwd', 'excludeTurns', 'config'],
   ThreadStartResponse: ['thread', 'model', 'reasoningEffort'],
-  TurnStartParams: ['threadId', 'clientUserMessageId', 'input', 'cwd', 'approvalPolicy', 'approvalsReviewer', 'sandboxPolicy', 'model', 'effort', 'summary'],
+  TurnStartParams: ['threadId', 'clientUserMessageId', 'input', 'cwd', 'approvalPolicy', 'approvalsReviewer', 'sandboxPolicy', 'model', 'effort', 'summary', 'collaborationMode'],
   TurnSteerParams: ['threadId', 'expectedTurnId', 'clientUserMessageId', 'input'],
   TurnSteerResponse: ['turnId'],
   TurnInterruptParams: ['threadId', 'turnId'],

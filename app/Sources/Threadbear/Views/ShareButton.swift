@@ -111,7 +111,7 @@ struct SharePopover: View {
                     .disabled(busy)
                     .tip("Make a new link. The old one stops working.")
                     Button {
-                        NSWorkspace.shared.open(link)
+                        OpenGate.openWeb(link)
                     } label: {
                         Image(systemName: "arrow.up.right.square")
                     }

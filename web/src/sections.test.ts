@@ -1,7 +1,7 @@
 // node --test web/src/sections.test.ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { archived, archiveShown, build, clampWidth, hibernating, isFiltering, matches, neighbour, NO_FILTER, passes, placeChoices, readFolded, readOrder, readWidth, shows, SIDEBAR_DEFAULT, SIDEBAR_MIN, urgency, wakesOf, type ThreadRow } from './sections.ts';
+import { archived, archiveShown, build, clampWidth, hibernating, isFiltering, matches, neighbour, NO_FILTER, passes, placeChoices, readFolded, readOrder, readWidth, shows, SIDEBAR_DEFAULT, SIDEBAR_MIN, urgency, wakeLine, wakesOf, type ThreadRow } from './sections.ts';
 
 const NOW = Date.parse('2026-11-05T10:00:00Z');
 let n = 0;
@@ -194,4 +194,13 @@ test('the sidebar stays between its limits and leaves the thread room', () => {
   assert.equal(readWidth(null), SIDEBAR_DEFAULT);
   assert.equal(readWidth('banana'), SIDEBAR_DEFAULT);
   assert.equal(readWidth('410'), 410);
+});
+
+test('a hibernating row that waits for more than a time says so first', () => {
+  const now = Date.parse('2026-11-05T09:00:00Z');
+  const r = row({ snoozedUntil: '2026-11-06T09:00:00Z', wakeNote: '"Convex I/O" finishes' });
+  assert.equal(wakeLine(r, ['misc'], now), 'Until "Convex I/O" finishes · misc');
+  assert.equal(wakeLine(row({ snoozedUntil: '2026-11-06T09:00:00Z' }), ['misc'], now), undefined);
+  // Awake again: the note is stale.
+  assert.equal(wakeLine(row({ wakeNote: 'the runner updates' }), ['misc'], now), undefined);
 });

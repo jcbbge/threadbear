@@ -20,7 +20,8 @@ each person's own Mac and their own Convex deployment.
 - **Keeps:** one row per Threadbear install (a random id, the hash of its
   key, when it was made and last seen, the version it says it is, and for
   backends from 5 Nov 2026 the address of the Convex deployment it
-  registered for) and daily totals (notifications sent and failed, new
+  registered for) and daily totals (notifications sent and failed, why
+  the failed ones failed as Apple's status and reason word, new
   installs). No device tokens, no thread ids, nothing per notification.
 - **Opting out:** `npx convex env set PUSH_RELAY off` on your deployment. Then
   nothing goes to the relay, and the phone gets no notifications (they'd have
@@ -78,7 +79,27 @@ hosts (self-hosted, a custom domain) can't use this relay: run your own
   `clean-terrier-424`. Env: the same `APNS_*` as Threadbear's prod.
 - Limits: 120 sends an hour per install; 20 registrations a day per
   deployment.
-- Stats for Mike: `npx convex run relay:stats --prod` in `relay/`.
+- Stats for Mike: `npx convex run relay:stats --prod` in `relay/`. Each
+  day's `reasons` tallies the failures as `"<status> <reason>"` (since 6
+  Nov 2026), and the relay's own log has a `[send] failed:` line for each
+  (status and reason only). `versions` counts installs by the version
+  their backend says (`api-52`), which anyone with an install can set:
+  it's stored only if it's a plain word (`/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/`,
+  else `unknown`) and counted in a Map, with anything stored before that
+  rule as `other`, since one `$x`, `é` or `toString` broke the query
+  for good (6 Nov 2026).
+- Its Apple key is Poddle's (same team, so it signs for any of Mike's
+  apps). Poddle moved to a new key and the old one was revoked, and from
+  5 Nov 2026 every send failed with `403 InvalidProviderToken` until 6 Nov,
+  when the relay and Threadbear's prod got the new key. If Poddle's key
+  changes again, copy `APNS_KEY_P8` and `APNS_KEY_ID` to both. To check a
+  key without a real phone: `npx convex run apns:send
+  '{"deviceToken":"<64 zeros>","environment":"production","threadId":"probe"}' --prod`
+  in `relay/` answers `400 BadDeviceToken` when Apple takes the key.
+- A backend hears when its pushes stop getting through: each send's
+  outcome goes in its `pushHealth` row (`convex/pushHealth.ts`), and the
+  owner runner's heartbeat carries `pushFailing` to `tb status` and a
+  notice in the app (docs/protocol.md, "Sync").
 - Deploy: `npm ci` then `npx convex deploy` in `relay/`, signed in to the
   Convex CLI as Mike (it isn't part of the runner's backend deploy, which
   is for each person's own deployment).

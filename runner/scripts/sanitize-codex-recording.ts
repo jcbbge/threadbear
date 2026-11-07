@@ -173,7 +173,10 @@ export function leaks(text: string, secrets: string[] = [], local = localNames()
   const marker = /(?:\.\.\.|…)\s*[[<]\d+ chars[\]>]/.exec(text);
   if (marker) found.push(`a truncation marker (${marker[0]})`);
   for (const s of secrets) if (text.includes(s)) found.push(`a dropped private value (${s.slice(0, 4)}…)`);
-  for (const n of local) if (n && text.toLowerCase().includes(n.toLowerCase())) found.push(`this Mac's user or host name (${n})`);
+  // As a whole name, not inside a word: a login called "vision" isn't in "revision".
+  for (const n of local) {
+    if (n && new RegExp(`(?<![a-z0-9])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9])`, 'i').test(text)) found.push(`this Mac's user or host name (${n})`);
+  }
   const b64 = /[A-Za-z0-9+/]{1500,}={0,2}/g;
   for (const m of text.matchAll(b64)) if (!TINY_PNG_B64.includes(m[0]) && !m[0].includes(TINY_PNG_B64)) found.push(`a long base64 string (${m[0].length} chars)`);
   return found;

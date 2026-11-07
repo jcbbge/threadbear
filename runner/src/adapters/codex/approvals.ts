@@ -2,9 +2,12 @@
 // elicitations, Threadbear tool calls and the clock. This owns the pending
 // map, the decision mapping, serverRequest/resolved and the "Always allow"
 // rules. Every request gets an answer: a card, a rule, or a refusal at once.
+import fs from 'node:fs';
+import path from 'node:path';
+import { codeWriteNote, type CodeWrite } from '../../code-writes.ts';
 import type { Question } from '../../protocol.ts';
 import type { Logger } from '../../log.ts';
-import { displayPath, truncateInput } from '../../tools.ts';
+import { cardInput, displayPath, tooLongForCard } from '../../tools.ts';
 import type { QuestionAnswer, QuestionRequest, ToolApprovalAnswer, ToolApprovalRequest } from '../types.ts';
 import type {
   ApplyPatchApprovalParams,
@@ -19,6 +22,7 @@ import type {
   RequestId,
   ToolRequestUserInputParams,
 } from './types.ts';
+import { firstLineSafely } from '../../safe-cut.ts';
 
 // ---- Refusals, for a request no session is there to answer
 
@@ -48,46 +52,109 @@ export function refusal(method: string): Reply {
 // acceptWithExecpolicyAmendment saves a rule that outlives the thread. So
 // the runner keeps its own rules in the thread's allowRules and answers
 // matching requests itself:
-//   codex:fileChange              any edit in this thread
-//   codex:command:<JSON argv>     exactly this command, as the card showed it
-//   codex:prefix:<JSON argv>      a plain command starting with these words,
-//                                 only from Codex's own proposed amendment
+//   codex:fileChange                       any edit in this thread
+//   codex:command:<JSON {cwd, argv}>       exactly this command in this
+//                                          folder, as the card showed it
+// "Always allow" never makes a rule wider than the card. Until 6 Nov 2026 it
+// saved Codex's proposedExecpolicyAmendment as a prefix (codex:prefix:), so
+// ["npm","exec"] from a card for `npm exec -- prettier` went on to allow
+// `npm exec --package=evil`; the card never showed the prefix, and no list
+// of programs that run code can be complete. Those rules, and the older
+// codex:command:<JSON argv> ones with no folder, are no longer honoured:
+// such a command asks again.
 export const FILE_CHANGE_RULE = 'codex:fileChange';
 const COMMAND_RULE = 'codex:command:';
-const PREFIX_RULE = 'codex:prefix:';
 
-export function commandRule(argv: string[]): string {
-  return COMMAND_RULE + JSON.stringify(argv);
+export function commandRule(argv: string[], cwd: string): string {
+  return COMMAND_RULE + JSON.stringify({ cwd, argv });
 }
 
-export function prefixRule(argv: string[]): string {
-  return PREFIX_RULE + JSON.stringify(argv);
-}
-
-function ruleArgv(rule: string, kind: string): string[] | null {
-  if (!rule.startsWith(kind)) return null;
+function ruleCommand(rule: string): { cwd: string; argv: string[] } | null {
+  if (!rule.startsWith(COMMAND_RULE)) return null;
   try {
-    const v = JSON.parse(rule.slice(kind.length));
-    return Array.isArray(v) && v.length && v.every((x) => typeof x === 'string') ? v : null;
+    const v = JSON.parse(rule.slice(COMMAND_RULE.length)) as unknown;
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+    const { cwd, argv } = v as { cwd?: unknown; argv?: unknown };
+    if (typeof cwd !== 'string' || !cwd) return null;
+    if (!Array.isArray(argv) || !argv.length || !argv.every((x) => typeof x === 'string')) return null;
+    return { cwd, argv };
   } catch {
     return null;
   }
 }
 
-// Commands that run other commands, or code, given as arguments. A rule for
-// one would allow anything, so none is made or matched.
-const RUNS_OTHERS = new Set([
-  'sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'csh', 'tcsh',
-  'env', 'sudo', 'doas', 'su', 'xargs', 'eval', 'exec', 'command', 'builtin', 'source', '.',
-  'nohup', 'time', 'nice', 'timeout', 'watch', 'osascript',
-  'python', 'python3', 'node', 'deno', 'bun', 'ruby', 'perl', 'php', 'lua', 'tclsh',
-  'npx', 'pnpx', 'bunx', 'uvx', 'uv', 'awk', 'gawk', 'sed', 'find', 'make', 'git',
+// The programs an exact "Always allow" can cover: ones whose effect is in
+// their words, reading files only as data. Anything else (a shell, an
+// interpreter, a package or build launcher like `npm test`, `make` or
+// `cargo run`, a test runner, a program by a path in the repo) runs code a
+// repo can change after the card, so the same words run something else
+// next time: the card offers no Always allow and no rule matches it.
+// An allowlist, as no list of programs that run code can be complete
+// (Daybreak, 7 Nov 2026: npm, pnpm, yarn and cargo were missing from the
+// list this replaced). Binding a rule to a hash of package.json or a
+// Makefile wouldn't cover the tests and sources those run.
+//
+// Not ripgrep, sort or diff: each has an option that runs a program
+// (`rg --pre` and `--hostname-bin`, `sort --compress-program`, GNU diff's
+// helpers), and a list of such options is the same incomplete list again
+// (Codex review, 7 Nov 2026, found `rg --hostname-bin`).
+const PLAIN_PROGRAMS = new Set([
+  'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'pwd', 'echo', 'printf', 'date', 'which',
+  'whoami', 'id', 'uname', 'stat', 'file', 'du', 'df', 'tree', 'cmp', 'comm', 'uniq', 'cut',
+  'tr', 'nl', 'basename', 'dirname', 'realpath', 'readlink', 'mkdir', 'touch', 'rm', 'rmdir', 'shasum',
+  'sha256sum', 'sha1sum', 'md5', 'md5sum', 'cksum', 'base64', 'xxd', 'hexdump', 'od', 'strings', 'true',
+  'false', 'sw_vers', 'uptime', 'ps', 'column', 'fold', 'rev', 'tac', 'seq', 'paste', 'sleep',
 ]);
+// Where the file that really runs must be: folders only the system writes
+// to. Not Homebrew's or /usr/local: the user's account (so an edit Mike once
+// allowed) can change what's in those, and a link there can lead into a repo.
+const SYSTEM_DIRS = ['/bin', '/usr/bin', '/sbin', '/usr/sbin'];
+const inSystemDir = (file: string): boolean => SYSTEM_DIRS.some((d) => file.startsWith(`${d}/`));
+
+// The file a program name runs, links followed, as a shell would find it
+// on PATH, or undefined when that isn't certain (a relative PATH entry
+// before it, which depends on the folder). The shell Codex runs commands in
+// is a login shell, so its PATH can differ from the runner's: one that puts
+// a folder of the user's first is theirs to have set up.
+function programFile(program: string, searchPath: string): string | undefined {
+  const real = (p: string): string | undefined => {
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return fs.statSync(p).isFile() ? fs.realpathSync(p) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  if (program.includes('/')) return path.isAbsolute(program) ? real(program) : undefined;
+  for (const dir of searchPath.split(':')) {
+    if (!path.isAbsolute(dir)) return undefined;
+    const hit = real(path.join(dir, program));
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+// Whether an exact rule may cover this argv: a program on PLAIN_PROGRAMS
+// (lower-cased, as macOS finds /bin/LS for ls) whose name leads to the
+// system's own file. Read each time a rule is made and matched, so a name
+// that leads elsewhere later stops matching (Codex review, 7 Nov 2026: a
+// `grep` or `/usr/local/bin/ls` that's a link into the repo).
+export function ruleMayCover(argv: string[], searchPath: string = process.env.PATH ?? ''): boolean {
+  const program = argv[0] ?? '';
+  const name = (program.split('/').pop() ?? '').toLowerCase();
+  if (!PLAIN_PROGRAMS.has(name)) return false;
+  const named = program.includes('/') ? `${program.slice(0, program.lastIndexOf('/'))}/${name}` : name;
+  if (program.includes('/') && !inSystemDir(named)) return false;
+  const file = programFile(named, searchPath);
+  return file !== undefined && inSystemDir(file);
+}
 
 // Codex wraps every command as `/bin/zsh -lc '<command>'`. Returns the inner
 // command, or the string as it is when it isn't wrapped.
 export function unwrapShell(command: string): string {
-  const m = /^\s*(?:\/(?:usr\/)?bin\/)?(?:zsh|bash|sh)\s+-l?c\s+([\s\S]+)$/.exec(command);
+  // Only the system's shell by its whole path: a bare `bash` is whichever
+  // PATH finds, which can be the repo's (Codex review, 7 Nov 2026).
+  const m = /^\s*\/(?:usr\/)?bin\/(?:zsh|bash|sh)\s+-l?c\s+([\s\S]+)$/.exec(command);
   if (!m) return command;
   const words = shellWords(m[1]);
   return words && words.length === 1 ? words[0] : command;
@@ -172,49 +239,36 @@ export function shellWords(s: string): string[] | null {
 }
 
 // The plain argv of a command approval, or null when no rule may cover it:
-// not a plain command, stdin to a running command, or network access.
+// not a plain command, stdin to a running command, network access, or a
+// program whose words don't say what it runs (ruleMayCover).
 export function plainArgv(p: CommandExecutionRequestApprovalParams): string[] | null {
   if ((p.kind ?? 'command') !== 'command') return null;
   if (p.networkApprovalContext || (Array.isArray(p.proposedNetworkPolicyAmendments) && p.proposedNetworkPolicyAmendments.length)) return null;
   if (typeof p.command !== 'string') return null;
   const argv = shellWords(unwrapShell(p.command));
-  if (!argv || !argv.length || RUNS_OTHERS.has(argv[0].split('/').pop()!)) return null;
+  if (!argv || !argv.length || !ruleMayCover(argv)) return null;
   return argv;
 }
 
-// The rule "Always allow" makes for a command: Codex's proposed amendment
-// (["npm","test"]) as a prefix when it starts the command and is more than
-// one word, else exactly the command the card showed.
-export function ruleFor(p: CommandExecutionRequestApprovalParams): string | null {
+// The rule "Always allow" makes for a command: exactly the command the card
+// showed, in the folder it showed. Codex's proposedExecpolicyAmendment is
+// never used, as it can be shorter than the command (see above).
+// `cwd` is the folder the card shows when the request names none.
+export function ruleFor(p: CommandExecutionRequestApprovalParams, cwd: string): string | null {
   const argv = plainArgv(p);
   if (!argv) return null;
-  const proposed = p.proposedExecpolicyAmendment;
-  if (
-    Array.isArray(proposed) &&
-    proposed.length >= 2 &&
-    proposed.length < argv.length &&
-    proposed.every((x) => typeof x === 'string') &&
-    startsWith(argv, proposed)
-  ) {
-    return prefixRule(proposed);
-  }
-  return commandRule(argv);
+  return commandRule(argv, p.cwd || cwd);
 }
 
-export function commandAllowed(p: CommandExecutionRequestApprovalParams, rules: Iterable<string>): boolean {
+export function commandAllowed(p: CommandExecutionRequestApprovalParams, rules: Iterable<string>, cwd: string): boolean {
   const argv = plainArgv(p);
   if (!argv) return false;
+  const where = p.cwd || cwd;
   for (const r of rules) {
-    const exact = ruleArgv(r, COMMAND_RULE);
-    if (exact && exact.length === argv.length && startsWith(argv, exact)) return true;
-    const prefix = ruleArgv(r, PREFIX_RULE);
-    if (prefix && prefix.length >= 2 && !RUNS_OTHERS.has(prefix[0].split('/').pop()!) && startsWith(argv, prefix)) return true;
+    const rule = ruleCommand(r);
+    if (rule && rule.cwd === where && rule.argv.length === argv.length && rule.argv.every((w, i) => argv[i] === w)) return true;
   }
   return false;
-}
-
-function startsWith(argv: string[], prefix: string[]): boolean {
-  return prefix.length <= argv.length && prefix.every((w, i) => argv[i] === w);
 }
 
 // ---- Handling requests
@@ -233,6 +287,9 @@ export type ApprovalsDeps = {
   // What the session saw of an item on item/started: the paths a fileChange
   // touches, for the card's title.
   itemPaths(itemId: string): string[] | undefined;
+  // Whether a file (absolute) is one Threadbear runs as code
+  // (code-writes.ts): a patch that changes one always asks.
+  runsAsCode(file: string): CodeWrite;
   callTool(params: DynamicToolCallParams, o: { fromChild: boolean; signal: AbortSignal }): Promise<DynamicToolCallResponse>;
   now(): number;
 };
@@ -249,6 +306,12 @@ export class CodexApprovals {
 
   get pendingCount(): number {
     return this.pending.size;
+  }
+
+  // Codex reports a patch's paths as written, maybe relative to the folder.
+  private runsAsCode(paths: string[]): CodeWrite {
+    const kinds = paths.map((f) => this.deps.runsAsCode(path.resolve(this.deps.cwd(), f)));
+    return kinds.includes(true) || (kinds.includes('unsure') ? 'unsure' : false);
   }
 
   // `fromChild`: the request came from a subagent's thread. Its card goes to
@@ -324,26 +387,36 @@ export class CodexApprovals {
       .then((a) => this.settle(id, answer(a)));
   }
 
+  // A request whose card couldn't show all of what it allows (cardInput):
+  // refused at once, and the thread says why.
+  private tooLong(id: RequestId, where: string, refusal: unknown): void {
+    this.deps.note(tooLongForCard(where));
+    this.deps.reply(id, refusal);
+  }
+
   private command(id: RequestId, p: CommandExecutionRequestApprovalParams, fromChild: boolean): void {
     const raw = typeof p.command === 'string' ? p.command : '';
     const inner = raw ? unwrapShell(raw) : (p.commandActions?.[0]?.command ?? '');
     const network = p.networkApprovalContext;
     const stdin = (p.kind ?? 'command') === 'writeStdin';
-    const rule = stdin || network ? null : ruleFor(p);
-    if (commandAllowed(p, this.deps.rules())) {
+    const cwd = p.cwd || this.deps.cwd();
+    const rule = stdin || network ? null : ruleFor(p, cwd);
+    if (commandAllowed(p, this.deps.rules(), cwd)) {
       this.deps.reply(id, { decision: 'accept' });
       return;
     }
     let title = firstLine(inner) || 'Run a command';
     if (stdin) title = `Send input to a running command${inner ? `: ${firstLine(inner)}` : ''}`;
     else if (network) title = `Allow network access to ${network.host}${inner ? ` for ${firstLine(inner)}` : ''}`;
-    const input: Record<string, unknown> = { command: inner, cwd: p.cwd ?? this.deps.cwd() };
+    const input: Record<string, unknown> = { command: inner, cwd };
     if (p.reason) input.reason = p.reason;
     if (network) input.network = network;
+    const card = cardInput(input, ['command', 'cwd', 'network']);
+    if (card.tooLong) return this.tooLong(id, card.tooLong, { decision: 'decline' });
     this.ask(
       id,
       'item/commandExecution/requestApproval',
-      { toolUseId: fromChild ? undefined : p.itemId, name: 'shell', title, input: truncateInput(input), canAlwaysAllow: Boolean(rule) },
+      { toolUseId: fromChild ? undefined : p.itemId, name: 'shell', title, input: card.input, canAlwaysAllow: Boolean(rule) },
       (a) => {
         if (a.decision === 'allowAlways' && rule) this.deps.addRules([rule]);
         return { decision: commandDecision(a) };
@@ -352,20 +425,25 @@ export class CodexApprovals {
   }
 
   private fileChange(id: RequestId, p: FileChangeRequestApprovalParams, fromChild: boolean): void {
-    if (hasRule(this.deps.rules(), FILE_CHANGE_RULE)) {
+    const known = p.itemId ? this.deps.itemPaths(p.itemId) : undefined;
+    const paths = known ?? [];
+    // A patch to a file that runs as code asks every time, past an "Always
+    // allow", as does one whose files weren't seen (code-writes.ts).
+    const code = this.runsAsCode(paths);
+    if (!code && known && hasRule(this.deps.rules(), FILE_CHANGE_RULE)) {
       this.deps.reply(id, { decision: 'accept' });
       return;
     }
-    const paths = (p.itemId && this.deps.itemPaths(p.itemId)) || [];
     const input: Record<string, unknown> = { paths };
     if (p.reason) input.reason = p.reason;
     if (p.grantRoot) input.grantRoot = p.grantRoot;
+    const title = editTitle(paths, this.deps.cwd());
     this.ask(
       id,
       'item/fileChange/requestApproval',
-      { toolUseId: fromChild ? undefined : p.itemId, name: 'apply_patch', title: editTitle(paths, this.deps.cwd()), input, canAlwaysAllow: true },
+      { toolUseId: fromChild ? undefined : p.itemId, name: 'apply_patch', title: code ? `${title} (${codeWriteNote(code)})` : title, input, canAlwaysAllow: !code },
       (a) => {
-        if (a.decision === 'allowAlways') this.deps.addRules([FILE_CHANGE_RULE]);
+        if (a.decision === 'allowAlways' && !code) this.deps.addRules([FILE_CHANGE_RULE]);
         return { decision: commandDecision(a) };
       },
     );
@@ -375,6 +453,8 @@ export class CodexApprovals {
     const requested: Record<string, unknown> = {};
     if (p.permissions?.network) requested.network = p.permissions.network;
     if (p.permissions?.fileSystem) requested.fileSystem = p.permissions.fileSystem;
+    const card = cardInput({ permissions: requested, cwd: p.cwd, reason: p.reason }, ['permissions', 'cwd']);
+    if (card.tooLong) return this.tooLong(id, card.tooLong, { permissions: {}, scope: 'turn' });
     this.ask(
       id,
       'item/permissions/requestApproval',
@@ -382,14 +462,15 @@ export class CodexApprovals {
         toolUseId: fromChild ? undefined : p.itemId,
         name: 'permissions',
         title: firstLine(p.reason ?? '') || 'Allow extra permissions',
-        input: truncateInput({ permissions: requested, cwd: p.cwd, reason: p.reason }),
-        canAlwaysAllow: true,
+        input: card.input,
+        // More filesystem or network access than the thread's sandbox gives
+        // is raising access, which outside Full is one call's OK (SECURITY.md):
+        // never "Always allow", and never the session scope that would hand
+        // it to every later command in the thread (Daybreak, 7 Nov 2026).
+        // A client that sends allowAlways anyway gets the one turn.
+        canAlwaysAllow: false,
       },
-      (a) => {
-        if (a.decision === 'allow') return { permissions: requested, scope: 'turn' };
-        if (a.decision === 'allowAlways') return { permissions: requested, scope: 'session' };
-        return { permissions: {}, scope: 'turn' };
-      },
+      (a) => (a.decision === 'allow' || a.decision === 'allowAlways' ? { permissions: requested, scope: 'turn' } : { permissions: {}, scope: 'turn' }),
     );
   }
 
@@ -486,21 +567,27 @@ export class CodexApprovals {
       threadId: p.conversationId,
       turnId: '',
       itemId: p.callId,
-      command: argv.length === 3 && /(^|\/)(zsh|bash|sh)$/.test(argv[0]) && /^-l?c$/.test(argv[1]) ? argv[2] : argv.map(quoteWord).join(' '),
+      // Only the system's shell comes off, as unwrapShell has it: a repo's own
+      // `bin/bash`, or a bare `bash` PATH might find there, is the program
+      // being run (Codex review, 7 Nov 2026).
+      command: argv.length === 3 && /^\/(?:usr\/)?bin\/(?:zsh|bash|sh)$/.test(argv[0]) && /^-l?c$/.test(argv[1]) ? argv[2] : argv.map(quoteWord).join(' '),
       cwd: p.cwd,
       reason: p.reason,
     };
-    if (commandAllowed(asV2, this.deps.rules())) {
+    const cwd = p.cwd || this.deps.cwd();
+    if (commandAllowed(asV2, this.deps.rules(), cwd)) {
       this.deps.reply(id, { decision: 'approved' });
       return;
     }
-    const rule = ruleFor(asV2);
-    const input: Record<string, unknown> = { command: asV2.command, cwd: p.cwd };
+    const rule = ruleFor(asV2, cwd);
+    const input: Record<string, unknown> = { command: asV2.command, cwd };
     if (p.reason) input.reason = p.reason;
+    const card = cardInput(input, ['command', 'cwd']);
+    if (card.tooLong) return this.tooLong(id, card.tooLong, { decision: 'abort' });
     this.ask(
       id,
       'execCommandApproval',
-      { toolUseId: fromChild ? undefined : p.callId, name: 'shell', title: firstLine(asV2.command ?? '') || 'Run a command', input: truncateInput(input), canAlwaysAllow: Boolean(rule) },
+      { toolUseId: fromChild ? undefined : p.callId, name: 'shell', title: firstLine(asV2.command ?? '') || 'Run a command', input: card.input, canAlwaysAllow: Boolean(rule) },
       (a) => {
         if (a.decision === 'allowAlways' && rule) this.deps.addRules([rule]);
         return { decision: legacyDecision(a) };
@@ -509,19 +596,24 @@ export class CodexApprovals {
   }
 
   private legacyPatch(id: RequestId, p: ApplyPatchApprovalParams, fromChild: boolean): void {
-    if (hasRule(this.deps.rules(), FILE_CHANGE_RULE)) {
+    // Each file and, for a rename, where it goes (`move_path`).
+    const changes = Object.entries(p.fileChanges ?? {});
+    const paths = changes.map(([f]) => f);
+    const moves = changes.flatMap(([, c]) => [(c as { move_path?: unknown })?.move_path, (c as { kind?: { move_path?: unknown } })?.kind?.move_path]).filter((x): x is string => typeof x === 'string' && x !== '');
+    const code = this.runsAsCode([...paths, ...moves]);
+    if (!code && hasRule(this.deps.rules(), FILE_CHANGE_RULE)) {
       this.deps.reply(id, { decision: 'approved' });
       return;
     }
-    const paths = Object.keys(p.fileChanges ?? {});
     const input: Record<string, unknown> = { paths };
     if (p.reason) input.reason = p.reason;
+    const title = editTitle(paths, this.deps.cwd());
     this.ask(
       id,
       'applyPatchApproval',
-      { toolUseId: fromChild ? undefined : p.callId, name: 'apply_patch', title: editTitle(paths, this.deps.cwd()), input, canAlwaysAllow: true },
+      { toolUseId: fromChild ? undefined : p.callId, name: 'apply_patch', title: code ? `${title} (${codeWriteNote(code)})` : title, input, canAlwaysAllow: !code },
       (a) => {
-        if (a.decision === 'allowAlways') this.deps.addRules([FILE_CHANGE_RULE]);
+        if (a.decision === 'allowAlways' && !code) this.deps.addRules([FILE_CHANGE_RULE]);
         return { decision: legacyDecision(a) };
       },
     );
@@ -555,8 +647,7 @@ function editTitle(paths: string[], cwd: string): string {
 }
 
 function firstLine(s: string, max = 200): string {
-  const line = (s.split('\n').find((l) => l.trim()) ?? '').trim();
-  return line.length > max ? line.slice(0, max - 1) + '…' : line;
+  return firstLineSafely(s, max, '…');
 }
 
 function quoteWord(w: string): string {

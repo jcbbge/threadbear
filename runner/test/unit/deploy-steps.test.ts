@@ -87,3 +87,15 @@ test('unitTests: a test that fails twice stops the build', () => {
   const { io } = fakeIo([{ status: 1, output }, { status: 1, output }]);
   assert.throws(() => steps.unitTests(c, {}, io), /Rerunning test\/unit\/broken\.test\.ts failed \(node exited with 1\)/);
 });
+
+// 90 s was too short with the Mac at a load of 94 on 18 cores (6 Nov): the
+// release was fine and started in 7 s once it eased. The wait goes on while
+// the Mac is that busy, up to a cap, and gives up at 90 s otherwise.
+test('the smoke test waits longer for a release to listen while the Mac is overloaded', () => {
+  assert.equal(steps.smokeTimedOut(89_000, 0.5), false);
+  assert.equal(steps.smokeTimedOut(91_000, 0.5), true);
+  assert.equal(steps.smokeTimedOut(91_000, 1.0), true);
+  assert.equal(steps.smokeTimedOut(91_000, 5.2), false);
+  assert.equal(steps.smokeTimedOut(9 * 60_000, 5.2), false);
+  assert.equal(steps.smokeTimedOut(10 * 60_000 + 1, 5.2), true);
+});

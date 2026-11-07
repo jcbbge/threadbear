@@ -35,6 +35,14 @@ final class AppUpdateTests: XCTestCase {
         (try? Data(contentsOf: url.appendingPathComponent("Contents/marker"))).map { String(decoding: $0, as: UTF8.self) }
     }
 
+    // The update's build runs at background priority (a land's check held
+    // Mike's M5 above load 24 on 6 Nov; builds Threadbear starts mustn't).
+    func testTheUpdateBuildRunsAtBackgroundPriority() {
+        let (executable, arguments) = AppUpdater.buildCommand(script: "/b/stage-update.sh", checkout: "/repo", next: "/next")
+        XCTAssertEqual(executable, "/usr/sbin/taskpolicy")
+        XCTAssertEqual(arguments, ["-b", "/bin/bash", "/b/stage-update.sh", "/repo", "--next", "/next"])
+    }
+
     func testTheTreeCoversAppAndDockAsBuildAppWritesIt() {
         // `git rev-parse main:app main:dock`, as the updater runs it.
         XCTAssertEqual(AppUpdate.tree(fromRevParse: "aaa111\nbbb222\n"), "aaa111+bbb222")

@@ -56,7 +56,11 @@ export type Turn = {
 
 export type UserInputItem =
   | { type: 'text'; text: string; text_elements: unknown[] }
-  | { type: 'localImage'; path: string };
+  | { type: 'localImage'; path: string }
+  | { type: 'skill'; name: string; path: string };
+
+// skills/list (only the fields the runner reads).
+export type SkillsListResponse = { data?: { cwd?: string; skills?: { name?: string; description?: string; shortDescription?: string; path?: string; scope?: string; enabled?: boolean }[] }[] };
 
 export type DynamicToolFunctionSpec = { type: 'function'; name: string; description: string; inputSchema: unknown };
 export type DynamicToolSpec = { type: 'namespace'; name: string; description: string; tools: DynamicToolFunctionSpec[] };
@@ -71,7 +75,22 @@ export type ThreadStartParams = {
   dynamicTools?: DynamicToolSpec[];
 };
 export type ThreadResumeParams = Omit<ThreadStartParams, 'dynamicTools'> & { threadId: string; excludeTurns: true };
-export type ThreadStartResponse = { thread: Thread; model: string; cwd: string; instructionSources: string[]; reasoningEffort: ReasoningEffort | null };
+export type ThreadStartResponse = {
+  thread: Thread;
+  model: string;
+  cwd: string;
+  instructionSources: string[];
+  reasoningEffort: ReasoningEffort | null;
+  // thread/resume's: the mode the thread was left in (absent from older servers).
+  collaborationMode?: CollaborationMode | null;
+};
+
+// Codex's collaboration mode (experimental): "plan" is its plan mode, which
+// "Plan first" uses. Null developer_instructions means the mode's own.
+export type CollaborationMode = {
+  mode: 'plan' | 'default';
+  settings: { model: string; reasoning_effort: ReasoningEffort | null; developer_instructions: string | null };
+};
 
 export type TurnStartParams = {
   threadId: string;
@@ -84,6 +103,7 @@ export type TurnStartParams = {
   model?: string;
   effort?: ReasoningEffort;
   summary: 'detailed';
+  collaborationMode?: CollaborationMode;
 };
 export type TurnStartResponse = { turn: Turn };
 export type TurnSteerParams = { threadId: string; expectedTurnId: string; clientUserMessageId?: string; input: UserInputItem[] };

@@ -80,6 +80,7 @@ public enum HighlightFold {
     public static let needsYou = "needsYou"
     public static let scheduled = "scheduled"
     public static let subagents = "subagents"
+    public static let startedThreads = "startedThreads"
     public static let pinned = "pinned"
     public static let files = "files"
     public static let links = "links"

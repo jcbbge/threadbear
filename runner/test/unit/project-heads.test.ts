@@ -119,19 +119,23 @@ test("one runner's list doesn't touch another's", async () => {
   assert.deepEqual(s.rows('projectHeads').map((h) => h.runnerId), [M5]);
 });
 
-const account = (id: string, email: string) => ({ id, provider: 'claude', title: id, email, usage: { windows: [], readAt: 'now', source: 'live' } });
+const account = (id: string, email: string) => ({ id, provider: 'claude', title: id, email, usage: { windows: [], readAt: '2026-11-06T00:00:00.000Z', source: 'live' } });
 
 test("sync:sharedUsage with the caller's runner id leaves its own rows out, and without one tells everyone's", async () => {
   const s = await setup();
   await call(s.ctx, sync.setAccounts, { key: OWNER, runnerId: M5, accounts: [account('a', 'one@x.com')] });
   await call(s.ctx, sync.setAccounts, { key: BRUCE_KEY, runnerId: BRUCE, accounts: [account('b', 'one@x.com'), account('c', 'other@x.com')] });
-  const of = (rows: unknown) => (rows as { runnerId: string; email: string }[]).map((r) => `${r.runnerId}:${r.email}`).sort();
-  assert.deepEqual(of(await call(s.ctx, sync.sharedUsage, { key: OWNER, runnerId: M5 })), [`${BRUCE}:one@x.com`, `${BRUCE}:other@x.com`]);
-  // A runner from before sends none.
-  assert.equal(of(await call(s.ctx, sync.sharedUsage, { key: OWNER })).length, 3);
-  // A runner key: never its own, whatever it sends, and only its own logins' readings.
-  assert.deepEqual(of(await call(s.ctx, sync.sharedUsage, { key: BRUCE_KEY, runnerId: M5 })), [`${M5}:one@x.com`]);
-  assert.deepEqual(of(await call(s.ctx, sync.sharedUsage, { key: BRUCE_KEY })), [`${M5}:one@x.com`]);
+  // Which of Bruce's logins count is the owner's word (shared-usage-trust.test.ts).
+  await call(s.ctx, sync.setRunnerLogins, { key: OWNER, runnerId: BRUCE, logins: [{ provider: 'claude', email: 'one@x.com' }, { provider: 'claude', email: 'other@x.com' }] });
+  const of = (rows: unknown) => (rows as { runnerId?: string; email: string }[]).map((r) => `${r.runnerId ?? '?'}:${r.email}`).sort();
+  // The owner: a runner key's rows are nobody's word (shared-usage-trust.test.ts).
+  assert.deepEqual(of(await call(s.ctx, sync.sharedUsage, { key: OWNER, runnerId: M5 })), []);
+  // A runner from before sends none, and is told about its own.
+  assert.deepEqual(of(await call(s.ctx, sync.sharedUsage, { key: OWNER })), [`${M5}:one@x.com`]);
+  // A runner key: never its own, whatever it sends, only the owner's readings of
+  // its listed logins, and not whose they are.
+  assert.deepEqual(of(await call(s.ctx, sync.sharedUsage, { key: BRUCE_KEY, runnerId: M5 })), ['?:one@x.com']);
+  assert.deepEqual(of(await call(s.ctx, sync.sharedUsage, { key: BRUCE_KEY })), ['?:one@x.com']);
 });
 
 test('a runner sends its id only to a backend that takes it', () => {
@@ -246,4 +250,56 @@ test('the older queries still answer with what their validators allow', async ()
   await s.ctx.db.insert('tokens', { hash: await sha256('tb_two'), name: 'p2', expiresAt: Date.now() + 100_000, createdAt: 1 });
   const [phoneRow] = (await call(s.ctx, phone.schedules, { token: 'tb_two' })) as Record<string, unknown>[];
   assert.equal('updatedMs' in phoneRow!, false);
+});
+
+// API 50: notes in a row of their own, so the rest of a project changing
+// doesn't rewrite them (convex/projectNotes.ts).
+test('notes live apart: the project row holds none, and a change without notes leaves them alone', async () => {
+  const s = await setup();
+  await call(s.ctx, sync.setProjects, { key: OWNER, runnerId: M5, projects: [project('p1'), project('p2', { notes: '' })] });
+  assert.deepEqual(s.rows('projects').map((p) => p.notes), ['', '']);
+  assert.deepEqual(s.rows('projectNotes').map((n) => [n.id, n.notes]), [['p1', 'NOTES']]);
+  const notesRow = s.rows('projectNotes')[0]!;
+  const { notes: _n, ...noNotes } = project('p1', { state: 'NEW STATE', updatedAt: 'u2' });
+  await call(s.ctx, sync.upsertProjects, { key: OWNER, runnerId: M5, projects: [noNotes], removed: [] });
+  assert.equal(s.rows('projectNotes')[0], notesRow);
+  const p = (await call(s.ctx, phone.project, { token: TOKEN, runnerId: M5, id: 'p1' })) as Record<string, any>;
+  assert.deepEqual([p.state, p.notes], ['NEW STATE', 'NOTES']);
+  // Notes given are written, and the same list again writes nothing.
+  await call(s.ctx, sync.upsertProjects, { key: OWNER, runnerId: M5, projects: [project('p1', { notes: 'EDITED' })], removed: [] });
+  assert.equal(s.rows('projectNotes')[0]!.notes, 'EDITED');
+  const edited = s.rows('projectNotes')[0]!;
+  await call(s.ctx, sync.setProjects, { key: OWNER, runnerId: M5, projects: [project('p1', { notes: 'EDITED' }), project('p2', { notes: '' })] });
+  assert.equal(s.rows('projectNotes')[0], edited);
+  // Emptied, or the project gone: the row goes.
+  await call(s.ctx, sync.upsertProjects, { key: OWNER, runnerId: M5, projects: [project('p1', { notes: '' })], removed: [] });
+  assert.equal(s.rows('projectNotes').length, 0);
+  await call(s.ctx, sync.upsertProjects, { key: OWNER, runnerId: M5, projects: [project('p1', { notes: 'BACK' })], removed: [] });
+  await call(s.ctx, sync.upsertProjects, { key: OWNER, runnerId: M5, projects: [], removed: ['p1'] });
+  assert.equal(s.rows('projectNotes').length, 0);
+  await call(s.ctx, sync.setProjects, { key: OWNER, runnerId: M5, projects: [project('p3', { notes: 'THREE' })] });
+  await call(s.ctx, sync.setProjects, { key: OWNER, runnerId: M5, projects: [] });
+  assert.equal(s.rows('projectNotes').length, 0);
+});
+
+test('a row from before keeps showing its notes, and they move out the first time it is written without them', async () => {
+  const s = await setup();
+  await s.ctx.db.insert('projects', { ...project('old', { notes: 'OLD NOTES' }), runnerId: M5 });
+  const read = async () => ((await call(s.ctx, phone.project, { token: TOKEN, runnerId: M5, id: 'old' })) as Record<string, any>).notes;
+  assert.equal(await read(), 'OLD NOTES');
+  const { notes: _n, ...noNotes } = project('old', { state: 'MOVED ON' });
+  await call(s.ctx, sync.upsertProjects, { key: OWNER, runnerId: M5, projects: [noNotes], removed: [] });
+  assert.equal(s.rows('projects')[0]!.notes, '');
+  assert.deepEqual(s.rows('projectNotes').map((n) => n.notes), ['OLD NOTES']);
+  assert.equal(await read(), 'OLD NOTES');
+});
+
+test("one runner's notes are its own", async () => {
+  const s = await setup();
+  await call(s.ctx, sync.setProjects, { key: OWNER, runnerId: M5, projects: [project('p1', { notes: 'MINE' })] });
+  await call(s.ctx, sync.setProjects, { key: BRUCE_KEY, runnerId: BRUCE, projects: [project('p1', { notes: 'BRUCE' })] });
+  await call(s.ctx, sync.setProjects, { key: BRUCE_KEY, runnerId: BRUCE, projects: [] });
+  assert.deepEqual(s.rows('projectNotes').map((n) => [n.runnerId, n.notes]), [[M5, 'MINE']]);
+  const p = (await call(s.ctx, phone.project, { token: TOKEN, runnerId: M5, id: 'p1' })) as Record<string, any>;
+  assert.equal(p.notes, 'MINE');
 });

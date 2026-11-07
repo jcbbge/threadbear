@@ -226,6 +226,159 @@ final class ComposerTests: XCTestCase {
         XCTAssertEqual(composer.string, "`\(video.standardizedFileURL.path)` ")
     }
 
+    /// Letting a file go anywhere over the thread gives it to the composer,
+    /// as only the box took it before (Jamie Turner, 6 Nov).
+    @MainActor func testAFileDroppedOnTheTranscriptGoesToTheComposer() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("transcript-drop-\(UUID().uuidString.prefix(6))", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let video = folder.appendingPathComponent("clip.mp4")
+        try Data("not really a movie".utf8).write(to: video)
+        let board = NSPasteboard(name: NSPasteboard.Name("transcript-drop-test-\(UUID().uuidString)"))
+        defer { board.releaseGlobally() }
+        board.clearContents()
+        board.writeObjects([video as NSURL])
+
+        let (window, parent, composer) = composerInWindow()
+        defer { window.close() }
+        let handle = ComposerHandle()
+        let controller = TranscriptController()
+        let host = TranscriptHost(controller: controller, ghost: false)
+        host.frame = parent.bounds
+        parent.addSubview(host)
+        XCTAssertTrue(host.registeredDraggedTypes.contains(.fileURL))
+        let outside = FakeDrag(pasteboard: board, window: window, location: .zero)
+
+        // No composer (a sub-agent's transcript): nowhere for it to go.
+        XCTAssertEqual(host.draggingEntered(outside), [])
+        XCTAssertFalse(host.performDragOperation(outside))
+
+        handle.textView = composer
+        controller.composerHandle = handle
+        // A file being dragged out of the app, let go back over the thread, stays out.
+        let fromThisApp = FakeDrag(pasteboard: board, window: window, location: .zero, source: FileDrag.Source.shared)
+        XCTAssertEqual(host.draggingEntered(fromThisApp), [])
+        XCTAssertFalse(host.performDragOperation(fromThisApp))
+        XCTAssertEqual(composer.string, "")
+
+        XCTAssertEqual(host.draggingEntered(outside), .copy)
+        XCTAssertEqual(host.draggingUpdated(outside), .copy)
+        XCTAssertEqual(host.subviews.count, 2, "the mark shows over the transcript")
+        XCTAssertTrue(host.performDragOperation(outside))
+        XCTAssertEqual(host.subviews.count, 1, "and goes with the drop")
+        XCTAssertEqual(composer.string, "`\(video.standardizedFileURL.path)` ")
+        XCTAssertTrue(window.firstResponder === composer)
+
+        // Words dragged in aren't files, so they aren't for the thread.
+        board.clearContents()
+        board.setString("hello", forType: .string)
+        XCTAssertEqual(host.draggingEntered(outside), [])
+    }
+
+    /// A thread dragged out of the sidebar and let go over the open thread
+    /// goes into its message as the thread's chip, as pasting its id does
+    /// (Mike, 6 Nov). The drag starts in this app, unlike a file's.
+    @MainActor func testAThreadDroppedOnTheTranscriptGoesInAsItsChip() throws {
+        let id = "th_drag_\(UUID().uuidString.prefix(6))"
+        AppModel.shared.threads[id] = ThreadSummary(id: id, title: "Fix the sidebar", accountId: "claude-main")
+        defer { AppModel.shared.threads[id] = nil }
+        let board = NSPasteboard(name: NSPasteboard.Name("thread-drop-test-\(UUID().uuidString)"))
+        defer { board.releaseGlobally() }
+        board.clearContents()
+        board.setString(id, forType: .string)
+
+        let (window, parent, composer) = composerInWindow()
+        defer { window.close() }
+        composer.string = "Look at "
+        composer.setSelectedRange(NSRange(location: 8, length: 0))
+        let handle = ComposerHandle()
+        handle.textView = composer
+        let controller = TranscriptController()
+        controller.composerHandle = handle
+        let host = TranscriptHost(controller: controller, ghost: false)
+        host.frame = parent.bounds
+        parent.addSubview(host)
+        XCTAssertTrue(host.registeredDraggedTypes.contains(.string))
+
+        let drag = FakeDrag(pasteboard: board, window: window, location: .zero, source: ThreadDrag.Source(ended: {}))
+        XCTAssertEqual(host.draggingEntered(drag), .copy)
+        XCTAssertTrue(host.performDragOperation(drag))
+        XCTAssertEqual(composer.draftNow.text, "Look at [Fix the sidebar](thread:\(id))")
+        XCTAssertTrue(window.firstResponder === composer)
+
+        // An id of a thread this Mac doesn't know is only words.
+        board.clearContents()
+        board.setString("th_nobody", forType: .string)
+        XCTAssertEqual(host.draggingEntered(drag), [])
+    }
+
+    /// Nothing in a transcript row signs up for drags, or a file let go over
+    /// it would stop there and never reach the transcript. A row's icon (an
+    /// NSImageView) did.
+    @MainActor func testTranscriptRowsLeaveDropsToTheTranscript() {
+        XCTAssertTrue(Symbols.makeView().registeredDraggedTypes.isEmpty, "a row's icon")
+        XCTAssertTrue(BackgroundRowCell(frame: .zero).bear.registeredDraggedTypes.isEmpty, "the background-work bear")
+        let text = TranscriptTextView()
+        text.isEditable = false
+        XCTAssertTrue(text.registeredDraggedTypes.isEmpty, "a row's words")
+    }
+
+    /// A picture dropped from a temp folder goes to the runner as a copy, as
+    /// a screenshot thumbnail's file is deleted as the drop ends (issue #2).
+    func testAPictureFromATempFolderIsKept() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("composer-thumb-\(UUID().uuidString.prefix(6))", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let shot = folder.appendingPathComponent("Screenshot.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: shot)
+
+        let composer = ComposerTextView()
+        var delivered: [URL] = []
+        composer.onImages = { delivered = $0 }
+        let board = NSPasteboard(name: NSPasteboard.Name("composer-thumb-test-\(UUID().uuidString)"))
+        defer { board.releaseGlobally() }
+        board.clearContents()
+        board.writeObjects([shot as NSURL])
+
+        XCTAssertTrue(composer.takeImages(from: board))
+        let kept = try XCTUnwrap(delivered.first)
+        defer { try? FileManager.default.removeItem(at: kept.deletingLastPathComponent()) }
+        XCTAssertEqual(kept.lastPathComponent, "Screenshot.png")
+        XCTAssertNotEqual(kept.standardizedFileURL, shot.standardizedFileURL)
+        try FileManager.default.removeItem(at: shot)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: kept.path))
+    }
+
+    /// A photo copied in Photos goes in as its image data, even with another
+    /// file copied alongside it, which goes in as usual.
+    func testAPhotosLibraryPhotoUsesItsImageData() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("composer-photos-\(UUID().uuidString.prefix(6))", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let other = folder.appendingPathComponent("other.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: other)
+        let jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0])
+
+        let photo = NSPasteboardItem()
+        photo.setString(URL(fileURLWithPath: "/Users/me/Pictures/Photos Library.photoslibrary/resources/ABC.jpeg").absoluteString, forType: .fileURL)
+        photo.setData(jpeg, forType: NSPasteboard.PasteboardType("public.jpeg"))
+        let plain = NSPasteboardItem()
+        plain.setString(other.absoluteString, forType: .fileURL)
+
+        let composer = ComposerTextView()
+        var delivered: [URL] = []
+        composer.onImages = { delivered = $0 }
+        let board = NSPasteboard(name: NSPasteboard.Name("composer-photos-test-\(UUID().uuidString)"))
+        defer { board.releaseGlobally() }
+        board.clearContents()
+        board.writeObjects([photo, plain])
+
+        XCTAssertTrue(composer.takeImages(from: board))
+        XCTAssertEqual(delivered.map(\.lastPathComponent), ["ABC.jpeg", "other.png"])
+        defer { delivered.forEach { try? FileManager.default.removeItem(at: $0.deletingLastPathComponent()) } }
+        XCTAssertEqual(try Data(contentsOf: delivered[0]), jpeg)
+    }
+
     /// The box is two lines tall when empty, grows a line at a time, and
     /// stops at ten lines (the rest scrolls).
     func testComposerGrowsFromTwoLinesToTen() throws {
@@ -666,7 +819,7 @@ final class AutomationTests: XCTestCase {
                 AppDump.Section(name: "Running", threads: []),
             ], snoozed: 0, archived: 2),
             selection: AppDump.Thread(id: "th1", title: "Fix it", status: "idle", needsYou: false, unread: false, hovered: false),
-            composer: AppDump.Composer(draft: "th1", text: "hello", images: 0, cwd: "/w", account: "claude-3", model: "default (the runner's, claude-haiku-5-5)", ask: true),
+            composer: AppDump.Composer(draft: "th1", text: "hello", images: 0, cwd: "/w", account: "claude-3", model: "default (the runner's, claude-haiku-5-5)", ask: true, mode: .ask),
             transcript: AppDump.Transcript(threadId: "th1", state: "loaded", hasMoreAbove: false, atBottom: true, rows: [
                 AppDump.Row(id: "u:1", kind: "user", height: 64, expanded: nil, inGroup: false, onScreen: false, seq: 1, turn: "t1", text: "Fix it"),
                 AppDump.Row(id: "g:r:r1", kind: "group", height: 32, expanded: true, inGroup: false, onScreen: true, seq: 2, turn: "t1", text: "Ran a command"),
@@ -738,7 +891,9 @@ private final class FakeDrag: NSObject, NSDraggingInfo {
     let draggingPasteboard: NSPasteboard
     let draggingDestinationWindow: NSWindow?
     let draggingLocation: NSPoint
-    init(pasteboard: NSPasteboard, window: NSWindow, location: NSPoint) {
+    let draggingSource: Any?
+    init(pasteboard: NSPasteboard, window: NSWindow, location: NSPoint, source: Any? = nil) {
+        draggingSource = source
         draggingPasteboard = pasteboard
         draggingDestinationWindow = window
         draggingLocation = location
@@ -746,7 +901,6 @@ private final class FakeDrag: NSObject, NSDraggingInfo {
     var draggingSourceOperationMask: NSDragOperation { .copy }
     var draggedImageLocation: NSPoint { draggingLocation }
     var draggedImage: NSImage? { nil }
-    var draggingSource: Any? { nil }
     var draggingSequenceNumber: Int { 1 }
     func slideDraggedImage(to screenPoint: NSPoint) {}
     var draggingFormation: NSDraggingFormation = .default

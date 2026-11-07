@@ -17,7 +17,10 @@ struct SecretCard: View {
     let key: String
     var onSent: (String) -> Void
     @State private var value = ""
-    @State private var busy = false
+    /// Save or Decline has been tapped: spinning until the card goes
+    /// (AppModel.answerCard), there still if he leaves and comes back.
+    private var busy: Bool { model.cardAnswers[approvalId] != nil }
+    private var declining: Bool { model.cardAnswers[approvalId]?.choice == "decline" }
     @State private var problem: String?
     /// Checked against the key kept for this runner (from pairing), and the
     /// runner kept for this thread, once the card shows and again on Save.
@@ -62,30 +65,45 @@ struct SecretCard: View {
                     .disabled(busy)
                 Label("Kept out of chat, in a private file this agent's commands can read for 24 hours", systemImage: "lock.shield")
                     .font(.footnote).foregroundStyle(.secondary)
-                if let problem {
+                if let problem = problem ?? refusal {
                     Text(problem).font(.footnote).foregroundStyle(.red)
                 }
                 HStack {
                     Button(action: save) {
-                        Text("Save securely").frame(maxWidth: .infinity)
+                        Text("Save securely")
+                            .frame(maxWidth: .infinity)
+                            .spinning(busy && !declining, tint: .white)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(busy || value.isEmpty)
+                    .disabled(busy ? declining : value.isEmpty)
                     Button(action: decline) {
-                        Text("Decline").frame(maxWidth: .infinity)
+                        Text("Decline")
+                            .frame(maxWidth: .infinity)
+                            .spinning(busy && declining)
                     }
                     .buttonStyle(.bordered)
                     .tint(.red)
-                    .disabled(busy)
+                    .disabled(busy && !declining)
                 }
+                .allowsHitTesting(!busy)
             }
         }
         .padding()
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .sensoryFeedback(trigger: busy) { _, new in
+            new ? (declining ? .selection : .impact(weight: .light)) : nil
+        }
         .task(id: "\(runnerId) \(key)") {
             guard model.canAnswerSecrets, SecretSeal.isUsableKey(key) else { return }
             trust = RunnerKeyPins.check(key, runnerId: runnerId, threadId: threadId, in: model.runnerKeys)
         }
+    }
+
+    /// Our own words, not the server's: nothing that came back with the request
+    /// ends up on screen. The value's gone, so it's typed afresh.
+    private var refusal: String? {
+        guard !busy, let choice = model.refusedSecrets[approvalId] else { return nil }
+        return choice == "decline" ? "Couldn't decline it. Try again." : "Couldn't send it. Type it again to retry."
     }
 
     private func save() {
@@ -110,25 +128,16 @@ struct SecretCard: View {
     }
 
     private func decline() {
+        guard !busy else { return }
         value = ""
         problem = nil
         send(.decline)
     }
 
     private func send(_ answer: SecretAnswer) {
-        guard let backend = model.backend else { return }
-        busy = true
-        Task {
-            defer { busy = false }
-            do {
-                onSent(try await backend.secret(threadId: threadId, approvalId: approvalId, answer: answer))
-            } catch TransportError.unauthorized(let message) {
-                model.report(TransportError.unauthorized(message))
-            } catch {
-                // Our own words, not the server's: nothing that came back
-                // with the request ends up on screen.
-                problem = answer == .decline ? "Couldn't decline it. Try again." : "Couldn't send it. Type it again to retry."
-            }
-        }
+        let (threadId, approvalId) = (threadId, approvalId)
+        model.answerCard(approvalId, choice: answer == .decline ? "decline" : "save", secret: true, send: { backend in
+            try await backend.secret(threadId: threadId, approvalId: approvalId, answer: answer)
+        }, sent: onSent)
     }
 }

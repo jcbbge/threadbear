@@ -230,7 +230,7 @@ final class PerfRunner: NSObject {
             app.archive(copy.id)
             archiveClicks.append((CACurrentMediaTime() - start) * 1000)
             pictures.append(ArchiveFlight.lastPictureMs)
-            try? await Task.sleep(for: .seconds(ArchiveFlight.duration + 0.5))
+            try? await Task.sleep(for: .seconds(ArchiveFlight.Destination.archive.duration + 0.5))
             watch.stop()
             archiveMaxGap = max(archiveMaxGap, watch.maxGap)
             archiveOver33 += watch.over33
@@ -241,6 +241,36 @@ final class PerfRunner: NSObject {
         log(String(format: "  frames from the click until it landed: %d, max gap %.1f ms, over 33 ms: %d", archiveFrames, archiveMaxGap, archiveOver33))
         json["archive"] = ["clickMs": statsJSON(archiveClicks), "pictureMs": statsJSON(pictures),
                            "frames": archiveFrames, "maxGapMs": archiveMaxGap, "over33": archiveOver33]
+
+        // 8. The same for hibernating the open thread: slower and softer,
+        // and on the next five copies, as those five have gone.
+        log("")
+        let tucking = Array(copies.dropFirst(5).prefix(5))
+        log("Hibernate the open thread (\(tucking.count) real-size copies, scrolled to the bottom)")
+        var tuckClicks: [Double] = [], tuckPictures: [Double] = []
+        var tuckMaxGap = 0.0, tuckOver33 = 0, tuckFrames = 0
+        for copy in tucking {
+            _ = await measureSwitch(copy.id)
+            app.transcript.scrollToBottom()
+            try? await Task.sleep(for: .milliseconds(300))
+            let watch = FrameWatch()
+            watch.start(on: app.transcript.scrollView)
+            try? await Task.sleep(for: .milliseconds(100))
+            let start = CACurrentMediaTime()
+            app.snooze(copy.id, until: Date().addingTimeInterval(3600))
+            tuckClicks.append((CACurrentMediaTime() - start) * 1000)
+            tuckPictures.append(ArchiveFlight.lastPictureMs)
+            try? await Task.sleep(for: .seconds(ArchiveFlight.Destination.hibernate.duration + 0.5))
+            watch.stop()
+            tuckMaxGap = max(tuckMaxGap, watch.maxGap)
+            tuckOver33 += watch.over33
+            tuckFrames += watch.frames
+        }
+        log("  " + stats("click (picture and opening the next thread)", tuckClicks, unit: "hibernates"))
+        log("  " + stats("of which the picture", tuckPictures, unit: "hibernates"))
+        log(String(format: "  frames from the click until it landed: %d, max gap %.1f ms, over 33 ms: %d", tuckFrames, tuckMaxGap, tuckOver33))
+        json["hibernate"] = ["clickMs": statsJSON(tuckClicks), "pictureMs": statsJSON(tuckPictures),
+                             "frames": tuckFrames, "maxGapMs": tuckMaxGap, "over33": tuckOver33]
 
         // Counted last: it loads every event of every fixture, which would
         // skew the memory numbers above.

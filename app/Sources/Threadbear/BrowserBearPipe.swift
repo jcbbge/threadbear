@@ -71,10 +71,16 @@ final class BrowserBearPipe: @unchecked Sendable {
             guard let self, !self.closed else { return }
             if let data { self.buffer.append(data) }
             guard self.buffer.count <= 16 * 1024 * 1024 else { return self.fail("BrowserBear sent an oversized frame.") }
-            while let newline = self.buffer.firstIndex(of: 0x0A) {
-                let line = self.buffer.prefix(upTo: newline)
+            // A frame is hundreds of KB and comes in many reads, and the panel
+            // gets up to 60 a second: look for its end only in what's new,
+            // and take all the lines in one cut rather than one copy each.
+            var start = self.buffer.startIndex
+            var from = max(start, self.buffer.endIndex - (data?.count ?? 0))
+            while let newline = self.buffer[from...].firstIndex(of: 0x0A) {
+                let line = self.buffer[start..<newline]
+                start = newline + 1
+                from = start
                 let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
-                self.buffer.removeSubrange(...newline)
                 guard let message else { return self.fail("BrowserBear sent an unreadable response.") }
                 if let id = message["id"] as? Int {
                     let reply = self.waiting.removeValue(forKey: id)
@@ -87,6 +93,7 @@ final class BrowserBearPipe: @unchecked Sendable {
                     else { reply?(message["result"] as? [String: Any] ?? [:]) }
                 } else { self.onEvent?(message) }
             }
+            if start > self.buffer.startIndex { self.buffer.removeSubrange(self.buffer.startIndex..<start) }
             if let error { self.fail(error.localizedDescription) }
             else if complete { self.fail("BrowserBear disconnected. Reopen the panel to reconnect.") }
             else { self.receive() }

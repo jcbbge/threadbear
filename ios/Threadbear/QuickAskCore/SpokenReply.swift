@@ -17,7 +17,10 @@ nonisolated enum SpokenReply {
             }
             if inCode || line.isEmpty { continue }
             line = line.replacing(/^(#{1,6}|>|[-*+]|\d+[.)])\s+/, with: "")
-            line = line.replacing(/\[([^\]]+)\]\([^)]+\)/) { String($0.1) }
+            // `[words](link)` is its words. Written so a `[` with no link
+            // after it uses itself up rather than every `[` being tried to
+            // the end of the line again, which was quadratic.
+            line = line.replacing(/\[([^\]]+)(?:\](?:\([^)]+(\))?)?)?/) { $0.2 == nil ? String($0.0) : String($0.1) }
             line = line.replacing(/https?:\/\/[^\s)]+/) { match in
                 URL(string: String(match.0).trimmingCharacters(in: CharacterSet(charactersIn: ".,;:")))?.host() ?? ""
             }

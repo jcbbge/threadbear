@@ -91,52 +91,85 @@ public struct ThreadSections: Sendable, Equatable {
     /// Starred takes a starred thread from all of these but Archived: Mike
     /// archived it, so it's done with.
     public static func build(_ threads: some Sequence<ThreadSummary>, now: Date, wakes: [String: Schedule] = [:], order: InboxOrder = .needsYou) -> ThreadSections {
+        #if DEBUG
+        buildCount += 1
+        #endif
         var sections = ThreadSections()
         for thread in threads {
-            if thread.isArchived {
-                sections.archived.append(thread)
-            } else if thread.isStarred {
-                sections.starred.append(thread)
-            } else if thread.isSnoozed(at: now) {
-                sections.hibernating.append(thread)
-            } else if thread.reviewWaiting || thread.status == .waiting || thread.waitingOnMike || (thread.needsYou && !thread.isWorkingInBackground) {
-                sections.inbox.append(thread)
-            } else if thread.status == .running || thread.status == .starting || thread.isWorkingInBackground {
-                sections.running.append(thread)
-            } else if thread.status == .idle, thread.needs != "you", thread.waitingForRoom == nil, wakes[thread.id] != nil {
-                sections.hibernating.append(thread)
-            } else {
-                sections.inbox.append(thread)
+            switch section(of: thread, now: now, wakes: wakes) {
+            case .starred: sections.starred.append(thread)
+            case .inbox: sections.inbox.append(thread)
+            case .running: sections.running.append(thread)
+            case .hibernating: sections.hibernating.append(thread)
+            case .archived: sections.archived.append(thread)
             }
         }
-        let newestFirst: (ThreadSummary, ThreadSummary) -> Bool = {
-            $0.lastActivityAt != $1.lastActivityAt ? $0.lastActivityAt > $1.lastActivityAt : $0.id < $1.id
-        }
-        sections.starred.sort {
-            let (a, b) = ($0.starredAt ?? .distantFuture, $1.starredAt ?? .distantFuture)
-            return a != b ? a < b : $0.id < $1.id
-        }
+        // Each sort pulls its keys out first. A summary has dozens of fields,
+        // most of them counted references, and comparing summaries copied two
+        // of them per comparison: with 877 archived threads that was most of
+        // what a thread update cost the main thread (THREADBEAR-1B).
+        typealias Activity = (Date, String)
+        let activity: (ThreadSummary) -> Activity = { ($0.lastActivityAt, $0.id) }
+        let newestFirst: (Activity, Activity) -> Bool = { $0.0 != $1.0 ? $0.0 > $1.0 : $0.1 < $1.1 }
+        let starredAt: (ThreadSummary) -> Activity = { ($0.starredAt ?? .distantFuture, $0.id) }
+        let oldestStarFirst: (Activity, Activity) -> Bool = { $0.0 != $1.0 ? $0.0 < $1.0 : $0.1 < $1.1 }
+        sections.starred.sort(key: starredAt, by: oldestStarFirst)
         switch order {
         case .needsYou:
-            sections.inbox.sort {
-                let (a, b) = (urgency($0), urgency($1))
-                return a != b ? a < b : newestFirst($0, $1)
-            }
+            let urgent: (ThreadSummary) -> (Int, Activity) = { (urgency($0), activity($0)) }
+            let mostUrgent: ((Int, Activity), (Int, Activity)) -> Bool = { $0.0 != $1.0 ? $0.0 < $1.0 : newestFirst($0.1, $1.1) }
+            sections.inbox.sort(key: urgent, by: mostUrgent)
         case .newest:
-            sections.inbox.sort(by: newestFirst)
+            sections.inbox.sort(key: activity, by: newestFirst)
         case .oldest:
-            sections.inbox.sort { newestFirst($1, $0) }
+            let oldestFirst: (Activity, Activity) -> Bool = { newestFirst($1, $0) }
+            sections.inbox.sort(key: activity, by: oldestFirst)
         }
-        sections.running.sort(by: newestFirst)
+        sections.running.sort(key: activity, by: newestFirst)
         // A snooze's time, or for one waiting on a schedule its next run.
         // Back on restart has no time, so it goes last with the topics.
-        let wakesAt: (ThreadSummary) -> Date = { $0.snoozedUntil ?? wakes[$0.id]?.nextRunAt ?? .distantFuture }
-        sections.hibernating.sort {
-            let (a, b) = (wakesAt($0), wakesAt($1))
-            return a != b ? a < b : newestFirst($0, $1)
-        }
-        sections.archived.sort(by: lastArchived)
+        let wakesAt: (ThreadSummary) -> (Date, Activity) = { ($0.snoozedUntil ?? wakes[$0.id]?.nextRunAt ?? .distantFuture, activity($0)) }
+        let soonestToWake: ((Date, Activity), (Date, Activity)) -> Bool = { $0.0 != $1.0 ? $0.0 < $1.0 : newestFirst($0.1, $1.1) }
+        sections.hibernating.sort(key: wakesAt, by: soonestToWake)
+        let archivedAt: (ThreadSummary) -> Date = { $0.archivedAt ?? .distantPast }
+        let lastArchived: (Date, Date) -> Bool = { $0 > $1 }
+        sections.archived.sort(key: archivedAt, by: lastArchived)
         return sections
+    }
+
+    #if DEBUG
+    /// How many times `build` has run, for tests that hold a thread update
+    /// to one sort of every thread.
+    nonisolated(unsafe) public static var buildCount = 0
+    #endif
+
+    /// Where `build` puts a thread.
+    private static func section(of thread: ThreadSummary, now: Date, wakes: [String: Schedule]) -> InboxSection {
+        if thread.isArchived { return .archived }
+        if thread.isStarred { return .starred }
+        if thread.isSnoozed(at: now) { return .hibernating }
+        if thread.reviewWaiting || thread.status == .waiting || thread.waitingOnMike || (thread.needsYou && !thread.isWorkingInBackground) { return .inbox }
+        if thread.status == .running || thread.status == .starting || thread.isWorkingInBackground { return .running }
+        if thread.status == .idle, thread.needs != "you", thread.waitingForRoom == nil, wakes[thread.id] != nil { return .hibernating }
+        return .inbox
+    }
+
+    /// `build(...).needsYou.count` without sorting anything: the Dock badge
+    /// asks on every thread update and only wants the number.
+    public static func needsYouCount(_ threads: some Sequence<ThreadSummary>, now: Date) -> Int {
+        var count = 0
+        for thread in threads where wantsYou(thread) {
+            switch section(of: thread, now: now, wakes: [:]) {
+            case .inbox: count += 1
+            case .starred where thread.snoozedUntil == nil: count += 1
+            default: break
+            }
+        }
+        return count
+    }
+
+    private static func wantsYou(_ thread: ThreadSummary) -> Bool {
+        thread.reviewWaiting || thread.status == .waiting || thread.needsYou
     }
 
     /// For each thread a schedule will message by itself, the one due
@@ -167,7 +200,7 @@ public struct ThreadSections: Sendable, Equatable {
     /// doesn't take one out of it, unless it's hibernating (the runner clears
     /// `snoozedUntil` when it wakes), which it wouldn't count for either.
     public var needsYou: [ThreadSummary] {
-        (starred.filter { $0.snoozedUntil == nil } + inbox).filter { $0.reviewWaiting || $0.status == .waiting || $0.needsYou }
+        (starred.filter { $0.snoozedUntil == nil } + inbox).filter(Self.wantsYou)
     }
 
     /// The live threads, not the ones put away.
@@ -185,10 +218,6 @@ public struct ThreadSections: Sendable, Equatable {
 
     private static func soonestToWake(_ a: ThreadSummary, _ b: ThreadSummary) -> Bool {
         (a.snoozedUntil ?? .distantFuture) < (b.snoozedUntil ?? .distantFuture)
-    }
-
-    private static func lastArchived(_ a: ThreadSummary, _ b: ThreadSummary) -> Bool {
-        (a.archivedAt ?? .distantPast) > (b.archivedAt ?? .distantPast)
     }
 
     /// Each section cut down to the threads a search matches, in the same
@@ -217,13 +246,23 @@ public struct ThreadSections: Sendable, Equatable {
     }
 }
 
+private extension Array {
+    /// Sorts by keys pulled out once each, moving each element only at the
+    /// end, for elements too big to copy on every comparison.
+    mutating func sort<Key>(key: (Element) -> Key, by inOrder: (Key, Key) -> Bool) {
+        let keys = map(key)
+        let order = indices.sorted { inOrder(keys[$0], keys[$1]) }
+        self = order.map { self[$0] }
+    }
+}
+
 /// Short relative times for the sidebar: "now", "5m", "3h", "Mon", "12 Oct".
 public enum RelativeTime {
     public static func short(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
         let seconds = now.timeIntervalSince(date)
         if seconds < 60 { return "now" }
-        if seconds < 3600 { return "\(Int(seconds / 60))m" }
-        if seconds < 86_400 { return "\(Int(seconds / 3600))h" }
+        if seconds < 3600 { return "\(Int(saturating: seconds / 60))m" }
+        if seconds < 86_400 { return "\(Int(saturating: seconds / 3600))h" }
         if seconds < 6 * 86_400 {
             return date.formatted(Date.FormatStyle(calendar: calendar).weekday(.abbreviated))
         }
@@ -243,8 +282,8 @@ public enum RelativeTime {
 
     /// "1m 12s", "850 ms", "2h 4m".
     public static func duration(milliseconds: Double) -> String {
-        if milliseconds < 1000 { return "\(Int(milliseconds)) ms" }
-        let total = Int(milliseconds / 1000)
+        if milliseconds < 1000 { return "\(Int(saturating: milliseconds)) ms" }
+        let total = Int(saturating: milliseconds / 1000)
         if total < 60 { return "\(total)s" }
         if total < 3600 { return "\(total / 60)m \(total % 60)s" }
         return "\(total / 3600)h \((total % 3600) / 60)m"
@@ -277,7 +316,10 @@ public enum PreviewText {
     public static func plain(_ text: String) -> String {
         var line = text
         // [label](url) reads as the label.
-        line = line.replacingOccurrences(of: #"!?\[([^\]]*)\]\([^)]*\)"#, with: "$1", options: .regularExpression)
+        // A `[` with no link after it uses up what it was tried against,
+        // rather than every `[` being tried to the end again, which was
+        // quadratic (cross-lab review, 7 Nov 2026). The same links match.
+        line = line.replacing(/!?\[([^\]]*)(?:\]\([^)]*(\))?)?/) { $0.2 == nil ? String($0.0) : String($0.1) }
         // Heading and quote markers wherever a line started (the preview has
         // its newlines folded into spaces, so look after any whitespace too).
         line = line.replacingOccurrences(of: #"(^|\s)(#{1,6}|>)\s+"#, with: "$1", options: .regularExpression)

@@ -19,6 +19,8 @@ import type { Logger } from './log.ts';
 import { currentLink, readRelease, readState, type ReleaseJson } from './release.ts';
 import type { RestartResult } from './restart.ts';
 import { atomicWriteFileSync, readJsonSync } from './fsutil.ts';
+import { inBackground } from './background.ts';
+import type { UpdateFailure } from './fix-update.ts';
 
 export const CHECK_INTERVAL_MS = 5 * 60_000;
 // After main's ref changes in the checkout (a commit or merge landing), the
@@ -78,6 +80,10 @@ export type UpdateDeps = {
   clock: Clock;
   log: Logger;
   notice: (level: 'info' | 'warning' | 'error', message: string) => void;
+  // A failed build or backend deploy: starts a thread to fix it
+  // (fix-update.ts) in place of the notice. False, or a throw, and the
+  // notice is said instead.
+  onFailed?: (f: UpdateFailure) => boolean;
   // Restarter.request with when: 'idle'.
   restart: (p: { release: string; reason: string; backgroundWaitMs: number }) => RestartResult;
   pendingRestart: () => boolean;
@@ -302,7 +308,8 @@ export function runBackendDeploy(repoDir: string, runnerDir: string, home: strin
       resolve({ ok: false, error: `couldn't open ${logFile}: ${(e as Error).message}` });
       return;
     }
-    const child = spawn(process.execPath, [script, '--home', home, '--repo', repoDir, '--commit', commit], { cwd: repoDir, env, stdio: ['ignore', fd, fd] });
+    // Background priority (background.ts): it builds the backend from main.
+    const child = spawn(...inBackground(process.execPath, [script, '--home', home, '--repo', repoDir, '--commit', commit]), { cwd: repoDir, env, stdio: ['ignore', fd, fd] });
     fs.closeSync(fd);
     child.on('error', (e) => resolve({ ok: false, error: e.message }));
     child.on('close', (code, signal) => {
@@ -333,7 +340,8 @@ export function runDeploy(runnerDir: string, home: string, logFile: string, foll
       resolve({ ok: false, error: `couldn't open ${logFile}: ${(e as Error).message}` });
       return;
     }
-    const child = spawn(process.execPath, [path.join(runnerDir, 'scripts', 'deploy.mjs'), '--no-restart', '--home', home, '--follow', follow], {
+    // Background priority (background.ts): the release build is npm ci and tsc.
+    const child = spawn(...inBackground(process.execPath, [path.join(runnerDir, 'scripts', 'deploy.mjs'), '--no-restart', '--home', home, '--follow', follow]), {
       cwd: runnerDir,
       env,
       stdio: ['ignore', fd, fd],
@@ -488,7 +496,10 @@ export class RunnerUpdater {
         this.backendFailed = b.ok ? undefined : (b.error ?? 'unknown error');
         if (!b.ok) {
           log.error('could not deploy the backend at main', { commit: main.short, error: this.backendFailed });
-          this.deps.notice('warning', `The Convex backend couldn't be deployed at main ${main.short} (${main.subject}): ${this.backendFailed}. The runner stays where it is until main changes. The output is in ${backendLogPath(home)}.`);
+          this.failed(
+            { kind: 'backend', commit: main.commit, short: main.short, subject: main.subject, error: this.backendFailed ?? 'unknown error', logFile: backendLogPath(home) },
+            `The Convex backend couldn't be deployed at main ${main.short} (${main.subject}): ${this.backendFailed}. The runner stays where it is until main changes. The output is in ${backendLogPath(home)}.`,
+          );
         }
       }
       // A runner newer than its backend could write what the backend can't
@@ -532,7 +543,10 @@ export class RunnerUpdater {
         this.reason = result.error;
         atomicWriteFileSync(updateFilePath(home), JSON.stringify({ failed: { tree: main.tree, buildTree: main.buildTree, commit: main.commit, at: this.checkedAt, error: result.error } } as UpdateFile, null, 2) + '\n');
         log.error('could not build a release of main', { commit: main.short, error: result.error });
-        this.deps.notice('warning', `The runner couldn't update to main at ${main.short} (${main.subject}): ${result.error}. The output is in ${updateLogPath(home)}.`);
+        this.failed(
+          { kind: 'build', commit: main.commit, short: main.short, subject: main.subject, error: result.error, logFile: updateLogPath(home) },
+          `The runner couldn't update to main at ${main.short} (${main.subject}): ${result.error}. The output is in ${updateLogPath(home)}.`,
+        );
         return decision;
       }
       this.releaseBuilt = result.id;
@@ -549,6 +563,16 @@ export class RunnerUpdater {
       this.busy = false;
       this.deps.onChange?.();
     }
+  }
+
+  // A thread to fix it when one can be started, else the notice.
+  private failed(f: UpdateFailure, notice: string): void {
+    try {
+      if (this.deps.onFailed?.(f)) return;
+    } catch (e) {
+      this.deps.log.warn('could not start a thread to fix the update', { error: String(e) });
+    }
+    this.deps.notice('warning', notice);
   }
 
   // The trees of releases that crashed at startup (deploy.mjs's `crashed`

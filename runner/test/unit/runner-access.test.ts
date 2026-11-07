@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { convexPoster, forbiddenText } from '../../src/sync.ts';
-import { ACCESS, actsAs, callerFrom, mayCall, mayClaim, mayFinish, mayTake, mayTouch, mayUseStorage, mayWrite, ownsCard, sameKey, type Caller } from '../../../convex/runnerAccess.ts';
+import { ACCESS, actsAs, badRunnerStats, callerFrom, isIsoTime, mayCall, mayClaim, mayFinish, mayTake, mayTouch, mayUseStorage, mayWrite, ownsCard, sameKey, wholeIn, type Caller } from '../../../convex/runnerAccess.ts';
 
 const OWNER_KEY = 'owner-key-of-the-deployment';
 const M5 = 'm5runner0001';
@@ -163,4 +163,24 @@ test("the runner tells a runner key's refusal from other errors, over HTTP and f
   assert.equal(forbiddenText(new Error(`[Request ID: 1] Server Error Uncaught ConvexError: {"kind":"forbidden","message":"no"}`)), 'no');
   assert.equal(forbiddenText(new Error('bad runner key')), undefined);
   assert.equal(forbiddenText(Object.assign(new Error('x'), { data: { kind: 'auth', message: 'bad runner key' } })), undefined);
+});
+
+// Daybreak, 7 Nov 2026: another runner's heartbeat startedAt of
+// "2026-11-05T01:00:00+////" and its stats' cores of 1e20 each stopped the
+// Mac app. The backend keeps them out (sync:heartbeat, sync:setRunnerStats).
+test("a runner key's startedAt has to be a time, and its figures in range", () => {
+  for (const ok of ['2026-11-05T01:00:00.000Z', '2026-11-05T01:00:00Z', '2026-11-05T01:00:00+01:30', '2026-11-05T01:00:00-0130', '2026-11-05T01:00:00.123456789Z', '2026-11-05T01:00:00']) {
+    assert.ok(isIsoTime(ok), ok);
+  }
+  for (const bad of ['2026-11-05T01:00:00+////', '2026-11-05T01:00:00+0a:00', '2026-11-05T01:00:00+24:00', '2026-13-05T01:00:00Z', 'yesterday', '', '2026-11-05T01:00:00Z ', '2026-11-05T01:00:00Z\n', `2026-11-05T01:00:00.${'1'.repeat(80)}Z`, 42]) {
+    assert.ok(!isIsoTime(bad), String(bad));
+  }
+  assert.ok(wholeIn(3, 10) && wholeIn(0, 10) && !wholeIn(-1, 10) && !wholeIn(1.5, 10) && !wholeIn(11, 10) && !wholeIn(Infinity, 10) && !wholeIn('3', 10));
+  const stats = { cpuPercent: 12, cores: 8, memUsed: 1e9, memTotal: 2e9, diskFree: 1e10, diskTotal: 2e10, load1: 1.5, uptimeSec: 3600 };
+  assert.equal(badRunnerStats(stats), undefined);
+  const { load1: _, ...noLoad } = stats;
+  assert.equal(badRunnerStats(noLoad), undefined);
+  for (const [field, value] of [['cores', 1e20], ['cores', 8.5], ['cores', -1], ['cpuPercent', 101], ['memUsed', 1e300], ['diskFree', -5], ['uptimeSec', Infinity], ['load1', NaN], ['memTotal', undefined]] as const) {
+    assert.match(badRunnerStats({ ...stats, [field]: value }) ?? '', new RegExp(`stats\\.${field}`), `${field} ${value}`);
+  }
 });

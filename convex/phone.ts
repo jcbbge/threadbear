@@ -4,24 +4,35 @@
 // which the owning runner applies (step 3 of docs/convex-backend.md) and
 // marks done or failed. Nothing here touches a runner directly.
 import { ConvexError, v, type Infer } from 'convex/values';
-import { mutation, query, type QueryCtx } from './_generated/server';
+import { internalMutation, internalQuery, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Doc, Id } from './_generated/dataModel';
-import { threadFields, views } from './schema';
-import { checkPhoneToken, hasLiveKey, runnerStatsRows, watchRunnersFor } from './lib';
+import { messageButton, threadFields, views } from './schema';
+import { checkPhoneToken, hasLiveKey, pageLimit, readRunnerOrder, runnerStatsRows, saveRunnerOrder, sha256, watchRunnersFor } from './lib';
 import { API_VERSION } from './version';
+import { pushOff } from './pushHealth';
 import { imagesFrom, phoneImage, replyImagesFrom } from './share';
-import { runnerName } from './sync';
+import { deleteIfUnused, endCommandFiles, eventBodyAnswer, finishedArgs, readEventBody, runnerName } from './sync';
+import { docBytes } from './runnerAccess';
 import { HEADS_MARK } from './projectHeads';
+import { notesOf } from './projectNotes';
 
 // A runner not heard from for this long is offline, and a command with no
 // runnerId goes to the main one still online (mainRunner).
 const ONLINE_MS = 3 * 60_000;
 const DEN_LIMIT = 100;
 const MAX_COMMAND_IMAGES = 6;
+// What may wait for one runner (queue): a runner asleep for a night gets a
+// few dozen; past these a phone's next one is refused until it takes some.
+// Bytes too, as one command can be most of a megabyte, and the runner reads
+// them all in one query (sync:pendingCommands).
+const WAITING_PER_RUNNER = 200;
+const WAITING_BYTES_PER_RUNNER = 8 * 1024 * 1024;
+// phone:waiting reads at most this many of a thread's pending sends, and as many taken.
+const WAITING_LIMIT = 50;
 
 const row = v.object({ ...threadFields, view: v.union(...views.map((x) => v.literal(x))) });
 const message = v.object({ seq: v.number(), role: v.union(v.literal('user'), v.literal('assistant')), text: v.string(), origin: v.optional(v.string()), at: v.string() });
-const pageMessage = v.object({ seq: v.number(), role: v.union(v.literal('user'), v.literal('assistant'), v.literal('tool')), text: v.string(), origin: v.optional(v.string()), toolKind: v.optional(v.string()), summary: v.optional(v.boolean()), turn: v.optional(v.string()), wokeBy: v.optional(v.array(v.object({ kind: v.string(), description: v.string() }))), at: v.string() });
+const pageMessage = v.object({ seq: v.number(), role: v.union(v.literal('user'), v.literal('assistant'), v.literal('tool')), text: v.string(), origin: v.optional(v.string()), toolKind: v.optional(v.string()), summary: v.optional(v.boolean()), turn: v.optional(v.string()), wokeBy: v.optional(v.array(v.object({ kind: v.string(), description: v.string() }))), buttons: v.optional(v.array(messageButton)), at: v.string() });
 // phone:thread's newest text messages for an old phone, and how far back it
 // looks past tool rows for them.
 const MESSAGES_SHOWN = 20;
@@ -31,6 +42,11 @@ const PAGE_DEFAULT = 50;
 // The website asks for more as you scroll back by raising limit, so one
 // live query covers everything it shows.
 const PAGE_MAX = 2000;
+// Without tools: true, how many tool rows a page may look past for its text
+// messages. Most rows are one-line tool rows, so a page stops at this many
+// read whatever it found, and says there's more.
+const TOOL_ROWS_SKIPPED = 4000;
+const PAGE_BYTES = 8 * 1024 * 1024;
 
 function strip<T extends { _id: unknown; _creationTime: unknown }>(doc: T): Omit<T, '_id' | '_creationTime'> {
   const { _id, _creationTime, ...rest } = doc;
@@ -56,29 +72,65 @@ function stripThread(doc: Doc<'threads'>): PhoneThread {
 
 // apiVersion is the backend's (version.ts), so the app can say "update
 // Threadbear on your Mac" when it's talking to a backend older than it needs.
+// pushOff: this backend can't send notifications (pushHealth.ts), so the
+// phone's Settings says so. An older phone ignores it.
 export const me = query({
   args: { token: v.string() },
-  returns: v.object({ name: v.string(), expiresAt: v.string(), apiVersion: v.number() }),
+  returns: v.object({ name: v.string(), expiresAt: v.string(), apiVersion: v.number(), pushOff: v.optional(v.boolean()) }),
   handler: async (ctx, { token }) => {
     const t = await checkPhoneToken(ctx, token);
-    return { name: t.name, expiresAt: new Date(t.expiresAt).toISOString(), apiVersion: API_VERSION };
+    return { name: t.name, expiresAt: new Date(t.expiresAt).toISOString(), apiVersion: API_VERSION, ...(pushOff(process.env) ? { pushOff: true } : {}) };
   },
 });
 
 export const runners = query({
   args: { token: v.string() },
   // release to pressure since API 45, for the website's runner page. An older
-  // phone ignores them.
-  returns: v.array(v.object({ runnerId: v.string(), name: v.string(), version: v.string(), lastSeenAt: v.string(), draining: v.boolean(), release: v.optional(v.string()), startedAt: v.optional(v.string()), threadCount: v.optional(v.number()), pressure: v.optional(v.string()) })),
+  // phone ignores them. In Mike's order since API 56 (orderedRunners), with
+  // `placed` on the ones he's put in it and `main` on the main Mac: only
+  // those are ever a new thread's automatic choice.
+  returns: v.array(v.object({ runnerId: v.string(), name: v.string(), version: v.string(), lastSeenAt: v.string(), draining: v.boolean(), release: v.optional(v.string()), startedAt: v.optional(v.string()), threadCount: v.optional(v.number()), pressure: v.optional(v.string()), placed: v.optional(v.boolean()), main: v.optional(v.boolean()) })),
   handler: async (ctx, { token }) => {
     await checkPhoneToken(ctx, token);
-    const out = [];
-    for await (const r of ctx.db.query('runners')) {
-      out.push({ runnerId: r.runnerId, name: r.name, version: r.version, lastSeenAt: new Date(r.lastSeenAt).toISOString(), draining: r.draining, ...(r.release ? { release: r.release } : {}), startedAt: r.startedAt, threadCount: r.threadCount, ...(r.pressure ? { pressure: r.pressure } : {}) });
-    }
-    return out;
+    const saved = await readRunnerOrder(ctx);
+    const runners = await orderedRunners(ctx);
+    // `main`: the owner-key Mac a new thread waits for when none of the
+    // placed ones is online, so the phone never falls back to just "the
+    // first listed", which with no main Mac known is a runner key's.
+    const main = await mainOwnerRunner(ctx, runners, false);
+    return runners.map((r) => ({ runnerId: r.runnerId, name: r.name, version: r.version, lastSeenAt: new Date(r.lastSeenAt).toISOString(), draining: r.draining, ...(r.release ? { release: r.release } : {}), startedAt: r.startedAt, threadCount: r.threadCount, ...(r.pressure ? { pressure: r.pressure } : {}), ...(saved.includes(r.runnerId) ? { placed: true } : {}), ...(r.runnerId === main ? { main: true } : {}) }));
   },
 });
+
+// Mike's order for his runners (API 57), from the phone's Settings. The
+// phone sends every runner it lists; ids it doesn't know of yet are kept as
+// sent, and a runner left out goes after the ones in it.
+export const setRunnerOrder = mutation({
+  args: { token: v.string(), runnerIds: v.array(v.string()) },
+  returns: v.null(),
+  handler: async (ctx, { token, runnerIds }) => {
+    await checkPhoneToken(ctx, token);
+    await saveRunnerOrder(ctx, runnerIds);
+    return null;
+  },
+});
+
+// Every runner, in Mike's order: the ones he's placed as he placed them, then
+// the rest with the main Mac first (isMain) and the others as they first
+// heartbeated. Never by anything a runner says of itself, like its thread
+// count, so a runner key can't push itself up the list.
+async function orderedRunners(ctx: QueryCtx): Promise<Doc<'runners'>[]> {
+  const all: Doc<'runners'>[] = [];
+  for await (const r of ctx.db.query('runners')) all.push(r);
+  const saved = await readRunnerOrder(ctx);
+  const main = await mainOwnerRunner(ctx, all, false);
+  const rank = (r: Doc<'runners'>) => {
+    const i = saved.indexOf(r.runnerId);
+    return i >= 0 ? i : saved.length + (r.runnerId === main ? 0 : 1);
+  };
+  // Array sort is stable, so ties keep the table's creation order.
+  return all.sort((a, b) => rank(a) - rank(b));
+}
 
 // Newest activity first. The den is capped at DEN_LIMIT.
 export const threads = query({
@@ -236,6 +288,45 @@ export const threadRow = query({
   },
 });
 
+// One tool's output, input and diffs, when someone opens it (API 52), from a runner
+// with full sync on: never a live query, and never on a shared page. Null: it's kept
+// on the runner. Old phones never ask.
+export const eventBody = query({
+  args: { token: v.string(), threadId: v.string(), seq: v.number() },
+  returns: eventBodyAnswer,
+  handler: async (ctx, { token, threadId, seq }) => {
+    await checkPhoneToken(ctx, token);
+    return readEventBody(ctx, threadId, seq);
+  },
+});
+
+// Asks the thread's runner to upload one picture a tool handed back, for a day
+// (API 52). It checks the picture is that tool's, in that thread's media folder.
+export const requestPicture = mutation({
+  args: { token: v.string(), threadId: v.string(), seq: v.number(), index: v.number() },
+  returns: v.id('commands'),
+  handler: async (ctx, { token, threadId, seq, index }) => {
+    await checkPhoneToken(ctx, token);
+    if (!Number.isSafeInteger(seq) || !Number.isSafeInteger(index) || seq < 0 || index < 0 || index > 100) throw new ConvexError({ kind: 'invalid', message: 'no such picture' });
+    const t = await ctx.db.query('threads').withIndex('by_threadId', (q) => q.eq('threadId', threadId)).unique();
+    if (!t) throw new ConvexError({ kind: 'notFound', message: 'no such thread' });
+    return queue(ctx, t.runnerId, 'picture', threadId, { seq, index });
+  },
+});
+
+// That picture, once it's up.
+export const heldPicture = query({
+  args: { token: v.string(), threadId: v.string(), seq: v.number(), index: v.number() },
+  returns: v.union(v.null(), v.object({ url: v.string(), mediaType: v.string(), width: v.optional(v.number()), height: v.optional(v.number()) })),
+  handler: async (ctx, { token, threadId, seq, index }) => {
+    await checkPhoneToken(ctx, token);
+    const img = await ctx.db.query('heldPictures').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId).eq('seq', seq).eq('index', index)).first();
+    const url = img ? await ctx.storage.getUrl(img.storageId) : null;
+    if (!img || !url) return null;
+    return { url, mediaType: img.mediaType, ...(img.width ? { width: img.width } : {}), ...(img.height ? { height: img.height } : {}) };
+  },
+});
+
 // A page of a thread's messages, newest first in the reading but returned
 // oldest first: the newest `limit` with no beforeSeq (live, so new messages
 // arrive by themselves), or the `limit` before beforeSeq. Tool rows (one line
@@ -251,24 +342,35 @@ export const messages = query({
   returns: v.object({ messages: v.array(pageMessage), hasMore: v.boolean(), images: v.optional(v.array(phoneImage)) }),
   handler: async (ctx, { token, threadId, beforeSeq, limit, tools, noImages }) => {
     await checkPhoneToken(ctx, token);
-    const want = Math.max(1, Math.min(PAGE_MAX, Math.floor(limit ?? PAGE_DEFAULT)));
-    const out: { seq: number; role: 'user' | 'assistant' | 'tool'; text: string; origin?: string; toolKind?: string; summary?: boolean; turn?: string; at: string }[] = [];
-    let hasMore = false;
+    const want = pageLimit(limit, PAGE_DEFAULT, PAGE_MAX);
+    const out: { seq: number; role: 'user' | 'assistant' | 'tool'; text: string; origin?: string; toolKind?: string; summary?: boolean; turn?: string; buttons?: Doc<'messages'>['buttons']; at: string }[] = [];
     const q = ctx.db
       .query('messages')
       .withIndex('by_thread_seq', (x) => (beforeSeq === undefined ? x.eq('threadId', threadId) : x.eq('threadId', threadId).lt('seq', beforeSeq)))
       .order('desc');
+    // Read as far as the page needs and no further, and never more than one row
+    // past the page and the tool rows it may look past, whatever was asked.
+    const most = want + 1 + (tools ? 0 : TOOL_ROWS_SKIPPED);
+    let read = 0;
+    let bytes = 0;
+    let hasMore = false;
     for await (const m of q) {
+      // And bytes: a page of big rows stops short, saying there's more, rather than going past what a query may read.
+      if (++read > most || (bytes += docBytes(m)) > PAGE_BYTES) {
+        hasMore = true;
+        break;
+      }
       if (m.role === 'tool' && !tools) continue;
       if (out.length >= want) {
         hasMore = true;
         break;
       }
-      out.push({ seq: m.seq, role: m.role, text: m.text, ...(m.origin ? { origin: m.origin } : {}), ...(m.toolKind ? { toolKind: m.toolKind } : {}), ...(m.summary ? { summary: true } : {}), ...(m.turn ? { turn: m.turn } : {}), ...(m.wokeBy ? { wokeBy: m.wokeBy } : {}), at: m.at });
+      out.push({ seq: m.seq, role: m.role, text: m.text, ...(m.origin ? { origin: m.origin } : {}), ...(m.toolKind ? { toolKind: m.toolKind } : {}), ...(m.summary ? { summary: true } : {}), ...(m.turn ? { turn: m.turn } : {}), ...(m.wokeBy ? { wokeBy: m.wokeBy } : {}), ...(m.buttons?.length ? { buttons: m.buttons } : {}), at: m.at });
     }
     out.reverse();
     const from = hasMore || beforeSeq !== undefined ? out[0]?.seq ?? 0 : 0;
-    const images = tools && !noImages && out.length ? [...(await imagesFrom(ctx, threadId, from)), ...(await replyImagesFrom(ctx, threadId, from))] : [];
+    // The page's pictures only: an older page's stop where the next page starts.
+    const images = tools && !noImages && out.length ? [...(await imagesFrom(ctx, threadId, from, beforeSeq)), ...(await replyImagesFrom(ctx, threadId, from, beforeSeq))] : [];
     return { messages: out, hasMore, ...(images.length ? { images } : {}) };
   },
 });
@@ -281,6 +383,7 @@ export const images = query({
   returns: v.array(phoneImage),
   handler: async (ctx, { token, threadId, from }) => {
     await checkPhoneToken(ctx, token);
+    if (!Number.isFinite(from)) throw new ConvexError({ kind: 'invalid', message: 'from must be a number' });
     return [...(await imagesFrom(ctx, threadId, from)), ...(await replyImagesFrom(ctx, threadId, from))];
   },
 });
@@ -380,7 +483,7 @@ export const project = query({
     const p = await ctx.db.query('projects').withIndex('by_runner_id', (q) => q.eq('runnerId', runnerId).eq('id', id)).unique();
     if (!p) return null;
     const { icon: _icon, ...rest } = strip(p);
-    return { ...rest, ...(await iconOf(ctx, p)) };
+    return { ...rest, notes: await notesOf(ctx, p), ...(await iconOf(ctx, p)) };
   },
 });
 
@@ -395,7 +498,7 @@ export const projectThreads = query({
   returns: v.array(row),
   handler: async (ctx, { token, projectId, limit }) => {
     await checkPhoneToken(ctx, token);
-    const n = Math.max(1, Math.min(PROJECT_THREADS_MAX, Math.floor(limit ?? PAGE_DEFAULT)));
+    const n = pageLimit(limit, PAGE_DEFAULT, PROJECT_THREADS_MAX);
     const links = await ctx.db
       .query('projectThreads')
       .withIndex('by_project', (q) => q.eq('projectId', projectId))
@@ -529,9 +632,62 @@ export const send = mutation({
   args: { token: v.string(), threadId: v.string(), text: v.string(), answers: v.optional(v.array(v.object({ action: v.string(), answer: v.string() }))), images: v.optional(v.array(v.id('_storage'))) },
   returns: v.id('commands'),
   handler: async (ctx, { token, threadId, text, answers, images }) => {
-    await checkPhoneToken(ctx, token);
+    const me = await checkPhoneToken(ctx, token);
     const t = await findThread(ctx, threadId);
-    return queue(ctx, t.runnerId, 'send', threadId, { text, ...(answers?.length ? { answers } : {}), ...(await commandImages(ctx, images)) });
+    return queue(ctx, t.runnerId, 'send', threadId, { text, ...(answers?.length ? { answers } : {}), ...(await commandImages(ctx, me.id, images)) });
+  },
+});
+
+// A thread's messages from the phone that its runner hasn't applied yet
+// (API 57), oldest first: pending ones can still be cancelled, taken ones
+// are on their way. The phone shows each as a dimmed message with its own
+// Cancel, so several sent while the Mac is asleep don't look lost.
+export const waiting = query({
+  args: { token: v.string(), threadId: v.string() },
+  returns: v.array(v.object({ commandId: v.id('commands'), state: v.union(v.literal('pending'), v.literal('taken')), text: v.string(), photos: v.number(), createdAt: v.number() })),
+  handler: async (ctx, { token, threadId }) => {
+    await checkPhoneToken(ctx, token);
+    const out = [];
+    for (const state of ['pending', 'taken'] as const) {
+      // Bounded: a phone can't usefully show more, and each row can carry a long message.
+      for (const c of await ctx.db.query('commands').withIndex('by_thread_state', (q) => q.eq('threadId', threadId).eq('state', state)).take(WAITING_LIMIT)) {
+        // The main Mac's own sends to another runner's thread (relay.ts) aren't the phone's to list or take back.
+        if (c.kind !== 'send' || c.args?.from === 'mac') continue;
+        out.push({ commandId: c._id, state, text: typeof c.args?.text === 'string' ? c.args.text : '', photos: Array.isArray(c.args?.images) ? c.args.images.length : 0, createdAt: c.createdAt });
+      }
+    }
+    return out.sort((a, b) => a.createdAt - b.createdAt);
+  },
+});
+
+// Takes back a message the runner hasn't taken yet (API 57). false once it
+// has: sync:takeCommand and this both check `pending` in one transaction, so
+// only one of them wins. The photos go too, as nothing will fetch them now.
+export const cancel = mutation({
+  args: { token: v.string(), commandId: v.id('commands') },
+  returns: v.boolean(),
+  handler: async (ctx, { token, commandId }) => {
+    await checkPhoneToken(ctx, token);
+    const c = await ctx.db.get(commandId);
+    if (!c || c.kind !== 'send' || c.args?.from === 'mac' || c.state !== 'pending') return false;
+    await ctx.db.patch(commandId, { state: 'failed', note: 'Cancelled', doneAt: Date.now(), args: finishedArgs(c.args) });
+    await endCommandFiles(ctx, commandId);
+    for (const image of Array.isArray(c.args?.images) ? c.args.images : []) await deleteIfUnused(ctx, image.storageId);
+    return true;
+  },
+});
+
+// A reply button's press (API 59, docs/protocol.md "Reply buttons"): queued
+// for the thread's runner, which calls buttons.press. A button already
+// pressed comes back as it is there, so a second tap starts nothing.
+export const press = mutation({
+  args: { token: v.string(), threadId: v.string(), buttonId: v.string() },
+  returns: v.id('commands'),
+  handler: async (ctx, { token, threadId, buttonId }) => {
+    await checkPhoneToken(ctx, token);
+    if (!/^[a-z0-9]{8}$/.test(buttonId)) throw new ConvexError({ kind: 'invalid', message: 'no such button' });
+    const t = await findThread(ctx, threadId);
+    return queue(ctx, t.runnerId, 'press', threadId, { buttonId });
   },
 });
 
@@ -614,38 +770,121 @@ export const share = mutation({
   },
 });
 
-// A new thread. With no runnerId, the main runner still online takes it
-// (or the first one back, as "any").
+// A new thread. With no runnerId, the first runner online in Mike's order
+// takes it, else the main runner still online (or the first one back, as
+// "any"): mainRunner.
 export const create = mutation({
   args: { token: v.string(), text: v.string(), runnerId: v.optional(v.string()), cwd: v.optional(v.string()), accountId: v.optional(v.string()), model: v.optional(v.string()), effort: v.optional(v.string()), images: v.optional(v.array(v.id('_storage'))) },
   returns: v.id('commands'),
   handler: async (ctx, { token, text, runnerId, cwd, accountId, model, effort, images }) => {
-    await checkPhoneToken(ctx, token);
-    const target = runnerId || (await mainRunner(ctx));
-    return queue(ctx, target, 'create', undefined, { text, ...(cwd ? { cwd } : {}), ...(accountId ? { accountId } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(await commandImages(ctx, images)) });
+    const me = await checkPhoneToken(ctx, token);
+    const target = runnerId ? await knownRunner(ctx, runnerId) : await mainRunner(ctx);
+    return queue(ctx, target, 'create', undefined, { text, ...(cwd ? { cwd } : {}), ...(accountId ? { accountId } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(await commandImages(ctx, me.id, images)) });
   },
 });
 
 // Where the phone POSTs a photo before sending it (API 18). It's only in
-// Convex on its way to the runner: sync:finishCommand deletes it.
+// Convex on its way to the runner: sync:finishCommand deletes it. Since 7 Nov
+// 2026 that's this deployment's own /phone/upload (convex/http.ts) with a
+// one-use ticket, not Convex's upload URL, so each photo is recorded as this
+// token's (phoneUploads) and counted against its allowances, and one never
+// sent goes after a day (sync:pruneFiles). The phone POSTs to whatever URL
+// it's given and reads { storageId } back, as before.
+export const PHONE_UPLOADS = {
+  perHour: 60,
+  perDay: 300,
+  bytesPerDay: 300 * 1024 * 1024,
+  maxBytes: 10 * 1024 * 1024,
+  ticketMs: 60 * 60_000,
+} as const;
+const DAY_MS = 24 * 60 * 60_000;
+
+// This token's uploads in the last day: how many, how many in the last hour,
+// and their bytes. At most perDay + 1 rows read, each a few hundred bytes.
+async function uploadsOf(ctx: QueryCtx, tokenId: Id<'tokens'>, now: number, except?: Id<'phoneUploads'>) {
+  const rows = await ctx.db.query('phoneUploads').withIndex('by_token_issued', (q) => q.eq('tokenId', tokenId).gt('issuedAt', now - DAY_MS)).take(PHONE_UPLOADS.perDay + 1);
+  let day = 0;
+  let hour = 0;
+  let bytes = 0;
+  for (const r of rows) {
+    if (r._id === except) continue;
+    day++;
+    if (r.issuedAt > now - PHONE_UPLOADS.ticketMs) hour++;
+    bytes += r.bytes ?? 0;
+  }
+  return { day, hour, bytes };
+}
+
 export const imageUploadUrl = mutation({
   args: { token: v.string() },
   returns: v.string(),
   handler: async (ctx, { token }) => {
-    await checkPhoneToken(ctx, token);
-    return ctx.storage.generateUploadUrl();
+    const me = await checkPhoneToken(ctx, token);
+    const now = Date.now();
+    const used = await uploadsOf(ctx, me.id, now);
+    if (used.hour >= PHONE_UPLOADS.perHour || used.day >= PHONE_UPLOADS.perDay || used.bytes >= PHONE_UPLOADS.bytesPerDay) {
+      throw new ConvexError({ kind: 'rateLimited', message: 'Too many photos for now: try again later.' });
+    }
+    const site = process.env.CONVEX_SITE_URL;
+    if (!site) throw new ConvexError({ kind: 'config', message: 'CONVEX_SITE_URL is not set' });
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    const ticket = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    await ctx.db.insert('phoneUploads', { ticketHash: await sha256(ticket), tokenId: me.id, issuedAt: now });
+    return `${site.replace(/\/+$/, '')}/phone/upload?ticket=${ticket}`;
   },
 });
 
-// A photo the phone uploaded and then never sent (API 25): it uploads as soon
-// as one's picked, so taking one back out, or giving up on the message, has
-// to take its copy back too. Nothing else would ever delete it.
+// Unused, under an hour old, and its token still good: revoking a phone ends
+// the uploads it had started.
+async function livePhoneTicket(ctx: QueryCtx, ticket: string) {
+  if (!/^[0-9a-f]{48}$/.test(ticket)) return null;
+  const hash = await sha256(ticket);
+  const row = await ctx.db.query('phoneUploads').withIndex('by_hash', (q) => q.eq('ticketHash', hash)).first();
+  if (!row || row.usedAt || row.issuedAt <= Date.now() - PHONE_UPLOADS.ticketMs) return null;
+  const t = await ctx.db.get(row.tokenId);
+  return t && !t.revokedAt && t.expiresAt >= Date.now() ? row : null;
+}
+
+// For /phone/upload, before it stores anything.
+export const phoneTicketOk = internalQuery({
+  args: { ticket: v.string() },
+  returns: v.boolean(),
+  handler: async (ctx, { ticket }) => (await livePhoneTicket(ctx, ticket)) !== null,
+});
+
+// The stored file is the ticket's token's. False (the route then deletes the
+// file): a dead or used ticket, or a file over the size cap. "later": over
+// the day's bytes, which time fixes (429).
+export const redeemPhoneUpload = internalMutation({
+  args: { ticket: v.string(), storageId: v.id('_storage'), bytes: v.number() },
+  returns: v.union(v.boolean(), v.literal('later')),
+  handler: async (ctx, { ticket, storageId, bytes }) => {
+    const row = await livePhoneTicket(ctx, ticket);
+    if (!row) return false;
+    const now = Date.now();
+    // Spent whatever happens: a refused ticket can't be tried again.
+    await ctx.db.patch(row._id, { usedAt: now, bytes: Number.isFinite(bytes) && bytes >= 0 ? bytes : 0 });
+    if (!(bytes >= 0) || bytes > PHONE_UPLOADS.maxBytes) return false;
+    if ((await uploadsOf(ctx, row.tokenId, now, row._id)).bytes + bytes > PHONE_UPLOADS.bytesPerDay) return 'later';
+    await ctx.db.patch(row._id, { storageId });
+    return true;
+  },
+});
+
+// A photo this phone uploaded and then never sent (API 25): it uploads as
+// soon as one's picked, so taking one back out, or giving up on the message,
+// has to take its copy back too. Only its own (phoneUploads), and only once
+// nothing else names it (deleteIfUnused): any other file, or one already in a
+// waiting message, is left alone, quietly, as the phone has nothing to do
+// about it. Its unsent ones go after a day anyway (sync:pruneFiles).
 export const discardImage = mutation({
   args: { token: v.string(), storageId: v.id('_storage') },
   returns: v.null(),
   handler: async (ctx, { token, storageId }) => {
-    await checkPhoneToken(ctx, token);
-    if (await ctx.db.system.get(storageId)) await ctx.storage.delete(storageId);
+    const me = await checkPhoneToken(ctx, token);
+    const upload = await ctx.db.query('phoneUploads').withIndex('by_storageId', (q) => q.eq('storageId', storageId)).first();
+    if (upload?.tokenId === me.id) await deleteIfUnused(ctx, storageId);
     return null;
   },
 });
@@ -672,28 +911,45 @@ export const quickAsk = mutation({
     if (!a || a.length > 20000) throw new ConvexError({ kind: 'invalid', message: 'answer must be 1 to 20000 characters' });
     if ((sources?.length ?? 0) > 10) throw new ConvexError({ kind: 'invalid', message: 'at most 10 sources' });
     if (!Number.isFinite(askedAt)) throw new ConvexError({ kind: 'invalid', message: 'askedAt must be a time' });
-    const target = runnerId || (await mainRunner(ctx));
+    const target = runnerId ? await knownRunner(ctx, runnerId) : await mainRunner(ctx);
     return queue(ctx, target, 'quickAsk', undefined, { question: q, answer: a, sources: sources ?? [], askedAt });
   },
 });
 
-// Where a phone's new thread goes when the phone doesn't say: the online
-// runner heartbeating with the owner key (byOwner, docs/protocol.md "Runner
-// keys") with the most threads, which is the Mac Mike really works on, with
-// his repos and printer. With none online it's "any", which only the owner
-// key takes, so it waits for that Mac rather than going to one with a
-// runner key: Mike's text is for his main Mac unless he picks another.
+// Where a phone's new thread goes when the phone doesn't say: the first
+// runner online in the order Mike set on the phone (API 56; a phone from
+// before it never says). With no order, or none of its runners online, the
+// online runner heartbeating with the owner key (byOwner, docs/protocol.md
+// "Runner keys") with the most threads, which is the Mac Mike really works
+// on, with his repos and printer. With none online it's "any", which only
+// the owner key takes, so it waits for that Mac rather than going to one
+// with a runner key: Mike's text is for his main Mac unless he picks
+// another, by name or by putting it in his order.
 // (Going by the latest heartbeat once sent half of them to Bruce; going by
 // most threads alone let a runner key claim a million threads to get them.)
 async function mainRunner(ctx: QueryCtx): Promise<string> {
-  let best: { runnerId: string; threadCount: number; lastSeenAt: number } | undefined;
-  for await (const r of ctx.db.query('runners')) {
-    // A runner with a live key of its own isn't the main Mac, whatever its
-    // last heartbeat said (lib.ts hasLiveKey).
-    if (!r.byOwner || r.draining || Date.now() - r.lastSeenAt > ONLINE_MS || (await hasLiveKey(ctx, r.runnerId))) continue;
+  const all: Doc<'runners'>[] = [];
+  for await (const r of ctx.db.query('runners')) all.push(r);
+  const online = (r: Doc<'runners'>) => !r.draining && Date.now() - r.lastSeenAt <= ONLINE_MS;
+  for (const id of await readRunnerOrder(ctx)) {
+    const r = all.find((x) => x.runnerId === id);
+    if (r && online(r)) return r.runnerId;
+  }
+  return (await mainOwnerRunner(ctx, all, true)) ?? 'any';
+}
+
+// The main Mac among these runners: heartbeating with the owner key, with
+// no live key of its own (lib.ts hasLiveKey: whatever its last heartbeat
+// said, a runner with a key isn't the main Mac), the most threads first.
+// Only online ones when `onlineOnly`, as a new thread needs; the phone's
+// list (orderedRunners) puts it first asleep too.
+async function mainOwnerRunner(ctx: QueryCtx, runners: Doc<'runners'>[], onlineOnly: boolean): Promise<string | undefined> {
+  let best: Doc<'runners'> | undefined;
+  for (const r of runners) {
+    if (!r.byOwner || (onlineOnly && (r.draining || Date.now() - r.lastSeenAt > ONLINE_MS)) || (await hasLiveKey(ctx, r.runnerId))) continue;
     if (!best || r.threadCount > best.threadCount || (r.threadCount === best.threadCount && r.lastSeenAt > best.lastSeenAt)) best = r;
   }
-  return best?.runnerId ?? 'any';
+  return best?.runnerId;
 }
 
 // Older messages: the owning runner writes up to 50 text messages before
@@ -709,6 +965,11 @@ export const loadEarlier = mutation({
   },
 });
 
+// An APNs device token as the phone sends it: hex (32 bytes today; Apple
+// says it can grow, so up to 100).
+const APNS_TOKEN = /^[0-9a-fA-F]{16,200}$/;
+export const MAX_DEVICES_PER_TOKEN = 5;
+
 export const registerDevice = mutation({
   // pushKey (API 4): the phone's own key for what goes through the push
   // relay, base64 of 32 bytes. Kept from an earlier registration if left out.
@@ -716,6 +977,7 @@ export const registerDevice = mutation({
   returns: v.null(),
   handler: async (ctx, { token, apnsToken, environment, pushKey }) => {
     if (pushKey !== undefined && !/^[A-Za-z0-9+/]{43}=$/.test(pushKey)) throw new ConvexError({ kind: 'invalid', message: 'pushKey must be base64 of 32 bytes' });
+    if (!APNS_TOKEN.test(apnsToken)) throw new ConvexError({ kind: 'invalid', message: 'apnsToken must be the device token in hex' });
     const t = await checkPhoneToken(ctx, token);
     const existing = await ctx.db
       .query('devices')
@@ -723,6 +985,16 @@ export const registerDevice = mutation({
       .unique();
     const key = pushKey ?? existing?.pushKey;
     const row = { apnsToken, environment, tokenName: t.name, tokenId: t.id, updatedAt: Date.now(), ...(existing?.notify ? { notify: existing.notify } : {}), ...(key ? { pushKey: key } : {}) };
+    // A phone token's oldest registrations give way to a new one (or one it
+    // takes over from another token), so a token holds at most
+    // MAX_DEVICES_PER_TOKEN rows: a phone reinstalled gets a new APNs token,
+    // and its old row stops mattering. Without a cap one token could fill
+    // the table that pushes and revoking read.
+    if (existing?.tokenId !== t.id) {
+      const mine = await ctx.db.query('devices').withIndex('by_tokenId', (q) => q.eq('tokenId', t.id)).take(MAX_DEVICES_PER_TOKEN + 20);
+      const over = mine.length - MAX_DEVICES_PER_TOKEN + 1;
+      if (over > 0) for (const old of mine.slice(0, over)) await ctx.db.delete(old._id);
+    }
     if (existing) await ctx.db.replace(existing._id, row);
     else await ctx.db.insert('devices', row);
     return null;
@@ -757,19 +1029,44 @@ async function findThread(ctx: QueryCtx, threadId: string) {
 
 // A command's photos as the runner fetches them. The URL is worked out here
 // rather than taken from the phone, so a command can't send a runner off to
-// fetch an address of the phone's choosing.
-async function commandImages(ctx: { storage: { getUrl(id: Id<'_storage'>): Promise<string | null> } }, images: Id<'_storage'>[] | undefined) {
+// fetch an address of the phone's choosing. Each must be a photo this token
+// uploaded (phoneUploads), so a command can't name a runner's picture or
+// project icon, which finishing it would then try to delete.
+async function commandImages(ctx: QueryCtx, tokenId: Id<'tokens'>, images: Id<'_storage'>[] | undefined) {
   if (!images?.length) return {};
   if (images.length > MAX_COMMAND_IMAGES) throw new ConvexError({ kind: 'invalid', message: `at most ${MAX_COMMAND_IMAGES} photos` });
   const out = [];
+  // Each in its place, repeats too: the text's [Picture N] markers count them in order.
   for (const storageId of images) {
-    const url = await ctx.storage.getUrl(storageId);
+    const upload = await ctx.db.query('phoneUploads').withIndex('by_storageId', (q) => q.eq('storageId', storageId)).first();
+    const url = upload?.tokenId === tokenId ? await ctx.storage.getUrl(storageId) : null;
     if (!url) throw new ConvexError({ kind: 'notFound', message: 'that photo has gone' });
     out.push({ storageId, url });
   }
   return { images: out };
 }
 
-async function queue(ctx: { db: QueryCtx['db'] & { insert: any } }, runnerId: string, kind: 'send' | 'respond' | 'update' | 'create' | 'page' | 'share' | 'quickAsk' | 'schedule', threadId: string | undefined, args: Record<string, unknown>) {
-  return ctx.db.insert('commands', { runnerId, ...(threadId ? { threadId } : {}), kind, args, state: 'pending', createdAt: Date.now() });
+// A runner the phone named for a new thread: one that has heartbeated here
+// (runners), or "any". Anything else would wait for ever, as nothing takes it.
+async function knownRunner(ctx: QueryCtx, runnerId: string): Promise<string> {
+  if (runnerId === 'any') return runnerId;
+  if (runnerId.length > 100 || !(await ctx.db.query('runners').withIndex('by_runnerId', (q) => q.eq('runnerId', runnerId)).first())) throw new ConvexError({ kind: 'notFound', message: 'no such runner' });
+  return runnerId;
+}
+
+// Refused once WAITING_PER_RUNNER commands, or WAITING_BYTES_PER_RUNNER of
+// them, wait for the runner: reads stop there, so this costs no more than
+// what the runner's own pendingCommands reads. One that waits too long goes
+// (sync:pruneFiles, COMMAND_KEEP_MS). Its photos are recorded in commandFiles
+// so a delete elsewhere sees they're still on their way (sync.ts storageInUse).
+async function queue(ctx: MutationCtx, runnerId: string, kind: 'send' | 'respond' | 'update' | 'create' | 'page' | 'share' | 'quickAsk' | 'schedule' | 'picture' | 'press', threadId: string | undefined, args: Record<string, unknown>) {
+  let n = 0;
+  let bytes = docBytes(args);
+  for await (const c of ctx.db.query('commands').withIndex('by_runner_state', (q) => q.eq('runnerId', runnerId).eq('state', 'pending'))) {
+    bytes += docBytes(c);
+    if (++n >= WAITING_PER_RUNNER || bytes > WAITING_BYTES_PER_RUNNER) throw new ConvexError({ kind: 'tooMany', message: 'Too much is waiting for that runner: it takes it when it next comes online.' });
+  }
+  const commandId = await ctx.db.insert('commands', { runnerId, ...(threadId ? { threadId } : {}), kind, args, state: 'pending', createdAt: Date.now() });
+  for (const image of Array.isArray(args.images) ? (args.images as { storageId: Id<'_storage'> }[]) : []) await ctx.db.insert('commandFiles', { storageId: image.storageId, commandId });
+  return commandId;
 }

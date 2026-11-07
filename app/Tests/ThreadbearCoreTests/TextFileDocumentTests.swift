@@ -52,6 +52,69 @@ final class TextFileDocumentTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "x")
     }
 
+    /// Read just before a save: someone else's write the watch hasn't
+    /// reported yet shows up, its own write doesn't.
+    func testChangedOnDiskSeesSomeoneElsesWrite() throws {
+        let url = try file("notes.txt", "a")
+        let doc = TextFileDocument(url: url)
+        try doc.load()
+        XCTAssertNil(try doc.changedOnDisk())
+        try doc.save("b")
+        XCTAssertNil(try doc.changedOnDisk(), "its own save")
+        try Data("c".utf8).write(to: url)
+        XCTAssertEqual(try doc.changedOnDisk(), "c")
+        // Turned into something it can't write back: read only from then on.
+        try Data([0x68, 0x69, 0xFF, 0xFE]).write(to: url)
+        XCTAssertNotNil(try doc.changedOnDisk())
+        XCTAssertFalse(doc.isEditable)
+        doc.adopt("whatever")
+        XCTAssertFalse(doc.isEditable, "taking the file's text doesn't make it editable")
+        // Can't be read at all: nobody can say a save is safe.
+        try FileManager.default.removeItem(at: url)
+        XCTAssertThrowsError(try doc.changedOnDisk())
+    }
+
+    /// Bytes that aren't UTF-8 can decode to exactly the saved text: the
+    /// check still marks it read only.
+    func testChangedOnDiskSeesBytesThatReadTheSame() throws {
+        let url = try file("same.txt", "hi\u{FFFD}")
+        let doc = TextFileDocument(url: url)
+        try doc.load()
+        XCTAssertTrue(doc.isEditable)
+        try Data([0x68, 0x69, 0xFF]).write(to: url)
+        XCTAssertNil(try doc.changedOnDisk())
+        XCTAssertFalse(doc.isEditable)
+    }
+
+    /// The watch, when a file being edited turns binary: the edits aren't
+    /// thrown away (a conflict, read only), and putting it back as UTF-8
+    /// with the same text makes it editable again.
+    func testWatchKeepsEditsWhenTheFileTurnsBinary() throws {
+        let url = try file("turns.txt", "hi")
+        let doc = TextFileDocument(url: url)
+        try doc.load()
+        var seen: [TextFileDocument.Change] = []
+        var shown = "hi typed"
+        doc.watch(shown: { shown }) { seen.append($0) }
+        defer { doc.stopWatching() }
+        try Data([0x68, 0x69, 0xFF]).write(to: url)
+        doc.check()
+        XCTAssertEqual(seen.last, .conflict("hi\u{FFFD}"))
+        XCTAssertFalse(doc.isEditable)
+        // Checked again before anyone picks: the edits still aren't dropped.
+        seen = []
+        doc.check()
+        XCTAssertEqual(seen.last ?? .same, .conflict("hi\u{FFFD}"))
+        XCTAssertFalse(doc.isEditable)
+        // Take the file's, then it's put back as UTF-8 with the same text.
+        doc.adopt("hi\u{FFFD}")
+        shown = "hi\u{FFFD}"
+        try Data("hi\u{FFFD}".utf8).write(to: url)
+        doc.check()
+        XCTAssertEqual(seen.last, .reload("hi\u{FFFD}"))
+        XCTAssertTrue(doc.isEditable)
+    }
+
     func testBinaryAndCutOffFilesAreReadOnly() throws {
         let url = try file("blob.txt", "")
         try Data([0x68, 0x69, 0xFF, 0xFE]).write(to: url)

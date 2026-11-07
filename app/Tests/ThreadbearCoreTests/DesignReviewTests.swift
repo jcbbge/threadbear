@@ -218,6 +218,14 @@ final class DesignReviewTests: XCTestCase {
         XCTAssertEqual(plain.allShots.map(\.image.path), ["/b.png"])
     }
 
+    func testAShotCanBeAVideoOrAPageWithItsStill() throws {
+        let json = #"{"id":"A","title":"Clips","image":{"path":"/a.png","mediaType":"image/png"},"shots":[{"image":{"path":"/a.png","mediaType":"image/png"},"media":{"path":"/a.mp4","mediaType":"video/mp4","width":1280,"height":720}},{"image":{"path":"/p.png","mediaType":"image/png"},"media":{"path":"/p/index.html","mediaType":"text/html"}},{"image":{"path":"/s.png","mediaType":"image/png"}}]}"#
+        let shots = try JSONDecoder().decode(ReviewOption.self, from: Data(json.utf8)).allShots
+        XCTAssertEqual(shots.map(\.video?.path), ["/a.mp4", nil, nil])
+        XCTAssertEqual(shots.map(\.page?.path), [nil, "/p/index.html", nil])
+        XCTAssertEqual(shots.map(\.image.path), ["/a.png", "/p.png", "/s.png"], "the still stays the image, for thumbnails")
+    }
+
     func testReviewReplyEventReachesTheBubble() {
         let text = "Review: Picker (r1)\n\nPicked A. Auto account."
         let event = E.event(4, "user.message", ["text": text, "images": [], "reviewId": "r1", "reviewResponse": ["pickedId": "A", "notes": [:]]])

@@ -84,6 +84,12 @@ test('plain text reply: session, deltas, one assistant.text, result', () => {
   assert.ok(textIdx > lastDelta);
   const ctxOut = outs.find((o) => o.kind === 'context');
   assert.ok(ctxOut && ctxOut.kind === 'context' && ctxOut.contextTokens > 1000);
+  // The result's modelUsage says how big the model's window is, so a client
+  // can show how full the context is.
+  const last = outs.findLast((o) => o.kind === 'context');
+  assert.ok(last && last.kind === 'context');
+  assert.equal(last.contextWindow, 1_000_000);
+  assert.equal(last.contextTokens, ctxOut.contextTokens);
   const result = outs.at(-1)!;
   assert.equal(result.kind, 'result');
   assert.equal(result.kind === 'result' && result.result.outcome, 'completed');
@@ -196,8 +202,8 @@ test("a successful Edit or Write says what it wrote, by the hash of the bytes re
   }
   const wrote = outs.filter((o) => o.kind === 'wrote');
   assert.deepEqual(wrote, [
-    { kind: 'wrote', itemId: 'toolu_019BcoFgUrhyzun1BBVKSy8Z', files: [{ path: '/work/proj/note.txt', sha256: sha('alpha\nBETA\ngamma\n') }] },
-    { kind: 'wrote', itemId: 'toolu_013dHVx9Xb6KVXVZYAH7zSgX', files: [{ path: '/work/proj/new.txt', sha256: sha('hi') }] },
+    { kind: 'wrote', itemId: 'toolu_019BcoFgUrhyzun1BBVKSy8Z', files: [{ path: '/work/proj/note.txt', sha256: sha('alpha\nBETA\ngamma\n'), base: sha('alpha\nbeta\ngamma\n') }] },
+    { kind: 'wrote', itemId: 'toolu_013dHVx9Xb6KVXVZYAH7zSgX', files: [{ path: '/work/proj/new.txt', sha256: sha('hi'), base: null }] },
   ]);
   // Each just before its result, so the runner hears it before the turn goes on.
   const next = outs[outs.findIndex((o) => o.kind === 'wrote') + 1];
@@ -227,6 +233,14 @@ test('wroteFromResult rebuilds an edit as Claude Code applies it, and gives up r
     sha('c\n'),
   );
   assert.equal(wroteFromResult('Write', { file_path: '/p/a.ts', content: 'from input' }, undefined)?.sha256, sha('from input'));
+  // What the edit started from (F21): the rest of the file is that, not
+  // the agent's. None for a Write, or an edit of a missing or empty file,
+  // whose bytes are all the call's.
+  assert.equal(wroteFromResult('Edit', {}, tur({ originalFile: 'a\nb\nc\n', oldString: 'b', newString: 'B' }))?.base, sha('a\nb\nc\n'));
+  assert.equal(wroteFromResult('MultiEdit', { edits: [{ old_string: 'a', new_string: 'b' }] }, tur({ originalFile: 'a\n' }))?.base, sha('a\n'));
+  assert.equal(wroteFromResult('Edit', {}, tur({ originalFile: null, oldString: '', newString: 'new\n' }))?.base, null);
+  assert.equal(wroteFromResult('Edit', {}, tur({ originalFile: '', oldString: '', newString: 'new\n' }))?.base, null);
+  assert.equal(wroteFromResult('Write', { file_path: '/p/a.ts', content: 'all mine' }, tur({ content: 'all mine', originalFile: 'theirs' }))?.base, null);
   // No original text, or text that isn't there: nothing, so nothing is trusted.
   assert.equal(wroteFromResult('Edit', { file_path: '/p/a.ts', old_string: 'a', new_string: 'b' }, undefined), undefined);
   assert.equal(wroteFromResult('Edit', {}, tur({ originalFile: 'abc', oldString: 'zzz', newString: 'y' })), undefined);
@@ -606,4 +620,22 @@ test('a narration block cut off after its signature streamed is kept as text', (
     { type: 'result', subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming', duration_ms: 5, errors: ['[ede_diagnostic] x'] },
   ].flatMap((m) => n.handle(m));
   assert.deepEqual(events(outs), [{ type: 'assistant.text', itemId: 'm1:0', text: 'All done.', narration: true }]);
+});
+
+test("the context window is the session model's, not a sub-agent's", () => {
+  const window = (modelUsage: Record<string, unknown>, model = 'claude-opus-5-5[1m]') => {
+    const m = new ClaudeNormalizer(ctx());
+    m.sent();
+    m.handle({ type: 'system', subtype: 'init', session_id: 's1', model });
+    m.handle({ type: 'stream_event', event: { type: 'message_delta', usage: { input_tokens: 10, cache_read_input_tokens: 5000, output_tokens: 20 } } });
+    const outs = m.handle({ type: 'result', subtype: 'success', is_error: false, duration_ms: 1, modelUsage });
+    const ctxOut = outs.find((o) => o.kind === 'context');
+    return ctxOut && ctxOut.kind === 'context' ? [ctxOut.contextTokens, ctxOut.contextWindow] : undefined;
+  };
+  // The session's model, matched without its "[1m]" suffix, beats a
+  // sub-agent's bigger window.
+  assert.deepEqual(window({ 'claude-haiku-5-5': { contextWindow: 1_000_000 }, 'claude-opus-5-5': { contextWindow: 200_000 } }), [5030, 200_000]);
+  // Only another model listed: can't tell, so no window.
+  assert.equal(window({ 'claude-haiku-5-5': { contextWindow: 1_000_000 }, 'claude-sonnet-5-5': { contextWindow: 1_000_000 } }), undefined);
+  assert.deepEqual(window({ 'claude-opus-5-5': { contextWindow: 1_000_000 } }, 'opus'), [5030, 1_000_000]);
 });

@@ -71,7 +71,7 @@ public struct PairingRequest: Sendable, Equatable, Identifiable {
         return lines.joined(separator: " ")
     }
 
-    static func host(_ url: URL) -> String { url.host() ?? url.absoluteString }
+    static func host(_ url: URL) -> String { Pairing.serverName(url) }
     static func macs(_ n: Int) -> String { n == 1 ? "1 Mac" : "\(n) Macs" }
 }
 

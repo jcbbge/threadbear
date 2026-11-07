@@ -45,6 +45,24 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(SettingsUpdate().params, [:])
     }
 
+    func testBringInDecodesAsDaysOrAWord() throws {
+        func decode(_ json: String) throws -> RunnerSettings { try JSONDecoder().decode(RunnerSettings.self, from: Data(json.utf8)) }
+        XCTAssertEqual(try decode(#"{"bringIn":3}"#).bringIn, .every(3))
+        XCTAssertEqual(try decode(#"{"bringIn":"important"}"#).bringIn, .important)
+        XCTAssertEqual(try decode(#"{"bringIn":"off"}"#).bringIn, .off)
+        XCTAssertTrue(try decode(#"{"bringIn":"off"}"#).bringInSupported)
+        XCTAssertEqual(try decode(#"{"bringIn":"weekly"}"#).bringIn, .standard, "a word it doesn't know is the default")
+        XCTAssertFalse(try decode("{}").bringInSupported, "an older runner sends none")
+        XCTAssertEqual(SettingsUpdate(bringIn: .every(7)).params, ["bringIn": .number(7)])
+        XCTAssertEqual(SettingsUpdate(bringIn: .off).params, ["bringIn": .string("off")])
+    }
+
+    func testBringInChoicesKeepACustomNumber() {
+        XCTAssertEqual(SettingsText.bringInChoices(current: .standard).map(\.title),
+                       ["Every day", "Every 3 days", "Every 5 days", "Every week", "Every 2 weeks", "Only important ones", "Never"])
+        XCTAssertEqual(SettingsText.bringInChoices(current: .every(10)).map(\.title)[4], "Every 10 days")
+    }
+
     func testSettingsUpdatedNotification() async throws {
         let transport = FakeTransport()
         let client = RPCClient(transport: transport)

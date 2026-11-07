@@ -186,7 +186,7 @@ if [ "$MODE" != "print" ]; then
     if [ "$SANDBOX" = 0 ] || same_dir "${THREADBEAR_RUNNER_HOME:-${THREADBEAR_HOME:-${THREADBEAR_DATA_DIR:-$DEFAULT_HOME}}}" "$DATA_HOME"; then IN_THREAD=1; fi
   fi
   if [ "$IN_THREAD" = 1 ]; then
-    echo "This would stop the runner this thread runs on and end this turn. Ask Mike to run it from a terminal:" >&2
+    echo "This would stop the runner this thread runs on and end this turn. Ask the user to run it from a terminal:" >&2
     printf '  %q' "$RUNNER_DIR/scripts/install-runner.sh" ${ARGS[@]+"${ARGS[@]}"} >&2
     echo >&2
     exit 1

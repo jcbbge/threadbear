@@ -43,10 +43,12 @@ The order Mike agreed on 26 Oct, and what became of each step:
   bigger than planned: Threadbear got its own iPhone app (1.0 in App
   Review) and a website with sharing, rather than a Threads tab in Quick
   Ask.
-- **Step 6: a second runner, then cloud sandboxes.** Not started. The plan
-  said Tinker Desk; on 29 Oct Mike moved it to Bruce, keeping Tinker Desk
-  for testing clean Threadbear installs. Cloud sandboxes were only ever this
-  line; nothing is designed.
+- **Step 6: a second runner, then cloud sandboxes.** The second runner is
+  done and supported: Bruce since 29 Oct, then a Linux server. Set one up
+  with INSTALL.md; the guide's "If you run Threadbear on more than one Mac"
+  says how it behaves. The plan said Tinker Desk; on 29 Oct Mike moved it
+  to Bruce, keeping Tinker Desk for testing clean Threadbear installs. Cloud
+  sandboxes were a separate idea, not settled.
 
 Much was added outside this order: schedules, hibernate, projects and the
 librarian, the dockable window (BearDock), patches and panels, the asks card,
@@ -55,9 +57,8 @@ docs are in `docs/` and the contracts in `docs/protocol.md`.
 
 ## Step 6: a second runner (Bruce)
 
-Draft design in `docs/step6-plan.md` (29 Oct), with open questions for
-Mike. Convex already handles several runners (`docs/convex-backend.md`);
-the gap is the Mac app, which talks to one runner on this Mac.
+Built. `docs/step6-plan.md` is the 29 Oct design it started from; for how
+it works today read the guide and `docs/protocol.md`, "Runner keys".
 
 ## Behaviour Mike asked for
 

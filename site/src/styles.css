@@ -493,7 +493,7 @@ a.video-card:hover .video-play { scale: 1.06; }
 .doc-next { margin-top: var(--s-500); padding-top: var(--s-200); border-top: 1px solid var(--line); font-size: 16px; line-height: 24px; font-weight: 500; }
 .doc-next a { text-decoration: none; }
 @media (max-width: 860px) {
-  .docs { grid-template-columns: 1fr; margin: var(--s-500) auto var(--s-700); padding: 0 var(--s-200); gap: var(--s-300); }
+  .docs { grid-template-columns: minmax(0, 1fr); margin: var(--s-500) auto var(--s-700); padding: 0 var(--s-200); gap: var(--s-300); }
   .docs-nav { position: static; }
   .docs-nav ol { flex-direction: row; flex-wrap: wrap; }
 }

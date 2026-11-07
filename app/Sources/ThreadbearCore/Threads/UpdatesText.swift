@@ -76,6 +76,9 @@ public enum UpdatesText {
     /// why it can't tell. Nil when there's nothing to say (no upstream).
     public static func upstreamLine(_ u: RunnerUpdates.Upstream?) -> String? {
         guard let u else { return nil }
+        // Held comes first: it's the one that wants something doing (a red
+        // build on main), and the last tag is still in tb status.
+        if let why = u.heldWhy, u.state == "off" { return "Your next release for everyone else is waiting: \(why)." }
         if let tag = u.publishedTag, u.state == "off" { return "Your last release for everyone else is \(tag)." }
         switch u.state {
         case "available":
@@ -93,6 +96,24 @@ public enum UpdatesText {
         }
     }
 
+    /// What the From Mike section lists under a release: the plain-words
+    /// notes Mike's runner wrote, a heading per release when there's more
+    /// than one, or (from older tags) the first commit subjects.
+    public static func releaseLines(_ r: RunnerUpdates.Upstream.Release) -> [(heading: String?, lines: [String])] {
+        guard !r.notes.isEmpty else { return [(nil, Array(r.subjects.prefix(5)))] }
+        if r.notes.count == 1, r.notes[0].tag == r.tag { return [(nil, r.notes[0].lines)] }
+        var groups = r.notes.map { note in
+            let date = releaseDate(note.tag)
+            return (heading: Optional(date.hasPrefix("of ") ? String(date.dropFirst(3)) : date), lines: note.lines)
+        }
+        // An older runner may supply notes only for older tags. Keep those
+        // dated, and show the subjects so the newest changes remain visible.
+        if !r.notes.contains(where: { $0.tag == r.tag }), !r.subjects.isEmpty {
+            groups.append((heading: "Every change", lines: Array(r.subjects.prefix(5))))
+        }
+        return groups
+    }
+
     /// "release/2026-10-30" as "of 30 Oct".
     public static func releaseDate(_ tag: String) -> String {
         let date = tag.hasPrefix("release/") ? String(tag.dropFirst("release/".count)) : tag
@@ -104,14 +125,21 @@ public enum UpdatesText {
 
     /// The first message of the thread Bring them in starts.
     public static func bringInPrompt(_ r: RunnerUpdates.Upstream.Release) -> String {
-        "Bring in Mike's release \(r.tag) (\(r.changes) new change\(r.changes == 1 ? "" : "s")) to this copy of Threadbear. Follow docs/bringing-in-updates.md, and ask me before it lands."
+        "Bring in Mike's release \(r.tag) (\(r.changes) new change\(r.changes == 1 ? "" : "s")) to this copy of Threadbear.\(commitLine(r)) Follow docs/bringing-in-updates.md, and ask me before it lands."
+    }
+
+    /// The commit the runner checked the release's signature for, so the
+    /// thread merges that and not a ref a later fetch could have moved.
+    static func commitLine(_ r: RunnerUpdates.Upstream.Release, merge: Bool = true) -> String {
+        guard let c = r.commit, c.range(of: "^[0-9a-f]{40}([0-9a-f]{24})?$", options: .regularExpression) != nil else { return "" }
+        return merge ? " Merge its commit \(c), the one its signature was checked for." : " Its commit is \(c), the one its signature was checked for."
     }
 
     /// Let's Discuss: the same release, talked through before anything
     /// changes (Mike, 4 Nov 2026), for someone who wants to know what it
     /// does to their own changes first.
     public static func discussPrompt(_ r: RunnerUpdates.Upstream.Release) -> String {
-        "Mike's release \(r.tag) has \(r.changes) new change\(r.changes == 1 ? "" : "s") for this copy of Threadbear. Before bringing any of it in, talk me through it: what's in it that I'd notice, anything that touches or clashes with the changes I've made in this copy, and anything risky. Section 1 of docs/bringing-in-updates.md says how to see both sides. Don't change anything yet; once we've talked it over, I'll say whether to bring it in, and then follow that doc."
+        "Mike's release \(r.tag) has \(r.changes) new change\(r.changes == 1 ? "" : "s") for this copy of Threadbear. Before bringing any of it in, talk me through it: what's in it that I'd notice, anything that touches or clashes with the changes I've made in this copy, and anything risky. Section 1 of docs/bringing-in-updates.md says how to see both sides.\(commitLine(r, merge: false)) Don't change anything yet; once we've talked it over, I'll say whether to bring it in, and then follow that doc."
     }
 
     /// The icon's tooltip. A failure is said, as it shares the grey dot

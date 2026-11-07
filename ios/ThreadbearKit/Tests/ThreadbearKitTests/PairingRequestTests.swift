@@ -52,6 +52,22 @@ import Testing
     }
 
     /// The first pairing is asked about too.
+    /// Two self-hosted backends on one Mac differ only by port: a link to
+    /// the other one says it moves the phone, naming both with their ports.
+    @Test func anotherPortIsAnotherServer() throws {
+        let current = Pairing(deploymentURL: URL(string: "https://mac.tail1.ts.net:3210")!, token: "tb_old")
+        let link = Self.link(host: "mac.tail1.ts.net:8443")
+        let request = try #require(PairingRequest(link: link, allowLocal: false, current: current, keys: { _ in MemoryRunnerKeyStore() }))
+        #expect(request.replacesHost == "mac.tail1.ts.net:3210")
+        #expect(!request.samePairedServer)
+        #expect(request.title == "Pair with mac.tail1.ts.net:8443?")
+        // A cloud address has no port, so it's named as it always was.
+        #expect(Pairing.serverName(URL(string: "https://happy-bear-123.convex.cloud")!) == "happy-bear-123.convex.cloud")
+        // Nor does one saved with a port, or the simulator's local backend: their Keychain names stay as they were.
+        #expect(Pairing.serverName(URL(string: "https://happy-bear-123.convex.cloud:443")!) == "happy-bear-123.convex.cloud")
+        #expect(Pairing.serverName(URL(string: "http://127.0.0.1:3210")!) == "127.0.0.1")
+    }
+
     @Test func theFirstPairingIsAskedAbout() throws {
         let gate = PairingGate()
         let saved = Saved()

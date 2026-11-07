@@ -11,6 +11,7 @@ import { components, internal } from './_generated/api';
 import { httpAction } from './_generated/server';
 import type { Id } from './_generated/dataModel';
 import { MAX_RUNNER_UPLOAD_BYTES } from './sync';
+import { PHONE_UPLOADS } from './phone';
 
 const http = httpRouter();
 
@@ -78,6 +79,32 @@ http.route({
     if (redeemed !== true) {
       await ctx.storage.delete(storageId);
       return redeemed === 'later' ? refuse(429, 'over the upload allowance for now: try again later') : refuse(403, 'upload refused: a bad or used ticket, or a revoked key');
+    }
+    return new Response(JSON.stringify({ storageId }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }),
+});
+
+// A phone's photo (phone:imageUploadUrl hands out this URL with a one-use
+// ticket): stored here and recorded as that phone token's (phoneUploads), so
+// only its own commands can send it and only it can discard it, and one
+// never sent is found and deleted after a day. Answers { storageId } as
+// Convex's own upload URL does, which is what the iPhone app reads.
+http.route({
+  path: '/phone/upload',
+  method: 'POST',
+  handler: httpAction(async (ctx, request) => {
+    const ticket = new URL(request.url).searchParams.get('ticket') ?? '';
+    const refuse = (status: number, error: string) => new Response(JSON.stringify({ error }), { status, headers: { 'Content-Type': 'application/json' } });
+    if (!(await ctx.runQuery(internal.phone.phoneTicketOk, { ticket }))) return refuse(403, 'bad or used upload ticket');
+    // Said up front by an honest client; checked again on what arrived.
+    if (Number(request.headers.get('content-length') ?? 0) > PHONE_UPLOADS.maxBytes) return refuse(413, 'too big');
+    const blob = await request.blob();
+    if (blob.size > PHONE_UPLOADS.maxBytes) return refuse(413, 'too big');
+    const storageId = await ctx.storage.store(blob);
+    const redeemed = await ctx.runMutation(internal.phone.redeemPhoneUpload, { ticket, storageId, bytes: blob.size });
+    if (redeemed !== true) {
+      await ctx.storage.delete(storageId);
+      return redeemed === 'later' ? refuse(429, 'over the upload allowance for now: try again later') : refuse(403, 'upload refused: a bad or used ticket, or a revoked phone');
     }
     return new Response(JSON.stringify({ storageId }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }),

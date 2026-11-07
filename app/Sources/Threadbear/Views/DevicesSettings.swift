@@ -37,14 +37,19 @@ struct DevicesSettings: View {
                 SettingsSection("Add a phone or browser",
                                 about: "The Threadbear iPhone app shows your inbox, lets you reply, approve and start threads, and gets a push when a thread needs you. It reads the Convex mirror, so it works while the Mac is asleep.\n\nThe website is your threads on the web, at \(app.devicesSite ?? "your deployment's .convex.site address"): a link you can paste anywhere. Each browser keeps a key of its own; sign another one in from here too.",
                                 ask: "put the iPhone app on your phone, or change how the mirror is set up.") {
+                    if app.pushOff {
+                        // A self-hosted backend: the push relay only reaches Convex cloud (docs/self-hosting.md).
+                        Label("Your backend is self-hosted, so the iPhone app gets no notifications. It shows what needs you when you open it.", systemImage: "bell.slash")
+                            .foregroundStyle(.secondary)
+                    }
                     LabeledContent("iPhone") {
                         Button("Show the code…") { pairPhone() }
-                            .disabled(pairing)
+                            .busy(pairing)
                             .tip("A code to scan with the Threadbear iPhone app. It pairs the phone with your threads for 90 days.")
                     }
                     LabeledContent("Website") {
                         Button("Open signed in") { openBrowser() }
-                            .disabled(opening)
+                            .busy(opening)
                             .tip("Opens your Threadbear website in \(DefaultBrowser.current()?.name ?? "your browser"), signed in for 90 days")
                     }
                 }

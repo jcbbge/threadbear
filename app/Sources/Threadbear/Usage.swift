@@ -39,28 +39,39 @@ extension AppModel {
 
     /// The usage popover's buttons. Each returns at once; progress comes
     /// through `clis.updated`.
-    func checkClis() { cliCall("clis.check") { try await $0.checkClis() } }
+    /// The button spins until the runner takes it.
+    func checkClis() { cliCall(BusyKey.checkClis) { try await $0.checkClis() } }
 
     func updateCli(_ provider: String, version: String? = nil, force: Bool = false) {
-        cliCall("clis.update") { try await $0.updateCli(provider: provider, version: version, force: force) }
+        cliCall(BusyKey.updateCli(provider)) { try await $0.updateCli(provider: provider, version: version, force: force) }
     }
 
+    /// The menu says the new setting at once, and goes back if it's refused.
     func setCliPolicy(_ provider: String, _ policy: String) {
-        cliCall("clis.setPolicy") { try await $0.setCliPolicy(provider: provider, policy: policy) }
+        guard let index = clis.firstIndex(where: { $0.provider == provider }) else {
+            return cliCall(BusyKey.cliPolicy(provider)) { try await $0.setCliPolicy(provider: provider, policy: policy) }
+        }
+        let before = clis[index].policy
+        clis[index].policy = policy
+        cliCall(BusyKey.cliPolicy(provider), failed: { [self] in
+            if let now = clis.firstIndex(where: { $0.provider == provider }), clis[now].policy == policy { clis[now].policy = before }
+        }) { try await $0.setCliPolicy(provider: provider, policy: policy) }
     }
 
-    private func cliCall(_ method: String, _ call: @escaping (RPCClient) async throws -> [CliStatus]) {
-        guard let client else { return }
-        Task {
+    private func cliCall(_ key: String, failed: @escaping @MainActor () -> Void = {}, _ call: @escaping (RPCClient) async throws -> [CliStatus]) {
+        guard let client else { return failed() }
+        guard whileBusy(key, { [self] in
             do {
                 clis = try await call(client)
                 clisSupported = true
             } catch RPCError.server(let code, _) where code == RPCError.methodNotFound {
+                failed()
                 clisSupported = false
             } catch {
+                failed()
                 show(error)
             }
-        }
+        }) else { return failed() }
     }
 
     /// An update under way, or one that failed and hasn't been dismissed,
@@ -126,10 +137,38 @@ extension AppModel {
     /// The open thread's last turn failed because its login was refused
     /// (`errorKind` auth: signed out, or the session ran out and couldn't
     /// be refreshed). The login to sign in again, for the sign-in line.
+    ///
+    /// Only for this Mac's own threads: another Mac's login is signed in on
+    /// that Mac (Terminal here would sign in this Mac's CLI), and nothing
+    /// that runner says about its thread may pick what runs here. Its
+    /// provider once went into the script as the login's name, shell and
+    /// all (Daybreak, 7 Nov). An unknown login falls back to the main one
+    /// of a provider there is, named in fixed words.
     func signInAccount(for thread: ThreadSummary) -> Account? {
-        guard thread.status == .error, loadedSession(thread.id)?.lastTurnErrorKind == .auth else { return nil }
-        return account(thread.accountId)
-            ?? Account(id: thread.provider == "codex" ? "codex-main" : "claude-main", provider: thread.provider, title: thread.provider)
+        guard signInNeeded(thread) else { return nil }
+        return Self.signInAccount(for: thread, known: account(thread.accountId))
+    }
+
+    /// The choice itself: `known` is this Mac's login with the thread's id.
+    nonisolated static func signInAccount(for thread: ThreadSummary, known: Account?) -> Account? {
+        guard !thread.isRemote else { return nil }
+        if let known { return known }
+        switch thread.provider {
+        case "claude": return Account(id: "claude-main", provider: "claude", title: "Claude")
+        case "codex": return Account(id: "codex-main", provider: "codex", title: "Codex")
+        default: return nil
+        }
+    }
+
+    /// Another Mac's thread whose login was refused: the runner it's
+    /// signed in on, for a line that says to sign in there.
+    func remoteSignInRunner(for thread: ThreadSummary) -> String? {
+        guard thread.isRemote, signInNeeded(thread) else { return nil }
+        return runnerName(of: thread) ?? "the other Mac"
+    }
+
+    private func signInNeeded(_ thread: ThreadSummary) -> Bool {
+        thread.status == .error && loadedSession(thread.id)?.lastTurnErrorKind == .auth
     }
 
     /// Opens Terminal on the CLI's own sign-in for that login, the same
@@ -139,11 +178,12 @@ extension AppModel {
     /// AppleScript, so macOS doesn't ask to let Threadbear control Terminal.
     func signIn(_ account: Account) {
         let path = clis.first { $0.provider == account.provider }?.path ?? ""
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("threadbear-sign-in-\(account.id).command")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("threadbear-sign-in-\(SignIn.fileSafe(account.id)).command")
         do {
             try SignIn.script(account, cliPath: path).write(to: url, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
-            NSWorkspace.shared.open(url)
+            // The script this app just wrote, every word of it quoted.
+            OpenGate.openOwn(url)
         } catch {
             errorMessage = "Couldn't open Terminal to sign in: \(error.localizedDescription)"
         }
@@ -204,6 +244,17 @@ enum AppWindow {
 enum SignIn {
     static func quoted(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
+    /// A login's name on one line, for the script's first line of output:
+    /// data printed by printf, never shell source (Daybreak, 7 Nov).
+    static func oneLine(_ s: String) -> String {
+        String(s.map { $0.isNewline || ($0.unicodeScalars.first.map { CharacterSet.controlCharacters.contains($0) } ?? false) ? " " : $0 }.prefix(200))
+    }
+
+    /// An account id as part of a file name: letters, digits, - and _.
+    static func fileSafe(_ id: String) -> String {
+        String(id.map { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") ? $0 : "_" }.prefix(64))
+    }
+
     /// `cliPath` is the binary the runner starts for new sessions (Codex is
     /// often Threadbear's own copy, not on the PATH); empty uses the PATH's.
     static func script(_ account: Account, cliPath: String) -> String {
@@ -215,7 +266,7 @@ enum SignIn {
         return """
         #!/bin/zsh -l
         export PATH="$HOME/.local/bin:$PATH"
-        echo "Signing in to \(codex ? "Codex" : "Claude") for Threadbear (\(account.title))."
+        printf '%s\\n' \(quoted("Signing in to \(codex ? "Codex" : "Claude") for Threadbear (\(Self.oneLine(account.title)))."))
         echo
         \(env)\(binary) \(codex ? "login" : "auth login")
         echo

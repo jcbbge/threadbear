@@ -20,9 +20,9 @@ front of `/api`; a missing scheme is taken as `https://`. The phone has to
 be able to reach it: Mike's runs on a Mac on his tailnet, so his phone uses
 Tailscale.
 
-The token goes in an `Authorization: Bearer <token>` header. Settings warns
-if it doesn't look like Agent Archive's (`aa_<16 hex>_<secret>`), but
-sends whatever you give it.
+The token goes in an `Authorization: Bearer <token>` header. Agent Archive's
+tokens look like `aa_<16 hex>_<secret>`, but the phone sends whatever you
+give it.
 
 A server can also hand both over in a link, usually as a QR code:
 `threadbear://quickask?url=<address>&token=<token>`, both URL-encoded.

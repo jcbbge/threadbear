@@ -8,6 +8,8 @@ import type { Clock } from './clock.ts';
 import { ErrorCode, RpcError } from './protocol.ts';
 import type { Notification } from './runner.ts';
 import type { Models } from './models/index.ts';
+import type { BringInSetting } from './bring-in.ts';
+import { DEFAULT_BRING_IN_DAYS, parseBringIn } from './bring-in.ts';
 
 export type Settings = {
   defaultCwd: string;
@@ -16,6 +18,9 @@ export type Settings = {
   followMain: boolean;
   bulletReplies: boolean;
   oneReply: boolean;
+  // How often a fork's runner starts a thread to bring in Mike's releases
+  // (bring-in.ts): every so many days, 'important' or 'off'.
+  bringIn: BringInSetting;
   models: {
     pool: string | null;
     privateFolders: string[];
@@ -29,6 +34,7 @@ export type SettingsUpdate = {
   followMain?: boolean;
   bulletReplies?: boolean;
   oneReply?: boolean;
+  bringIn?: BringInSetting;
   models?: { pool?: string | null; privateFolders?: string[] };
 };
 
@@ -53,6 +59,7 @@ export class SettingsService {
       followMain: readRunnerJson(this.cfg.home).followMain !== false,
       bulletReplies: this.cfg.bulletReplies,
       oneReply: this.cfg.oneReply,
+      bringIn: bringInSetting(this.cfg.home),
       models: {
         pool: this.cfg.models.pool,
         privateFolders: [...this.cfg.models.privateFolders],
@@ -95,6 +102,8 @@ export class SettingsService {
     if (u.followMain !== undefined) json.followMain = u.followMain;
     if (u.bulletReplies !== undefined) json.bulletReplies = this.cfg.bulletReplies = u.bulletReplies;
     if (u.oneReply !== undefined) json.oneReply = this.cfg.oneReply = u.oneReply;
+    // Read each time it's needed (bring-in.ts), so this takes effect at once.
+    if (u.bringIn !== undefined) json.releases = { ...json.releases, bringIn: u.bringIn };
     if (folders !== undefined || pool !== undefined) {
       json.models = { ...json.models };
       if (pool !== undefined) json.models.pool = this.cfg.models.pool = pool;
@@ -130,6 +139,11 @@ export function settingsMethods(s: SettingsService): Record<string, (p: Record<s
       if (p.oneReply !== undefined) {
         if (typeof p.oneReply !== 'boolean') throw bad('oneReply must be a boolean');
         u.oneReply = p.oneReply;
+      }
+      if (p.bringIn !== undefined) {
+        const b = parseBringIn(p.bringIn);
+        if (b === undefined) throw bad("bringIn must be a whole number of days from 1 to 365, 'important' or 'off'");
+        u.bringIn = b;
       }
       if (p.models !== undefined) {
         const m = p.models;
@@ -210,4 +224,9 @@ function maxTokens(p: Record<string, unknown>): { maxTokens?: number } {
   if (p.maxTokens === undefined || p.maxTokens === null) return {};
   if (typeof p.maxTokens !== 'number' || !Number.isInteger(p.maxTokens) || p.maxTokens < 1 || p.maxTokens > 8000) throw bad('maxTokens must be a whole number from 1 to 8000');
   return { maxTokens: p.maxTokens };
+}
+
+// runner.json `releases.bringIn`, or every 5 days.
+export function bringInSetting(home: string): BringInSetting {
+  return parseBringIn(readRunnerJson(home).releases?.bringIn) ?? DEFAULT_BRING_IN_DAYS;
 }

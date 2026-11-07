@@ -26,6 +26,11 @@ extension AppModel {
     func receive(remote: RemoteThreads) {
         remoteIndex = remote
         if remoteRunners != remote.runners { remoteRunners = remote.runners }
+        if let pending = pendingRunnerOrder {
+            if remote.order == pending { pendingRunnerOrder = nil }
+        } else if runnerOrder != remote.order {
+            runnerOrder = remote.order
+        }
         applyRemoteIndex()
         applyDefaultRunner()
     }
@@ -47,6 +52,76 @@ extension AppModel {
         let gone = next.values.filter { $0.isRemote && !listed.contains($0.id) && !liveRemote.contains($0.id) && !madeRemote.contains($0.id) }.map(\.id)
         if next != threads { threads = next }
         for id in gone { forget(id) }
+        threadCountMayHaveChanged()
+    }
+
+    /// A thread read through Convex has the table's row for a summary,
+    /// and that row has no card (thread-index.ts leaves the asks out, as
+    /// they'd cost a write each). The card still comes, in the relay's
+    /// events, so the transcript draws it, but picking an answer and
+    /// sending it go by the summary's `needs`, `asks` and `asksSeq`
+    /// (Decisions.isOpen), and without them every click on it did nothing
+    /// (Mike, 6 Nov, on a Hetzner thread). So while it's open here they
+    /// come from the card it's showing, in the relay's seqs like the card.
+    func withRelayCard(_ summary: ThreadSummary) -> ThreadSummary {
+        guard summary.isRemote, !directRemoteLink else { return summary }
+        return Decisions.withCard(summary, sessions[summary.id]?.openCard)
+    }
+
+    /// A relayed thread's card came or went (ThreadSession.syncOpenCard).
+    /// Any summary stored over it gets the card too (`threads`' didSet).
+    func relayCardChanged(_ threadId: String) {
+        guard viaRelay(threadId), let thread = threads[threadId] else { return }
+        let next = withRelayCard(thread)
+        if next != thread { threads[threadId] = next }
+    }
+
+    // MARK: The order
+
+    /// Every runner as Settings > Runners lists them: in Mike's order, then
+    /// any he hasn't placed, this Mac first and the rest as the runner has
+    /// them (the phone's list does the same, convex/phone.ts orderedRunners).
+    var orderedRunnerIds: [String] {
+        let selfId = runners.first(where: \.isSelf)?.id
+        let all = (selfId.map { [$0] } ?? []) + remoteRunners.map(\.id)
+        let order = runnerOrder ?? []
+        let rank = { (id: String) in order.firstIndex(of: id) ?? order.count }
+        return all.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }.map(\.element)
+    }
+
+    /// One place up or down, for VoiceOver's actions on a runner's row (a
+    /// drag saves the whole order itself).
+    func moveRunner(_ id: String, by offset: Int) {
+        let ids = orderedRunnerIds
+        guard let from = ids.firstIndex(of: id), ids.indices.contains(from + offset) else { return }
+        setRunnerOrder(ReorderDrag.moving(ids, from: from, to: from + offset))
+    }
+
+    /// Saves the order through this Mac's runner, here at once.
+    func setRunnerOrder(_ ids: [String]) {
+        guard let client else { return }
+        pendingRunnerOrder = ids
+        runnerOrder = ids
+        Task {
+            do {
+                try await client.setRunnerOrder(ids)
+                // Saved. Normally the list comes back in it at once; if
+                // something else (the phone) moved it again before that, the
+                // backend's order wins after a moment rather than this one
+                // staying on screen for good.
+                try? await Task.sleep(for: .seconds(5))
+                if pendingRunnerOrder == ids {
+                    pendingRunnerOrder = nil
+                    runnerOrder = remoteIndex.order
+                }
+            } catch {
+                if pendingRunnerOrder == ids {
+                    pendingRunnerOrder = nil
+                    runnerOrder = remoteIndex.order
+                }
+                errorMessage = "Couldn't save the runner order. \(error.localizedDescription)"
+            }
+        }
     }
 
     func isRemote(_ threadId: String) -> Bool { threads[threadId]?.isRemote == true }
@@ -97,6 +172,15 @@ extension AppModel {
     /// Where a thread's requests go, without connecting: this Mac's runner
     /// for its own threads (and with no thread), the thread's runner while
     /// it's connected, else nil.
+    /// A tool's output on another runner's thread, from Convex: once for each tool, as
+    /// this Mac's runner keeps it, and it arrives as events on the thread.
+    func fetchHeldBody(threadId: String, seq: Int) {
+        guard viaRelay(threadId), let client else { return }
+        Task {
+            _ = try? await client.call("threads.heldBody", .object(["threadId": .string(threadId), "seq": .number(Double(seq))]), as: JSONValue.self)
+        }
+    }
+
     func client(for threadId: String?) -> RPCClient? {
         guard let threadId, !viaRelay(threadId) else { return client }
         return remoteClients.client(for: route(threadId), local: client)

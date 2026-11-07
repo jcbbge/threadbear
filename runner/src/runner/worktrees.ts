@@ -7,7 +7,7 @@ import type { RunnerPart } from './part.ts';
 import type { Action, EventBody } from '../protocol.ts';
 import type { ThreadRecord } from '../store.ts';
 import { BIN_DIR, threadEnv } from '../restart.ts';
-import { cleanUpWorktree, makeWorktree, sameSubfolder } from '../worktrees.ts';
+import { cleanUpWorktree, makeWorktree, sameSubfolder, worktreeGone } from '../worktrees.ts';
 import { isDirectory } from '../fsutil.ts';
 import { automaticTrust, findWorktreePatch, isInside, readWorktreePatch, runCommand, type PatchSet, worktreePatchFiles } from '../patches.ts';
 import fs from 'node:fs';
@@ -84,6 +84,7 @@ export const worktreesPart = {
       env: { ...process.env, ...threadEnv(rec.id, this.cfg.home) },
       shell: this.actionShell,
       timeoutMs: this.actionTimeoutMs,
+      background: this.backgroundJobs,
     });
     if (rt.deleted) return;
     const body: EventBody = {
@@ -136,12 +137,19 @@ export const worktreesPart = {
   // A thread whose worktree was removed (it was archived with everything
   // landed) and has now come back carries on in the main checkout. Returns
   // a line for the agent, whose system prompt still names the worktree.
+  // The thread's worktree has gone since its CLI last ran, so its next
+  // start moves it to the main checkout (leaveRemovedWorktree). A spare's
+  // folder is still there, but it's another thread's (or will be), so the
+  // thread never carries on in it.
+  leavesRemovedWorktree(this: Runner, rec: ThreadRecord): boolean {
+    const w = rec.worktree;
+    return Boolean(w?.removedAt && isInside(rec.cwd, w.path) && (w.spare || !isDirectory(rec.cwd)));
+  },
+
   leaveRemovedWorktree(this: Runner, st: ThreadState, turnId: string): string | undefined {
     const { rec } = st;
     const w = rec.worktree;
-    // A spare's folder is still there, but it's another thread's (or will
-    // be), so the thread never carries on in it.
-    if (!w?.removedAt || !isInside(rec.cwd, w.path) || (!w.spare && isDirectory(rec.cwd))) return undefined;
+    if (!w || !this.leavesRemovedWorktree(rec)) return undefined;
     const from = rec.cwd;
     const to = sameSubfolder(from, w.path, w.mainCheckout);
     if (rec.sessionUsed) {
@@ -179,6 +187,41 @@ export const worktreesPart = {
     return land ? [...set.actions, land] : set.actions;
   },
 
+  // At start (and when a thread is handed over): an archived thread whose
+  // worktree and branch have gone (or whose folder another thread has
+  // taken) but whose record never said so (a handover saved it mid-cleanup
+  // before 6 Nov, THREADBEAR-16, or the runner stopped there) is told now,
+  // so it shows no Land chip and, brought back, never carries on in the
+  // folder. Each check counts as the thread's cleanup, so a message sent
+  // meanwhile waits for it (deliver).
+  settleLostCleanups(this: Runner, threads: Iterable<ThreadState> = this.threads.values(), retry = true): Promise<void> {
+    const checks = [];
+    for (const st of threads) {
+      const { rec, rt } = st;
+      const w = rec.worktree;
+      if (!rec.archivedAt || !w || w.removedAt || rt.cleaning) continue;
+      // Archived, but the runner went before the cleanup ran: it's still to
+      // do, not just to record. Not from a handover: one that comes with this
+      // still owed gave up waiting for its git (letGo), which may still be
+      // removing the folder, and a second one beside it could read that as
+      // uncommitted changes. The next start does it.
+      const check = (retry && w.cleanupOwed ? this.cleanUpWorktree(st) : worktreeGone(w).then((gone) => {
+          if (!gone || rt.deleted || w.removedAt) return;
+          w.removedAt = this.isoNow();
+          if (gone === 'taken') w.spare = true;
+          this.markDirty(st);
+          this.log.info("recorded a worktree's removal the record missed", { threadId: rec.id, path: w.path });
+        }))
+        .catch((e: unknown) => this.log.warn("couldn't check an archived thread's worktree", { threadId: rec.id, error: String(e) }))
+        .finally(() => {
+          if (rt.cleaning === check) rt.cleaning = undefined;
+        });
+      rt.cleaning = check;
+      checks.push(check);
+    }
+    return Promise.all(checks).then(() => undefined);
+  },
+
   // When the thread is archived or deleted: its worktree and branch go if
   // everything on them is on main; otherwise they stay, and the thread (or,
   // once it's deleted, a notice) says so and how to land or drop them.
@@ -188,18 +231,25 @@ export const worktreesPart = {
     if (!w || w.removedAt) return;
     let result;
     try {
-      result = await cleanUpWorktree(w);
+      result = await cleanUpWorktree(w, () => deleted || !st.rt.deleted);
     } catch (e) {
       result = { removed: false as const, reason: String((e as Error).message ?? e) };
     }
     this.log.info('worktree cleanup', { threadId: rec.id, path: w.path, ...result });
+    // Deleted meanwhile: nothing to record it in, and emit would throw.
+    if (st.rt.deleted && !deleted) return;
+    delete w.cleanupOwed;
     if (result.removed) {
       w.removedAt = this.isoNow();
-      if ('spare' in result && result.spare) w.spare = true;
+      // A folder that's another checkout's now counts as a spare: the
+      // thread, brought back, never carries on in it (leavesRemovedWorktree).
+      if (result.spare || result.taken) w.spare = true;
       if (deleted) return;
-      const text = w.spare
-        ? `Deleted this thread's branch ${w.branch} (everything on it is on main) and kept its worktree, build caches and all, for the next thread.`
-        : `Removed this thread's worktree and its branch ${w.branch}: everything on it is on main.`;
+      const text = result.taken
+        ? `This thread's worktree had already gone, and its folder ${w.path} is another checkout's now, so it was left alone. Its branch ${w.branch} is gone too.`
+        : w.spare
+          ? `Deleted this thread's branch ${w.branch} (everything on it is on main) and kept its worktree, build caches and all, for the next thread.`
+          : `Removed this thread's worktree and its branch ${w.branch}: everything on it is on main.`;
       this.emit(st, { type: 'system.note', text });
       this.markDirty(st);
       return;

@@ -12,7 +12,7 @@ import { api } from '../../convex/_generated/api';
 import { go, threadPath } from './route';
 import { ago } from './format';
 import { MenuChoice, Pop } from './menu';
-import { ARCHIVE_FIRST, ARCHIVE_STEP, archived, archiveShown, build, clampWidth, hibernating, isFiltering, neighbour, NO_FILTER, passes, placeChoices, placesOf, readFolded, readOrder, readWidth, shows, SIDEBAR_DEFAULT, wakesOf, type Filter, type InboxOrder, type SectionKey } from './sections';
+import { wakeLine, ARCHIVE_FIRST, ARCHIVE_STEP, archived, archiveShown, build, clampWidth, hibernating, isFiltering, neighbour, NO_FILTER, passes, placeChoices, placesOf, readFolded, readOrder, readWidth, shows, SIDEBAR_DEFAULT, wakesOf, type Filter, type InboxOrder, type SectionKey } from './sections';
 import * as Icon from './icons';
 
 export type Row = NonNullable<ReturnType<typeof useQuery<typeof api.phone.threads>>>[number];
@@ -330,7 +330,7 @@ function Rows({ rows, selected, focusList }: { rows: Row[]; selected?: string; f
             {/* Its place, as on the Mac and the phone, with the last thing
                 Mike said to it on hover. While it works, what it's doing. */}
             <span className="sub" title={r.asked ? `You: ${r.asked}` : undefined}>
-              {r.working && busy(r) ? r.working : placesOf(r).join(', ')}
+              {r.working && busy(r) ? r.working : (wakeLine(r, placesOf(r), Date.now()) ?? placesOf(r).join(', '))}
             </span>
           </a>
         </li>

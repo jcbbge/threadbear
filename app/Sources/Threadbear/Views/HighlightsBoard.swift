@@ -264,7 +264,7 @@ private struct BoardCard: View {
     }
 
     private func openInNotion() {
-        if let url = URL(string: task.url) { NSWorkspace.shared.open(url) }
+        if let url = URL(string: task.url) { OpenGate.openWeb(url) }
     }
 
     private var openButton: some View {

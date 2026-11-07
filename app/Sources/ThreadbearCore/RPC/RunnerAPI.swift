@@ -120,6 +120,13 @@ public extension RPCClient {
         try await call("threads.highlights", .object(["threadId": .string(threadId)]), as: ThreadHighlights.self)
     }
 
+    /// The slash commands the thread can run, for the composer's palette
+    /// (docs/protocol.md, "Slash commands"). The first ask for a folder
+    /// starts a CLI to list them, which takes a second or two.
+    func threadCommands(threadId: String) async throws -> [SlashCommand] {
+        try await call("threads.commands", .object(["threadId": .string(threadId)]), as: SlashCommandList.self, timeout: .seconds(30)).commands
+    }
+
     /// Asks the small model about words selected in the thread (see
     /// "Explain"). The pool's CLI can take a few seconds to start.
     func explain(_ session: ExplainSession, threadId: String, turn index: Int) async throws -> ExplainResult {
@@ -146,9 +153,11 @@ public extension RPCClient {
     }
 
     /// Runs an action from the thread's patches. A command action answers
-    /// when the command has finished (the runner stops it after 10 minutes).
+    /// when the command has finished. Land has an hour for queueing and
+    /// checking; other commands have ten minutes. Allow a minute for the reply.
     func runAction(threadId: String, actionId: String) async throws -> ActionRunResult {
-        try await call("actions.run", .object(["threadId": .string(threadId), "actionId": .string(actionId)]), as: ActionRunResult.self, timeout: .seconds(11 * 60))
+        let minutes = actionId == "worktree.land" ? 61 : 11
+        return try await call("actions.run", .object(["threadId": .string(threadId), "actionId": .string(actionId)]), as: ActionRunResult.self, timeout: .seconds(minutes * 60))
     }
 
     /// Trusts the versions of the thread's waiting patch files that were
@@ -222,6 +231,26 @@ public extension RPCClient {
         if let message { params["message"] = .string(message) }
         if let answers { params["answers"] = .object(answers.mapValues { .string($0) }) }
         _ = try await call("approvals.respond", .object(params), as: EmptyResult.self)
+    }
+
+    /// Another runner's request for a new thread, as it was filed
+    /// (docs/protocol.md, "Asking another runner"). Only this Mac's own
+    /// runner, with the owner key, can read and answer it.
+    func startRequest(threadId: String, approvalId: String) async throws -> StartRequest {
+        try await call("requests.get", .object(["threadId": .string(threadId), "approvalId": .string(approvalId)]), as: StartRequest.self)
+    }
+
+    /// Starts it (on `runnerId`) or says no, then answers its card.
+    func answerStartRequest(threadId: String, approvalId: String, allow: Bool, runnerId: String?, fingerprint: String?) async throws {
+        var params: [String: JSONValue] = ["threadId": .string(threadId), "approvalId": .string(approvalId), "allow": .bool(allow)]
+        if let runnerId { params["runnerId"] = .string(runnerId) }
+        if let fingerprint { params["fingerprint"] = .string(fingerprint) }
+        _ = try await call("requests.answer", .object(params), as: JSONValue.self)
+    }
+
+    /// Go ahead on a "Plan first" plan (docs/protocol.md, "Plan first").
+    func approvePlan(threadId: String, itemId: String) async throws {
+        _ = try await call("plans.approve", .object(["threadId": .string(threadId), "itemId": .string(itemId)]), as: EmptyResult.self)
     }
 
     /// Answers a `secret.requested` card (docs/protocol.md, "Secrets").
@@ -536,6 +565,13 @@ public extension RPCClient {
         }
     }
 
+    /// Puts the runners in this order (every runner's id, this one's too):
+    /// the one order the phone sets as well. It comes back in
+    /// `remoteThreads.updated`.
+    func setRunnerOrder(_ runnerIds: [String]) async throws {
+        _ = try await call("runners.setOrder", .object(["runnerIds": .array(runnerIds.map { .string($0) })]), as: EmptyResult.self)
+    }
+
     /// Runs it now, as if it were due, even when paused. Another runner's
     /// schedule comes back `queued`, with no thread: that runner runs it.
     func runSchedule(_ scheduleId: String) async throws -> ScheduleRunResult {
@@ -832,6 +868,29 @@ public struct ProjectUpdate: Sendable, Hashable {
         if let archived { params["archived"] = .bool(archived) }
         if let notion { params["notion"] = .string(notion) }
         return params
+    }
+
+    /// The project as it will be once the runner has made this change, so
+    /// a save shows straight away however slow the runner is. Its reply
+    /// replaces the guess. A different Notion page has a board nobody has
+    /// read yet, so the old one goes.
+    public func applied(to project: Project, now: Date = Date()) -> Project {
+        var project = project
+        if let title, !title.isEmpty { project.title = title }
+        if let folders { project.folders = folders }
+        if let goals { project.goals = goals }
+        if let state {
+            project.state = state
+            project.stateUpdatedAt = now
+        }
+        if let notes { project.notes = notes }
+        if let archived { project.archived = archived }
+        if let notion {
+            let link = notion.isEmpty ? nil : notion
+            if link != project.notion { project.tasks = nil }
+            project.notion = link
+        }
+        return project
     }
 }
 

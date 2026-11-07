@@ -214,8 +214,9 @@ turn footer (duration and cost), a note or an error.
 - While a turn runs, the last row is "Working for 12s" with a spinner, and
   the turn's live group adds the current action after a dot.
 - A turn that edited files ends with an "Edited 3 files" card (name, folder,
-  +N −M); click a file for its diff. A turn that ended with a summary
-  doesn't: the summary is the reply, and the edits are in its folded work.
+  +N −M); click a file for its diff. A turn that ended with a summary, or
+  with One reply's final message, doesn't: that's the reply, and the edits
+  are in its folded work.
 
 - `ThreadbearCore` turns protocol events into rows (`TranscriptModel`), keeps
   live events in seq order and spots gaps (`ThreadFeed`), splits markdown into
@@ -470,9 +471,13 @@ app has quit (another thread's once it has been quiet for 30 minutes).
 Tools/dev-app.sh start --mock                    # the demo threads; prints the instance id
 Tools/dev-app.sh start --mock --fixtures .fixtures/threads/<id>   # a tb export
 Tools/dev-app.sh start --home <dev runner home>  # runner/scripts/dev-runner.sh
+Tools/dev-app.sh start --mock --bear-date 2026-12-24T23:00   # the date the bear goes by: its Santa hat (1 to 26 December), bedtime under an empty Inbox
+TB_MOCK_NO_REMOTE=1 Tools/dev-app.sh start --mock --fixtures Tools/mock-runner/fixtures/demo-keep-awake   # archive that one and the inbox is empty: bruce's demo threads can't be
 Tools/dev-app.sh do '{"cmd":"open","id":"demo_upload"}' '{"cmd":"expand","row":"g:"}'
 Tools/dev-app.sh do '{"cmd":"collapse","highlightSection":"subagents"}'   # a Highlights heading; see HighlightFold
+Tools/dev-app.sh do '{"cmd":"point","settings":true,"x":200,"y":262,"toX":215,"toY":345,"holdMs":800}'   # real events in the Settings window; holdMs waits mid-drag for a `shot`
 Tools/dev-app.sh do '{"cmd":"click","tip":"Hide Links"}'   # presses a SwiftUI control by its tooltip, without moving the pointer
+Tools/dev-app.sh do '{"cmd":"error","text":"Thread not found"}'   # fills the error bar ({"cmd":"error"} clears it)
 Tools/dev-app.sh dump            # sidebar, rows (id, kind, height, open, text), panels, actions, composer, banner
 Tools/dev-app.sh shot /tmp/a.png # the window alone
 Tools/dev-app.sh rebuild         # a new build, same options and runner, same thread open
@@ -522,26 +527,32 @@ is an error. Commands marked "the open thread" act on `id` when it's given
 |---|---|---|
 | `open` | `id`, `timeout` | selects a thread and waits until its rows are on screen |
 | `signin` | `sendAgain` | the selected thread's Sign in… line, shown when its last turn's login was refused: the login it names (`ok none` without one); `sendAgain` presses Send again |
+| `refusal` | `continue` | the selected thread's Codex Sol recovery offer (`ok none` without one); `continue: true` presses Continue with Codex Sol. A message containing `mock refusal` makes a Claude turn fail with a safeguards refusal on the mock runner |
 | `select` | `id` | selects it without waiting |
 | `subagent` | `thread` (default: the open one), `id`, `timeout` | shows a sub-agent's transcript, as clicking its row under the thread does, and waits until its rows are on screen |
+| `menu-key` | `key` (a letter, or `down`, `up`, `left`, `right`), `modifiers` (`cmd`, `opt`, `ctrl`, `shift`) | a key equivalent through the main menu, as pressing it would; says whether an item took it, the open thread and any end-of-inbox note |
+| `click-at` | `x`, `y` | a click at a point in the main window, in points from its top left, without moving the pointer |
 | `mouse-button` | `button` (`back`, `forward`) | a mouse's side-button click over the window, through the same handler as a real one; says the sidebar view, the thread and whether back and forward can go further |
+| `page-swipe` | `dx`, `dy` (right and down positive; right is Back), `steps`, `lift` (default true) | two fingers across the middle of the window, as synthetic trackpad events through the handler SwipeNavigation's monitor calls; `"lift": false` leaves the fingers down for a shot of the edge arrow. Says the way, how far along and whether it's past the line, then where the window went |
 | `realMenu` | `x`, `y` (window points from the top left; `right` to right-click) or `main` (a menu bar menu), `sub` | opens a real menu; `dev-app.sh menu <file.png> '<these as JSON>'` captures it, the only way to see its icons. It's up for a second over whatever's in front, so check `HIDIdleTime` first |
 | `new`, `options` | `cwd`, `account`, `model` (`null` for the default), `effort` (`null` for the model's own), `ask` | the new-thread composer and its menus; `options` refuses anything else (a typo used to pass) and says what's set now |
-| `composer-menu` | `menu` (`model`, `account`, `permission`, `folder` or `runner`, the new-thread composer's Runs on; default `model`), `click` (an item's title; an account's email or id), `show` (opens the model or account picker and says its window number) | the composer chip's menu (or the model or account picker) for the open thread or a new one, as text: `[x]` the ticked item, `*` the default, the subtitle after a dash, submenus and older models indented, `#` on a section, `---` before the account picker's line about where the numbers came from; `click` picks an item as a click would |
+| `composer-menu` | `menu` (`model`, `account`, `permission`, `folder`, `runner`, the new-thread composer's Runs on, or `context`, the context ring: its tokens and percent, `show` opens its popover; default `model`), `click` (an item's title; an account's email or id), `show` (opens the model or account picker and says its window number) | the composer chip's menu (or the model or account picker) for the open thread or a new one, as text: `[x]` the ticked item, `*` the default, the subtitle after a dash, submenus and older models indented, `#` on a section, `---` before the account picker's line about where the numbers came from; `click` picks an item as a click would |
 | `menu-popover` | `stuck` (true: behave as if macOS had stopped showing menus), `show` or `popup` (`permission`, `folder`, `plus` or `hibernate` with `id`), `click` (a row's title), `fromView` (true with `show`: from a small view that's then freed, as the moon is, and says whether it stayed and sits below) | the popover that stands in for a menu when menus are stuck (MenuWatch): `show` draws one over the window and says its window number, `popup` opens a real menu (stuck, the popover takes its place), `click` picks a row as a click would; alone, lists the rows on show and whether menus are stuck |
 | `drag-space` | `add` (a Space id: puts the main window on it, as a drag on macOS 27.2 leaves it on the drag Space, 31 on Mike's Mac), `misfile` (true: files it under another display's Space instead of its own, as an update restart in the background did), `repair` (true runs DragSpace's repair now) | the main window's Spaces and frame, the displays' own Spaces, how many repairs and refiles have run and whether menus are stuck for another reason |
 | `usage` | `show` (true opens the Usage panel, false closes it), `click` (`Update`, `Update anyway`, `Go back to <version>`, `Automatic`, `Ask me`, `Off` with `provider`, or `Check now`) | the Usage panel as text: each login's room by pool (`#`) and provider (`##`), then the Updates panel's CLIs with their buttons in brackets. `dump` has the same lines while it's open |
 | `share` | `access` (`off` or `link`), `open` (true opens the share popover, false closes it) | sets the selected thread's sharing through the same call as the popover; says its access, link, whether the popover is up, and the thread's own web link (what the ... menu's Share submenu opens and copies) |
 | `updates` | `show` (true opens the Updates panel, false closes it), `rightClick` (true right-clicks the icon, which opens or closes the app's update popover), `popover` (false closes that), `preview` (`staged`, `building`, `failed` or `none`: makes up the app's update, for screenshots) | whether the icon has its grey dot for the app or runner, its tooltip, whether the popover is up and its line, and the panel's app and runner lines |
-| `point` | `x`, `y`, `toX`, `scrollX`, `scrollY`, `review` (a review's ID, for its window) | real events at a spot in the window (points from its top left), for SwiftUI controls with nothing to find them by: a click, a drag to `toX`, or a wheel in lines. They go straight to the window, so the pointer stays put |
+| `point` | `x`, `y`, `toX`, `toY`, `scrollX`, `scrollY`, `review` (a review's ID, for its window) | real events at a spot in the window (points from its top left), for SwiftUI controls with nothing to find them by: a click, a drag to `toX` and `toY`, or a wheel in lines. They go straight to the window, so the pointer stays put |
 | `project-why` | `id` (a project's id, or null to close) | opens the ⓘ popover on that project's heading in the open thread's Highlights; says its reason, who put it there and its buttons |
 | `connectors` | `show` (true opens the Connectors panel, false closes it), `click` (a service's id: presses its Connect button, which opens the page in the browser) | the state, whether the icon has its accent or grey dot, its tooltip, and each service's line with its button |
 | `type`, `send`, `return` | `text`, `replace`, `timeout`, `shift` | types into the composer (`replace` takes the place of what's there); `send` types and presses Return, and from the new-thread composer waits for the thread it starts and prints its id; `return` with `"shift": true` is Shift-Return |
 | `paste` | `text` | pastes into the composer as ⌘V would (a thread id or card link comes in as its chip), through a private pasteboard, not the clipboard |
 | `rename` | `title` | without `title`, makes the open thread's title in the header a field, as a click does; with it, saves that title as Mike's |
+| `drop` | `path`, `x`, `y` (window points from its top left), `hover`, `leave` | drops a file there on the view AppKit would hand it to (the deepest one under it signed up for a type it has), through the instance's own pasteboard; `hover` stops before the drop (for a shot of the mark), `leave` drags back off. Not a real drag: check one of those by hand before trusting it |
 | `paste-image` | `path`, `focused` | through the instance's own pasteboard; `focused` pastes where the cursor is (an ask's Something else box) |
 | `decide` | `pick` (`"ask:choice"`, both 1-based, choice 0 for "Something else"; picking the same again unpicks it), `clear`, `send` | the open thread's card of asks, picked as its buttons pick, waiting in the composer; `send` sends the composer with the picks. Says what's picked after |
 | `return`, `escape` at the cursor | `focused` (`return` only) | `return` with `focused: true`, or `escape`, presses the key in whichever text box has the cursor |
+| `arrow`, `tab` | `dir` (`up` or `down`) | presses the arrow or Tab key where the cursor is: in the composer they move and take the slash command palette's pick |
 | `click` | `title`, or `tip` (with `settings`: in the Settings window) | a button in the transcript: Allow, Always allow, Deny, an option, Send answer; `tip` presses a SwiftUI control with that tooltip through the window, without moving the pointer |
 | `expand`, `collapse` | `row`, `file`, `all`, `section`, `scheduleSection` | a group, tool, thinking block or settled approval (one folded in a closed group opens it); `file` (path or index) in a changes card; `all` for a whole diff; `section` (`inbox`, `running`) folds or opens an inbox heading, as clicking it does; `scheduleSection` (`active`, `paused`, `done`) a Scheduled one |
 | `sort` | `order` (`needsYou`, `newest`, `oldest`) | the Inbox section's order, as its heading's sort menu sets it |
@@ -571,15 +582,16 @@ is an error. Commands marked "the open thread" act on `id` when it's given
 | `page-scroll` | `dy` (points a frame, 14), `steps` (120), `back` (default true), `updates` (a second, 0) | scrolls the scroll view under the middle of the window (the transcript, or a page like Projects) down and back, as a trackpad would, optionally with that many stand-in thread updates a second, and says how the frames went. Needs `front` |
 | `action` | `id`, `timeout` | runs that action chip of the selected thread and waits for a command to finish (default 60 s); `dump` lists the actions |
 | `trust` | `id` | does what Patches' Trust button does, for the selected thread's waiting patches (`id` for one) |
-| `panel` | `id`, `show` | the selected thread's pane sections, each a panel in the window's dock: `id` opens or brings up that section (`threadbear.highlights`, a panel's id, or `threadbear.patches`; an error names the ones it has), `show` false closes every section and true opens them again (Highlights if none), neither toggles; `dump` lists the sections, the active one starred, and what Highlights has, and its `dock:` line is the whole layout |
+| `panel` | `id`, `show` | the selected thread's pane sections, each a panel in the window's dock: `id` opens or brings up that section (`threadbear.highlights`, `threadbear.files`, a panel's id, or `threadbear.patches`; an error names the ones it has), `show` false closes every section and true opens them again (Highlights if none), neither toggles; `dump` lists the sections, the active one starred, and what Highlights has, and its `dock:` line is the whole layout |
 | `folder` | `open`, `select`, `click` (`count`), `expand`, `up`, `mode`, `sort` (`ascending`), `hidden`, `key` (`command`, `shift`, `characters`), `crumb`, `pathBar`, `menu`, `choose` (`row`), `quickLook` | the folder browser showing in the pane (FolderBrowser.swift): `open` is what a double-click does to that row, `select` picks it, `click` presses it through the window (`count` 2 for a double-click), `expand` is its triangle, `up` is ⌘↑, `mode` is `list` or `icons`, `sort` a column (`name`, `modified`, `size`), `hidden` is ⌘⇧., `key` a key code on the view showing, `crumb` a folder in the path bar; says the rows, and `pathBar` its words, `menu` a row's right-click menu (`""` the empty space's), `choose` picks an item of it (`row`, or the empty space's), `quickLook` what the space bar would show. `dump`'s preview line has the same summary |
-| `preview` | `path`, `url`, `close`, `back`, `edit`, `insert` | opens a file, folder or page in the selected thread's pane, as a click on a highlight does (a web URL goes to the browser); `close` goes back to the section, `back` is the bar's Back. Over a text file, `edit` true or false is the bar's pencil or Done, and `insert` types text at the end of the editor (`wait` false returns before the save), `resolve` (`file` or `mine`) presses the conflict bar's button; `dump`'s preview line says `(editing)` |
+| `preview` | `path`, `url`, `close`, `back`, `edit`, `insert`, `save` | opens a file, folder or page in the selected thread's pane, as a click on a highlight does (a web URL goes to the browser); `close` goes back to the section, `back` is the bar's Back. Over a text file, `edit` true or false is the bar's pencil or Done, and `insert` types text at the end of the editor (`wait` false returns before the save), `save` true is ⌘S, `resolve` (`file` or `mine`) presses the conflict bar's button; `dump`'s preview line says `(editing)` |
 | `waitFor` | `row`, `kind`, `status` (and `thread`), `text`, `banner` (`""` for none), `connection`, `loaded`, `ready`, `not`, `timeout` | until every condition given holds (default 10 s) |
 | `dump` | `format` (`json`, `text`), `out` | |
 | `screenshot` | `path`, `inProcess` | `screencapture -l`, or drawn in-process when that gives no image; a dev-app instance always draws in-process (`shot` runs screencapture itself). `out` and `path` are refused under ~/Desktop, ~/Documents and ~/Downloads, where macOS would ask Mike to let the temp bundle in; `shot` and `dump` write in the instance's folder and move the file |
 | `window` | `panel`, `settings`, `sheet`, `popover` | the window's id (for `screencapture -l`) and size, once anything pending is drawn; with `panel`, that panel's window of its own; with `popover`, the popover that's up (an ⓘ's: open one with `click`'s `tip` and `settings`) |
 | `float` | `id`, `back` | opens a dock panel (`threadbear.highlights`, say) in a window of its own, kept behind Mike's work, as its menu's Open in New Window does; `back` puts it back in the dock. Says the layout |
-| `settings` | `tab` (`general`, `models`, `pools`, `runners`, `devices`), `pair` (true: shows the pairing code on the devices tab), `close` | opens the Settings window (behind Mike's windows) on that tab, or closes it; says its window number and what it shows (the devices tab's paired list, site and reason among it). `shot <file> --settings`, and `window` and `screenshot` with `"settings": true`, capture it; add `--sheet` (or `"sheet": true`) for the pairing code over it |
+| `settings` | `tab` (`general`, `models`, `pools`, `runners`, `devices`, `keyboard`), `pair` (true: shows the pairing code on the devices tab), `close` | opens the Settings window (behind Mike's windows) on that tab, or closes it; says its window number and what it shows (the devices tab's paired list, site and reason among it). `shot <file> --settings`, and `window` and `screenshot` with `"settings": true`, capture it; add `--sheet` (or `"sheet": true`) for the pairing code over it |
+| `shortcuts` | `record` (a command, as in shortcuts.json), `press` (`cmd+e`, through the recorder), `answer` (`use`, `cancel`), `reset` (a command or `all`), `post` (`keyCode`, `characters`, `modifiers`: a real key press through this app's own event queue, so its monitors and menus see it and nothing reaches any other app) | Settings > Keyboard: says what's listening, the outcome of the last press and what's changed |
 | `review` | `id` (optional), `mode` (`All`, `Single`), `show` (zero-based option, enlarges it) with `shot` (zero-based, which of its shots), `actual` (true zooms to 100%, false fits the image), `peek` (true shows the first reference option, today's version, over the shot on show, as holding Space does), `pick` (option ID or a list of them, each toggles), `none` (true toggles none of them), `reply` (the reply box's text), `notes` (object keyed by ID), `save`, `submit`, `cancel`, `close` | opens a review from the selected thread in a window of its own, kept behind Mike's work, as a click on its card does; edits and sends through the same session as the UI. Returns the draft, status and the window number. `window` and `screenshot` with `"review": "<review ID>"` target its window |
 | `open-panel` | `id` | opens a thread in a panel of its own beside the main panel, as the row's Open in New Panel |
 | `dock-move` | `panel` (`usage`, `thread:<id>` or a full id), `edge` (`left`, `right`, `top`, `bottom`) | moves a panel to a side of the window, as dragging it there does; returns the layout |
@@ -617,7 +629,9 @@ the runner, and which events each row came from ("Copy debug info").
 `MockRunnerTests` runs the real WebSocket client against the mock runner,
 its restart included (skipped if node or the mock's `npm install` is
 missing, except under `THREADBEAR_REQUIRE_MOCK=1`, which `../check.sh` sets
-after installing the mock's packages). `ThreadbearAppTests` tests the app target itself: typing into the
+after installing the mock's packages). A test that reaches a real modal (an
+alert, a save panel) ends the run at once with its stack (`Tests/ModalGuard`),
+as nobody can click it on a check host: stub what asks. `ThreadbearAppTests` tests the app target itself: typing into the
 composer, question answers, incremental streaming heights against a full
 measure, the render cache, sliced tall text, drafts kept when a send fails,
 the restart banner, the runner's message as a note, and the automation
@@ -639,3 +653,15 @@ streams) and text typed into the composer reaching the draft.
 - The model picker lists the CLI's own rows once the runner has asked each
   account (a few seconds after it starts); until then it offers opus, sonnet
   and haiku by name. The runner passes the row's id through to the CLI.
+
+### A real drag
+
+`point` hands events to a window kept behind everything, so it reaches AppKit
+controls, but a SwiftUI gesture ignores a window that isn't key (a `DragGesture`
+never fires, 7 Nov). For those, on Tinker Desk's desktop and never Mike's:
+`{"cmd":"settings","tab":"runners","front":true}` floats the Settings window
+on top and says its number and top left, and `Tools/realdrag.swift` (compile it
+with `swiftc`, run it through `desk`) posts a real drag. Click a blank part of
+the window with it first to make the window key. Look at the whole desktop
+once if nothing happens: other threads' windows and permission dialogs sit
+there, and a drag that misses lands in them.

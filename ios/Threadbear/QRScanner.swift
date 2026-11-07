@@ -77,7 +77,6 @@ struct QRScanner: UIViewControllerRepresentable {
 /// plainly if it's been turned off.
 struct ScanSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openURL) private var openURL
     var accept: (String) -> Bool
     var onCode: (String) -> Void
     @State private var allowed: Bool?
@@ -114,7 +113,8 @@ struct ScanSheet: View {
                         Text("Turn it on in Settings to scan the pairing code.")
                             .multilineTextAlignment(.center)
                         Button("Open Settings") {
-                            if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+                            // The app's own Settings page, not a link from anywhere.
+                            if let url = URL(string: UIApplication.openSettingsURLString) { LinkGate.shared.openOwn(url) }
                         }
                         .buttonStyle(.borderedProminent)
                     }

@@ -181,4 +181,32 @@ final class DecisionsTests: XCTestCase {
         let back = try JSONDecoder().decode(Ask.self, from: JSONEncoder().encode(good))
         XCTAssertEqual(back, good)
     }
+
+    /// Return in a Something else box goes on to the next ask with no
+    /// pick rather than sending (Mike, 7 Nov: Return on ask 7 of 10 sent
+    /// the card with 8 to 10 unanswered), wrapping round to earlier ones.
+    func testNextUnansweredSkipsAnsweredAndWraps() {
+        XCTAssertEqual(Decisions.nextUnanswered(after: 6, count: 10, picks: [0: 0, 6: Decisions.ownAnswer]), 7)
+        XCTAssertEqual(Decisions.nextUnanswered(after: 2, count: 4, picks: [2: 1, 3: 0]), 0)
+        XCTAssertEqual(Decisions.nextUnanswered(after: 0, count: 3, picks: [0: 0, 1: 1]), 2)
+        // Every other ask answered (this one too, or not): nothing left, so Return sends.
+        XCTAssertNil(Decisions.nextUnanswered(after: 1, count: 3, picks: [0: 0, 1: Decisions.ownAnswer, 2: 1]))
+        XCTAssertNil(Decisions.nextUnanswered(after: 0, count: 2, picks: [1: 0]))
+        XCTAssertNil(Decisions.nextUnanswered(after: 0, count: 1, picks: [:]))
+        // The composer's Return counts the ask showing as well, after the rest.
+        XCTAssertEqual(Decisions.nextUnanswered(after: 1, count: 2, picks: [0: Decisions.ownAnswer], orThis: true), 1)
+        XCTAssertEqual(Decisions.nextUnanswered(after: 1, count: 3, picks: [0: 0], orThis: true), 2)
+        XCTAssertEqual(Decisions.nextUnanswered(after: 0, count: 1, picks: [:], orThis: true), 0)
+        XCTAssertNil(Decisions.nextUnanswered(after: 0, count: 2, picks: [0: 0, 1: 1], orThis: true))
+    }
+
+    /// Something else with an empty box sends nothing for that ask, so
+    /// it's still unanswered (a Return there mustn't send the rest).
+    func testAnEmptySomethingElseBoxIsNotAnAnswer() {
+        let own = Decisions.ownAnswer
+        let picks = [0: own, 1: 0, 2: own, 3: own]
+        let notes = [0: AskNote(text: "  \n"), 2: AskNote(text: "mine"), 3: AskNote(text: "", images: [ImageRef(path: "/tmp/a.png", mediaType: "image/png")])]
+        XCTAssertEqual(Decisions.filled(picks: picks, notes: notes), [1: 0, 2: own, 3: own])
+        XCTAssertEqual(Decisions.nextUnanswered(after: 3, count: 4, picks: Decisions.filled(picks: picks, notes: notes)), 0)
+    }
 }

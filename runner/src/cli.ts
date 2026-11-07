@@ -25,6 +25,7 @@ const OPTIONS = {
   effort: { type: 'string' },
   ask: { type: 'boolean' },
   auto: { type: 'boolean' },
+  plan: { type: 'boolean' },
   full: { type: 'boolean' },
   text: { type: 'string' },
   image: { type: 'string', multiple: true },
@@ -79,7 +80,7 @@ const OPTIONS = {
 
 const HELP = `tb: talk to the Threadbear runner
 
-  tb new "text" [--cwd DIR] [--pool ID | --account ID] [--model M] [--effort L] [--ask | --auto] [--image FILE]... [--wait]
+  tb new "text" [--cwd DIR] [--pool ID | --account ID] [--model M] [--effort L] [--ask | --auto | --plan] [--image FILE]... [--wait]
                 [--from NAME] [--why WORDS] [--icon SYMBOL]
                                   --pool runs it on a pool (the login with room, moving when
                                   one runs dry); --account pins it to one login. --from says a
@@ -138,6 +139,9 @@ const HELP = `tb: talk to the Threadbear runner
                                   as that runner alone, written over ssh into its
                                   secrets/convex-key (or a file); never printed
   tb runner list [--json]         tb runner revoke <runnerId> [--purge]  (--purge: and take out all it wrote)
+  tb runner logins [<runnerId> <provider:email>... | none]
+                                  on the main Mac: which logins a runner key's Mac gets this Mac's
+                                  usage readings of (only your word counts, not what that Mac says)
   tb runner check [--ssh <host>]  whether a Mac with a runner key also has a deploy key or
                                   Convex login (either can do anything to the deployment)
   tb runner rotate-owner [--finish] [--lock-out <runnerId,...>]
@@ -162,7 +166,7 @@ ${DEV_HELP}`;
 // The flags each command reads. Any other is refused rather than ignored:
 // `tb events <id> --from 3` used to print every event as if it had worked.
 const COMMAND_FLAGS: Record<string, string[]> = {
-  new: ['cwd', 'account', 'pool', 'model', 'effort', 'ask', 'auto', 'image', 'wait', 'json', 'from', 'why', 'icon'],
+  new: ['cwd', 'account', 'pool', 'model', 'effort', 'ask', 'auto', 'plan', 'image', 'wait', 'json', 'from', 'why', 'icon'],
   send: ['image', 'wait', 'json'],
   list: ['snoozed', 'archived', 'all', 'json'],
   search: ['json'],
@@ -313,15 +317,12 @@ async function landCommand(cfg: ReturnType<typeof loadConfig>, dryRun: boolean):
     }
     target = found.target;
   }
-  let check: string | undefined;
-  try {
-    // Trusted as it stands: running tb land is asking for this check.
-    check = (await findWorktreePatch(from, undefined, undefined, undefined, TRUST_ALL))?.check;
-  } catch (e) {
-    console.error(`Couldn't read the repo's patches for its check: ${(e as Error).message}`);
-    return 1;
-  }
-  return land({ path: target.path, branch: target.branch, mainCheckout: target.mainCheckout, check }, { dryRun });
+  return land(target, {
+    dryRun,
+    // Read after the landing lock and rebase: main may have changed the
+    // check while we waited. Running tb land asks for this patch's check.
+    readCheck: async () => (await findWorktreePatch(from, undefined, undefined, undefined, TRUST_ALL, true))?.check,
+  });
 }
 
 // The thread's summary, or undefined when the runner can't be reached or
@@ -364,6 +365,7 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
       if (f.effort) params.effort = f.effort;
       if (f.ask) params.permissionMode = 'ask';
       else if (f.auto) params.permissionMode = 'auto';
+      else if (f.plan) params.permissionMode = 'plan';
       const startedBy = startedByFlags(f, process.env.THREADBEAR_THREAD_ID);
       if (startedBy) params.startedBy = startedBy;
       const r = await client.call<{ thread: ThreadSummary; turnId: string }>('threads.create', params);
@@ -441,10 +443,11 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
     }
     case 'snooze': {
       const id = notSelf(await resolveId(client, args[0]), STOPS_SELF);
-      // "restart": until the runner next starts.
-      const until = args[1]?.toLowerCase() === 'restart' ? 'restart' : parseWhen(args[1] ?? '1h');
+      // "restart": until the runner next starts; "release": until it starts on a new release.
+      const word = args[1]?.toLowerCase();
+      const until = word === 'restart' || word === 'release' ? word : parseWhen(args[1] ?? '1h');
       const r = await client.call<{ thread: ThreadSummary }>('threads.update', { threadId: id, snoozedUntil: until });
-      console.log(`snoozed until ${r.thread.snoozedUntilRestart ? 'the runner restarts' : r.thread.snoozedUntil}`);
+      console.log(`snoozed until ${r.thread.snoozedUntilRelease ? 'a new release' : r.thread.snoozedUntilRestart ? 'the runner restarts' : r.thread.snoozedUntil}`);
       return 0;
     }
     case 'archive':
@@ -905,6 +908,10 @@ function printEvent(e: any, json: boolean, prefix = ''): void {
       return out(`  (${e.decision})`);
     case 'plan.updated':
       return out(e.entries.map((x: { status: string; text: string }) => `  [${x.status === 'completed' ? 'x' : x.status === 'in_progress' ? '>' : ' '}] ${x.text}`).join('\n'));
+    case 'plan.proposed':
+      return out(`Plan, waiting for approval:\n${e.text}`);
+    case 'plan.resolved':
+      return out(e.decision === 'go' ? '(plan approved)' : '(plan sent back)');
     case 'turn.started':
       // tb events lists every event, so its seqs have no gaps.
       return prefix ? out('(turn started)') : undefined;

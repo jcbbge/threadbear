@@ -31,7 +31,7 @@ export const clisPart = {
     if (rt.tasks.length) return;
     rt.idleTimer = this.clock.setTimeout(() => {
       rt.idleTimer = undefined;
-      if (!rt.turn && rec.queue.length === 0 && rt.tasks.length === 0) this.releaseSession(st);
+      if (!rt.turn && rec.queue.length === 0 && rt.tasks.length === 0 && rt.approvals.size === 0) this.releaseSession(st);
     }, this.cfg.idleMs);
   },
 

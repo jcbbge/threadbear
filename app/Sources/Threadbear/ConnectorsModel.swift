@@ -11,8 +11,21 @@ extension AppModel {
 
     /// A fresh look at the gateway: the panel opening, or its refresh
     /// button. The runner skips the ask if it made one a moment ago.
-    func refreshConnectors() {
-        fetchConnectors(refresh: true)
+    /// `shown`: the refresh button, whose icon spins and which says if the
+    /// gateway's status couldn't be read. Opening the panel just logs it.
+    func refreshConnectors(shown: Bool = false) {
+        guard shown else { return fetchConnectors(refresh: true) }
+        guard let client else { return }
+        whileBusy(BusyKey.refreshConnectors) { [self] in
+            do {
+                connectors = try await client.connectorsStatus(refresh: true)
+            } catch RPCError.server(let code, _) where code == RPCError.methodNotFound {
+                connectors = nil
+                if connectorsShown { connectorsShown = false }
+            } catch {
+                show(error)
+            }
+        }
     }
 
     private func fetchConnectors(refresh: Bool) {
@@ -35,13 +48,13 @@ extension AppModel {
     func openConnect(_ service: ConnectorService) {
         guard let url = ConnectorsText.serviceURL(connectors, service) else { return }
         AppLog.write("connectors", "opening the gateway's page for \(service.id)")
-        NSWorkspace.shared.open(url)
+        OpenGate.openWeb(url)
     }
 
     /// Opens the gateway's admin page, with every service on it.
     func openConnectorsAdmin() {
         guard let url = ConnectorsText.manageURL(connectors) else { return }
         AppLog.write("connectors", "opening the gateway's admin page")
-        NSWorkspace.shared.open(url)
+        OpenGate.openWeb(url)
     }
 }

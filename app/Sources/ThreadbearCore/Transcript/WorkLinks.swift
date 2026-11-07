@@ -21,6 +21,8 @@ public enum WorkLinks {
         var out = ""
         var last = 0
         for match in destination.matches(in: markdown, range: NSRange(location: 0, length: ns.length)) {
+            // No `)` to end it: not a link, and the rest of its line is used up.
+            guard match.range(at: 3).location != NSNotFound else { continue }
             let body = match.range(at: 2)
             out += ns.substring(with: NSRange(location: last, length: body.location - last))
             let raw = ns.substring(with: body)
@@ -30,7 +32,11 @@ public enum WorkLinks {
         return out + ns.substring(from: last)
     }
 
-    nonisolated(unsafe) private static let destination = try! NSRegularExpression(pattern: #"\]\((work|thread):([^)\n]*)\)"#)
+    // The `)` is optional so that a link with none uses up the rest of its
+    // line: each `](work:` after it would fail the same way, and trying
+    // them all was quadratic, 2 s on a 32,000-character reply (Daybreak's
+    // findings of 7 Nov 2026 led to the sweep that found it).
+    nonisolated(unsafe) private static let destination = try! NSRegularExpression(pattern: #"\]\((work|thread):([^)\n]*)(\))?"#)
     private static let allowed: CharacterSet = {
         var set = CharacterSet.urlPathAllowed
         set.remove(charactersIn: "%")
@@ -129,7 +135,8 @@ public enum WorkLinks {
     /// Whether the agent's own text mentions the words outside its work:
     /// links: a line that links to a step isn't the step.
     private static func mentions(_ text: String, _ q: String) -> Bool {
-        normal(text.replacingOccurrences(of: #"\]\(work:[^)\n]*\)"#, with: "]", options: .regularExpression)).contains(q)
+        // As `destination`: one with no `)` uses up its line and stays.
+        normal(text.replacing(/\]\(work:[^)\n]*(\))?/) { $0.1 == nil ? String($0.0) : "]" }).contains(q)
     }
 
     /// "cd app && npm test" starts with "npm test" too.

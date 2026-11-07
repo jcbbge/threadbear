@@ -349,8 +349,17 @@ thread is busy (background work holds it 30 minutes at most; under
 reason "Updating to main at <short>: <subject>". `launch.mjs`'s crash
 rollback covers a release that doesn't come up.
 
-- A build that fails is said once (a `runner.notice` warning, and `tb
-  status`), kept in `<home>/runner/update.json`, and not tried again until
+- A build that fails starts a thread in the background to fix it
+  (`runner/src/fix-update.ts`; Mike, 6 Nov: the old banner came up often,
+  mostly for tests that flaked on a busy Mac, and told him nothing he could
+  act on). The thread reads the output, fixes the cause on main (or clears
+  `update.json` when a rerun is all it takes), watches `tb status` until
+  main goes through and archives itself, so Mike only sees it when it needs
+  him. One at a time: a failure at a newer commit goes to the open thread.
+  A failed backend deploy does the same. Only when no thread can be started
+  (a release that doesn't record its checkout) is it a `runner.notice`
+  warning instead. Either way `tb status` shows it. The failure is
+  kept in `<home>/runner/update.json`, and not tried again until
   something under `runner/` changes on main. That includes a fix to a
   test alone, though it changes nothing that runs: a failure in the checks
   is often fixed that way. Its output is in `<home>/runner/update.log`. A tree whose

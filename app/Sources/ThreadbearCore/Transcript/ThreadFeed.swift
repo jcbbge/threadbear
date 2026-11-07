@@ -175,6 +175,11 @@ public struct ThreadFeed: Sendable {
         model.setAskPicks(seq, picks)
     }
 
+    /// Another runner's request was read (see `TranscriptModel.setStartRequest`).
+    public mutating func setStartRequest(_ approvalId: String, _ request: StartRequest) -> TranscriptChange {
+        model.setStartRequest(approvalId, request)
+    }
+
     /// Mike wrote in a card's Something else boxes (see `TranscriptModel.setAskNotes`).
     public mutating func setAskNotes(_ seq: Int, _ notes: [Int: AskNote]) -> TranscriptChange {
         model.setAskNotes(seq, notes)
@@ -183,6 +188,11 @@ public struct ThreadFeed: Sendable {
     /// Mike ticked follow-ups on a done card (see `TranscriptModel.setNextPicks`).
     public mutating func setNextPicks(_ seq: Int, _ picks: Set<Int>, explain: Set<Int> = []) -> TranscriptChange {
         model.setNextPicks(seq, picks, explain: explain)
+    }
+
+    /// The done card's loose ends changed (see `TranscriptModel.setLooseEnds`).
+    public mutating func setLooseEnds(_ check: LooseEnds?) -> TranscriptChange {
+        model.setLooseEnds(check)
     }
 
     /// The thread's background work changed (see

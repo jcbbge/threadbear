@@ -38,8 +38,10 @@ public enum Decisions {
     }
 
     private static func oneLine(_ text: String) -> String {
-        text.replacingOccurrences(of: #"\s*\n\s*"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Split by hand: `\s*\n\s*` tried every space as a start, quadratic
+        // on a long run of them.
+        text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.joined(separator: " ")
     }
 
     /// Whether the text ends a sentence, looking past closing quotes,
@@ -115,6 +117,27 @@ public enum Decisions {
         }
     }
 
+    /// The next ask after `index` (wrapping round) with nothing picked, or
+    /// nil when every other ask has a pick. Return in a Something else box
+    /// goes there instead of sending while one's left, so an early Return
+    /// can't send the card half answered (Mike, 7 Nov). `orThis` counts ask
+    /// `index` too, last (the empty composer's Return, from the ask shown).
+    /// The picks that will send something: Something else with nothing
+    /// written or pasted in its box is left out of the message (`answers`),
+    /// so it doesn't count as an answer either.
+    public static func filled(picks: [Int: Int], notes: [Int: AskNote]) -> [Int: Int] {
+        picks.filter { index, n in
+            guard n == ownAnswer, let note = notes[index] else { return n != ownAnswer }
+            return !note.images.isEmpty || !note.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    public static func nextUnanswered(after index: Int, count: Int, picks: [Int: Int], orThis: Bool = false) -> Int? {
+        guard count > 0 else { return nil }
+        let others = count > 1 ? (1..<count).map { (index + $0) % count } : []
+        return (others + (orThis ? [index] : [])).first { picks[$0] == nil }
+    }
+
     /// The pictures from the answered asks' boxes, in the card's order,
     /// numbered as `answers` says. The composer's own go after them.
     public static func images(asks: [Ask], picks: [Int: Int], notes: [Int: AskNote]) -> [ImageRef] {
@@ -184,9 +207,43 @@ public enum Decisions {
         return rest.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Whether the open card can be answered: a completed turn that said
-    /// it needs Mike, with asks, and nothing running.
-    public static func isOpen(_ thread: ThreadSummary) -> Bool {
-        thread.needs == "you" && thread.asksSeq != nil && !thread.asks.isEmpty && !thread.status.isBusy
+    /// Whether the open card can be answered: the last completed turn said
+    /// it needs Mike, with asks, and nothing running, or else a running
+    /// turn whose transcript still has that card open (`card`, the
+    /// session's TranscriptModel.openCard). A background job the agent
+    /// left (a script waiting for his phone to unlock) wakes it with a
+    /// runner message, which leaves the card open, and while that turn
+    /// ran every click on it did nothing (Mike, 7 Nov); his answer now
+    /// goes into the running turn like anything he sends mid-turn. The
+    /// summary keeps its asks until the turn ends, even after his own
+    /// reply (from the phone too) closed the card, so a running thread
+    /// takes the card's word for it: an unsent pick on a card he'd
+    /// already answered mustn't go with his next message.
+    public static func isOpen(_ thread: ThreadSummary, card openCard: TranscriptRow? = nil) -> Bool {
+        guard thread.needs == "you", let seq = thread.asksSeq, !thread.asks.isEmpty else { return false }
+        guard thread.status.isBusy else { return true }
+        guard case .asks(let card)? = openCard?.content else { return false }
+        return card.isOpen && !card.isDone && card.seq == seq
+    }
+
+    /// The summary with the card the transcript has open, for a summary
+    /// that comes without one: another runner's thread read through
+    /// Convex, whose sidebar row leaves the asks out (AppModel.withRelayCard).
+    /// The asks and their seq are the card's, so a pick on it matches.
+    /// No open card with asks (answered, a done card, none yet) leaves
+    /// none.
+    public static func withCard(_ thread: ThreadSummary, _ openCard: TranscriptRow?) -> ThreadSummary {
+        var out = thread
+        if case .asks(let card)? = openCard?.content, card.isOpen, !card.isDone, !card.asks.isEmpty {
+            out.needs = "you"
+            // Ticks live on the card, not its asks (asks.ticked).
+            out.asks = card.asks.enumerated().map { i, ask in var ask = ask; ask.ticked = card.ticked.contains(i); return ask }
+            out.asksSeq = card.seq
+        } else {
+            out.needs = nil
+            out.asks = []
+            out.asksSeq = nil
+        }
+        return out
     }
 }

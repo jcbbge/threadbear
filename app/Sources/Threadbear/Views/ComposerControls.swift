@@ -9,6 +9,7 @@ import ThreadbearCore
 /// for a thread on another Mac.
 struct ComposerControls: View {
     @Environment(AppModel.self) private var app
+    @AppStorage(VoiceMode.enabledKey) private var voiceEnabled = true
     let thread: ThreadSummary?
     let running: Bool
     let canSend: Bool
@@ -109,7 +110,7 @@ struct ComposerControls: View {
             .frame(height: zoomed(26))
             .tip("\(place), in \(thread.cwd.abbreviatingHome)")
             Spacer(minLength: zoomed(8))
-            SendButton(running: running, canSend: canSend, sending: sending, onSend: onSend, onStop: { app.interrupt() })
+            SendButton(running: running, canSend: canSend, sending: sending, stopping: app.isBusy(BusyKey.stop(thread.id)), onSend: onSend, onStop: { app.interrupt(thread.id) })
                 .layoutPriority(1)
         }
         .frame(height: SendButton.size)
@@ -122,6 +123,9 @@ struct ComposerControls: View {
         // A new thread for another runner: no pictures or schedules from
         // here (paths on this Mac). Its folder is in the machine chip's menu.
         let draftAway = thread == nil && app.newThreadRunnerId != nil
+        // A login or pool pick can't be guessed (ThreadUpdate.applied), so
+        // the chips that show it spin until the runner has made it.
+        let moving = thread.map { app.isBusy(BusyKey.moving($0.id)) } ?? false
         HStack(spacing: zoomed(4)) {
             if let remote {
                 runnerChip(remote.thread, place: remote.place)
@@ -131,7 +135,7 @@ struct ComposerControls: View {
                 runsOnChip
                     .padding(.leading, -zoomed(7))
             } else {
-                PlusButton { settings.plusMenu(attach: onAttach, schedule: app.schedulesSupported ? onSchedule : nil) }
+                PlusButton(busy: thread.map { app.isBusy(BusyKey.movingFolder($0.id)) } ?? false) { settings.plusMenu(attach: onAttach, schedule: app.schedulesSupported ? onSchedule : nil) }
                     // Pulls the glyph back so it lines up with the text above.
                     .padding(.leading, -zoomed(7))
                 runsOnChip
@@ -140,12 +144,12 @@ struct ComposerControls: View {
             // chip: the model chip names the pool (or the pinned login).
             if !settings.usesPools {
                 ComposerChip(icon: "person.crop.circle", title: AccountName.short(account, accounts: settings.logins.accounts), help: settings.accountChipHelp,
-                             badge: settings.accountBadge, popover: {
+                             badge: settings.accountBadge, busy: moving, popover: {
                     NSHostingController(rootView: AccountPickerView(threadId: thread?.id, close: $0).environment(app))
                 }, openRequest: app.accountPickerRequest)
                 ChipDivider()
             }
-            ComposerChip(icon: settings.modelChipIcon, logo: settings.modelChipLogo, title: settings.modelChipTitle, help: settings.modelChipHelp, badge: settings.modelChipBadge, popover: {
+            ComposerChip(icon: settings.modelChipIcon, logo: settings.modelChipLogo, title: settings.modelChipTitle, help: settings.modelChipHelp, badge: settings.modelChipBadge, busy: moving, popover: {
                 // The picker reads the thread live, so a pick made while
                 // it's open shows straight away.
                 NSHostingController(rootView: ModelPickerView(threadId: thread?.id, close: $0).environment(app))
@@ -159,7 +163,20 @@ struct ComposerControls: View {
                 settings.permissionMenu()
             }
             Spacer(minLength: zoomed(8))
-            SendButton(running: running, canSend: canSend, sending: sending, onSend: onSend, onStop: { app.interrupt() })
+            // How full the context is, beside send: where you decide to
+            // carry on, /compact or start afresh.
+            if let thread, let meter = ContextMeter(thread) {
+                ContextRing(meter: meter, openRequest: app.contextMeterRequest) {
+                    NSHostingController(rootView: ContextPopover(threadId: thread.id).environment(app))
+                }
+            }
+            // Voice for the thread, or on a new thread's composer, where
+            // what's said first starts it (Settings > Voice can hide it).
+            if voiceEnabled, VoiceMode.available, !draftAway {
+                VoiceButton(threadId: thread?.id ?? VoiceMode.newThread, size: SendButton.size)
+                    .layoutPriority(1)
+            }
+            SendButton(running: running, canSend: canSend, sending: sending, stopping: thread.map { app.isBusy(BusyKey.stop($0.id)) } ?? false, onSend: onSend, onStop: { app.interrupt(thread?.id) })
                 .layoutPriority(1)
                 // Right-click send for later, as Mail and Slack do. Not on
                 // another Mac's thread: its schedules are made from there.
@@ -634,7 +651,7 @@ struct ThreadSettings {
         let menu = NSMenu()
         // Auto is Claude Code's; Codex has nothing like it, so it's only offered
         // for Claude (or if a thread is somehow on it already).
-        let modes: [PermissionMode] = provider == "claude" || permissionMode == .auto ? [.full, .auto, .ask] : [.full, .ask]
+        let modes: [PermissionMode] = provider == "claude" || permissionMode == .auto ? [.full, .auto, .ask, .plan] : [.full, .ask, .plan]
         for mode in modes {
             let item = ActionMenuItem(mode.composerTitle, symbol: mode.composerIcon, checked: permissionMode == mode) { setPermission(mode) }
             item.subtitle = mode.composerHelp
@@ -690,6 +707,7 @@ private extension PermissionMode {
         case .full: "Full access"
         case .ask: "Ask before edits"
         case .auto: "Auto"
+        case .plan: "Plan first"
         }
     }
 
@@ -698,6 +716,7 @@ private extension PermissionMode {
         case .full: "lock.open"
         case .ask: "lock"
         case .auto: "lock.shield"
+        case .plan: "list.bullet.clipboard"
         }
     }
 
@@ -706,6 +725,7 @@ private extension PermissionMode {
         case .full: "Edits files and runs commands without asking"
         case .ask: "Asks before editing files or running commands"
         case .auto: "A safety check approves or blocks each action, and asks only when unsure"
+        case .plan: "Reads and plans, and changes nothing until you approve its plan"
         }
     }
 }
@@ -723,6 +743,9 @@ private struct ComposerChip: View {
     /// After the title: "· 12%" in orange, "Limit reached" in red. Colour
     /// only here, where it means the account is running out.
     var badge: AccountUsageText.ChipBadge? = nil
+    /// A pick from this chip is on its way: a spinner for the icon, and it
+    /// won't open again until that's landed.
+    var busy = false
     var menu: (() -> NSMenu)? = nil
     /// Instead of a menu: a popover above the chip, given a way to close
     /// itself.
@@ -739,7 +762,10 @@ private struct ComposerChip: View {
         } label: {
             HStack(spacing: zoomed(4)) {
                 Group {
-                    if let logo {
+                    if busy {
+                        SpinnerMark(color: .secondaryLabelColor)
+                            .frame(width: TypeScale.chip, height: TypeScale.chip)
+                    } else if let logo {
                         ProviderMark(provider: logo, symbol: icon, side: TypeScale.chip - 1)
                     } else {
                         Image(systemName: icon)
@@ -788,12 +814,98 @@ private struct ComposerChip: View {
         .background(MenuAnchorView(anchor: anchor))
         .onHover { hovering = $0 }
         .onChange(of: openRequest) { _, _ in open() }
-        .tip(help)
+        .disabled(busy)
+        .tip(busy ? "Moving this thread" : help)
     }
 
     private func open() {
+        guard !busy else { return }
         if let menu { anchor.popUp(menu()) }
         else if let popover { anchor.show(popover) }
+    }
+}
+
+/// A small ring for how full the thread's context is: grey, orange once
+/// it's nearly full (the one place it has colour, as that's when it
+/// matters). Clicking it opens ContextPopover.
+private struct ContextRing: View {
+    let meter: ContextMeter
+    var openRequest: Int = 0
+    let popover: () -> NSViewController
+    @State private var hovering = false
+    @State private var anchor = MenuAnchor()
+
+    var body: some View {
+        let side = zoomed(15)
+        let line = zoomed(2.5)
+        Button {
+            anchor.show { _ in popover() }
+        } label: {
+            ZStack {
+                Circle().stroke(Color.primary.opacity(0.22), lineWidth: line)
+                Circle()
+                    // A sliver even when nearly empty, so it reads as a meter.
+                    .trim(from: 0, to: max(0.03, meter.fraction))
+                    .stroke(meter.isNearlyFull ? Color.orange : Color.secondary, style: StrokeStyle(lineWidth: line, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+            }
+            .frame(width: side, height: side)
+            .frame(width: zoomed(26), height: zoomed(26))
+            .background(Circle().fill(Color.primary.opacity(hovering ? 0.08 : 0)))
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .background(MenuAnchorView(anchor: anchor))
+        .onHover { hovering = $0 }
+        .onChange(of: openRequest) { _, _ in anchor.show { _ in popover() } }
+        .tip(meter.tip)
+        .accessibilityLabel(meter.tip)
+    }
+}
+
+/// The ring's popover: the context in tokens, what happens when it fills,
+/// then the model and login the thread is really running on and what it
+/// has cost. Reads the thread live, so it moves while a turn runs.
+struct ContextPopover: View {
+    @Environment(AppModel.self) private var app
+    let threadId: String
+
+    var body: some View {
+        let thread = app.threads[threadId]
+        VStack(alignment: .leading, spacing: 6) {
+            if let thread, let meter = ContextMeter(thread) {
+                Text("Context").font(.system(size: 13, weight: .semibold))
+                ProgressView(value: meter.fraction)
+                    .progressViewStyle(.linear)
+                    .tint(meter.isNearlyFull ? .orange : .secondary)
+                HStack {
+                    Text(meter.amount)
+                    Spacer()
+                    Text("\(meter.percent)%").foregroundStyle(.secondary)
+                }
+                .font(.system(size: 12))
+                Text(ContextMeter.compactNote(provider: thread.provider))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Divider().padding(.vertical, 2)
+                let settings = ThreadSettings(app: app, thread: thread)
+                row("Model", ComposerChips.chipTitle(model: settings.effectiveModel, effort: settings.effectiveEffort, choices: settings.choices))
+                row("Login", settings.logins.account(thread.accountId).map(AccountName.title) ?? thread.accountId)
+                if let cost = CostText.format(thread.costUsd) { row("Cost so far", cost) }
+            }
+        }
+        .padding(14)
+        .frame(width: 260)
+    }
+
+    private func row(_ name: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(name).foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(value).lineLimit(1).truncationMode(.middle)
+        }
+        .font(.system(size: 12))
     }
 }
 
@@ -807,6 +919,8 @@ private struct ChipDivider: View {
 
 /// Opens a small menu: "Attach images…" and the folder.
 private struct PlusButton: View {
+    /// A folder picked from its menu is on its way.
+    var busy = false
     let menu: () -> NSMenu
     @State private var hovering = false
     @State private var anchor = MenuAnchor()
@@ -823,6 +937,7 @@ private struct PlusButton: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
+        .busy(busy)
         .background(MenuAnchorView(anchor: anchor))
         .onHover { hovering = $0 }
         .tip("Attach images, change the folder or schedule the message")
@@ -836,8 +951,11 @@ private struct SendButton: View {
     let running: Bool
     let canSend: Bool
     let sending: Bool
+    /// The Stop is on its way: a spinner until the turn has ended.
+    var stopping = false
     let onSend: () -> Void
     let onStop: () -> Void
+    @Environment(\.sendNudges) private var nudges
 
     static var size: CGFloat { zoomed(28) }
 
@@ -855,18 +973,33 @@ private struct SendButton: View {
                 .background(Circle().fill(Color.primary.opacity(0.1)))
                 .tip("Starting the thread")
                 .accessibilityLabel("Starting the thread")
+        } else if running && !canSend && stopping {
+            SpinnerMark(color: .secondaryLabelColor)
+                .padding(zoomed(6))
+                .frame(width: Self.size, height: Self.size)
+                .background(Circle().fill(Color.primary.opacity(0.1)))
+                .tip("Stopping")
+                .accessibilityLabel("Stopping")
         } else if running && !canSend {
             Button(action: onStop) {
                 Image(systemName: "stop.fill").font(.system(size: zoomed(9), weight: .bold))
             }
             .buttonStyle(CircleButtonStyle(filled: true))
-            .shortcutHint("⌘.", .before)
-            .tip("Stop (⌘.)")
+            .shortcutHint(AppShortcuts.shared.display(.stop), .before)
+            .tip(AppShortcuts.shared.tip("Stop", .stop))
             .accessibilityLabel("Stop")
-            .keyboardShortcut(".", modifiers: .command)
+            .shortcut(.stop)
         } else {
             Button(action: onSend) {
                 Image(systemName: "arrow.up").font(.system(size: zoomed(13), weight: .semibold))
+                    // Up 3 pt and back as Return lands: the first half of
+                    // the message leaving (`SendLift`).
+                    .keyframeAnimator(initialValue: CGFloat(0), trigger: Juice.reduceMotion ? 0 : nudges) { arrow, y in
+                        arrow.offset(y: y)
+                    } keyframes: { _ in
+                        CubicKeyframe(-zoomed(3), duration: 0.05)
+                        CubicKeyframe(0, duration: 0.07)
+                    }
             }
             .buttonStyle(CircleButtonStyle(filled: canSend))
             .disabled(!canSend)

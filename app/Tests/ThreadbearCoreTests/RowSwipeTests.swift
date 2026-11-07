@@ -34,6 +34,21 @@ final class RowSwipeTests: XCTestCase {
         XCTAssertFalse(swipe.end())
     }
 
+    /// A mouse dragging a row: left is the swipe to archive, any other way
+    /// is the thread being dragged out to drop into a message (6 Nov).
+    func testAMouseDragLeftSwipesAndAnyOtherWayDragsTheThreadOut() {
+        XCTAssertFalse(RowSwipe.dragsOut(dx: 3, dy: 2), "too small to call yet")
+        XCTAssertFalse(RowSwipe.dragsOut(dx: -8, dy: 1), "left is the swipe")
+        XCTAssertTrue(RowSwipe.dragsOut(dx: 8, dy: 1), "right, towards the thread")
+        XCTAssertTrue(RowSwipe.dragsOut(dx: 0, dy: -8))
+        XCTAssertTrue(RowSwipe.dragsOut(dx: 1, dy: 8))
+        XCTAssertTrue(RowSwipe.dragsOut(dx: -6, dy: -5), "a diagonal isn't a swipe either")
+        // Whichever the swipe would have tracked, it isn't a drag out.
+        for (dx, dy) in [(-6.0, 0.0), (-7, 4), (-30, -12)] {
+            XCTAssertEqual(RowSwipe.dragsOut(dx: dx, dy: dy), !swiped([(dx, dy)]).isSwiping, "\(dx), \(dy)")
+        }
+    }
+
     /// A diagonal scroll isn't a swipe: across has to clearly lead.
     func testDiagonalScrolls() {
         let swipe = swiped([(-6, -5)])
@@ -86,5 +101,18 @@ final class RowSwipeTests: XCTestCase {
         swipe.cancel()
         XCTAssertFalse(swipe.end())
         XCTAssertEqual(swipe.offset, 0)
+    }
+
+    /// While a swipe right goes Back, it isn't the row's: the row lets it
+    /// go, and still takes a swipe left to archive.
+    func testASwipeRightIsLeftToBackWhenItsTaken() {
+        var right = RowSwipe()
+        right.begin(rightTaken: true)
+        XCTAssertFalse(right.move(dx: 8, dy: 0))
+        XCTAssertEqual(right.phase, .ignoring)
+        var left = RowSwipe()
+        left.begin(rightTaken: true)
+        XCTAssertTrue(left.move(dx: -8, dy: 0))
+        XCTAssertTrue(left.isSwiping)
     }
 }

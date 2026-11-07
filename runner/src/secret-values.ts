@@ -12,6 +12,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { nameHoldsSecret } from './redaction.ts';
+import { hasLineBreak, hasUrlCredentials, isSpace, lastLineBreakIn, stripEnvComment } from './linear-text.ts';
 
 export const REFRESH_MS = 5 * 60_000;
 // A value shorter than this is too likely to be an ordinary word, and masking
@@ -23,6 +24,13 @@ const MIN_ASKED_VALUE = 8;
 const MIN_LINE = 16;
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_CHILD_FOLDERS = 100;
+// No limit on how many .env files a look reads, though a repo decides how
+// many it has. One that stopped at a count (tried for Gautam's scan, F25)
+// let a repo's 500 junk .env.<x> files push your own .env.qa.local out of
+// the mask while the mirror carried on (Codex's review, 6 Nov 2026). Each
+// file is at most MAX_FILE_BYTES, parses in time linear in its length and
+// is read with an await between, so many of them take longer to read but
+// never hold the event loop for more than one file's parse.
 const SKIP_FOLDERS = new Set(['node_modules', 'dist', 'build', 'vendor', 'Pods', 'DerivedData']);
 
 // How much of a value has to be there for its cut-off start to be recognised,
@@ -50,7 +58,7 @@ function entropy(s: string): number {
 // Could this value be a credential whatever its name says?
 export function looksRandom(value: string): boolean {
   if (value.length < 20 || /\s/.test(value)) return false;
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) && !/:\/\/[^/@\s]+:[^/@\s]+@/.test(value)) return false;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value) && !hasUrlCredentials(value)) return false;
   if (value.startsWith('/') || value.startsWith('~')) return false;
   return entropy(value) >= 3.5 && /\d/.test(value) && /[A-Za-z]/.test(value);
 }
@@ -68,7 +76,7 @@ export function valuesOfVariable(name: string, value: string): string[] {
   const v = value.trim();
   if (v.length < MIN_ENV_VALUE) return [];
   const named = nameHoldsSecret(name);
-  if (!named && (PLAIN_NAME.test(name) || /public/i.test(name)) && !/:\/\/[^/@\s]+:[^/@\s]+@/.test(v)) return [];
+  if (!named && (PLAIN_NAME.test(name) || /public/i.test(name)) && !hasUrlCredentials(v)) return [];
   const pieces = linesOf(v);
   if (!named && !looksRandom(v) && !pieces.some(looksRandom)) return [];
   return [...new Set([v, ...pieces])];
@@ -76,51 +84,75 @@ export function valuesOfVariable(name: string, value: string): string[] {
 
 // KEY=value lines, `export` or not, with quoted values that may run over
 // several lines. Not a full dotenv: a line it can't read is left out.
+//
+// A repo writes these files, so this takes time in proportion to the file
+// however it's laid out: no regex here can backtrack over a long run of
+// spaces (`/\s+#.*$/` could, for minutes: Gautam's scan, F25), and a
+// quote that never closes looks for its end once, not again from every
+// line after it.
 export function parseEnvFile(text: string): { name: string; value: string }[] {
   const out: { name: string; value: string }[] = [];
   const lines = text.split(/\r?\n/);
+  // Per quote mark, the next line it closes on, from the last look. Asked
+  // with i only ever growing, so each line is looked at once per mark.
+  const closes = new Map<string, number>();
+  const nextClose = (quote: string, after: number): number => {
+    const known = closes.get(quote);
+    if (known !== undefined && known > after) return known;
+    let j = after + 1;
+    while (j < lines.length && closeOn(lines[j]!, quote) < 0) j++;
+    closes.set(quote, j);
+    return j;
+  };
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i]!.match(/^\s*(?:export\s+)?([A-Za-z_][\w.-]*)\s*=\s*(.*)$/);
+    const line = lines[i]!;
+    const m = /^\s*(?:export\s+)?([A-Za-z_][\w.-]*)\s*=/.exec(line);
     if (!m) continue;
+    // What `\s*(.*)$` took: a line break left in the value (a lone \r)
+    // was no match.
+    let value = line.slice(m[0].length).trimStart();
+    if (hasLineBreak(value)) continue;
     const name = m[1]!;
-    let value = m[2]!;
     const quote = value[0];
     if (quote === '"' || quote === "'") {
-      // Where the quote closes on this line, ignoring an escaped one: what
-      // follows it can only be a comment. Not closed here, it runs on.
-      const closeOn = (s: string, from = 0): number => {
-        for (let k = from; k < s.length; k++) {
-          if (s[k] === '\\' && quote === '"') k++;
-          else if (s[k] === quote && /^\s*(#.*)?$/.test(s.slice(k + 1))) return k;
-        }
-        return -1;
-      };
+      // Where the quote closes on this line: what follows it can only be
+      // a comment. Not closed here, it runs on.
       const rest = value.slice(1);
-      const here = closeOn(rest);
+      const here = closeOn(rest, quote);
       if (here >= 0) {
         value = rest.slice(0, here);
       } else {
-        const parts = [rest];
-        let j = i + 1;
-        let end = -1;
-        for (; j < lines.length; j++) {
-          end = closeOn(lines[j]!);
-          if (end >= 0) break;
-          parts.push(lines[j]!);
-        }
+        const j = nextClose(quote, i);
         if (j < lines.length) {
+          value = [rest, ...lines.slice(i + 1, j), lines[j]!.slice(0, closeOn(lines[j]!, quote))].join('\n');
           i = j;
-          parts.push(lines[j]!.slice(0, end));
-          value = parts.join('\n');
         } else value = rest; // never closed: take the one line
       }
     } else {
       // An unquoted value ends at a comment.
-      value = value.replace(/\s+#.*$/, '');
+      value = stripEnvComment(value);
     }
     out.push({ name, value });
   }
   return out;
+}
+
+// Where `quote` closes in `s`, ignoring an escaped one in double quotes: the
+// first one followed only by whitespace, or by whitespace and a comment.
+// What `/^\s*(#.*)?$/` said of the rest, with no regex run again from
+// each quote mark.
+function closeOn(s: string, quote: string): number {
+  const lastBreak = lastLineBreakIn(s);
+  for (let k = 0; k < s.length; k++) {
+    if (s[k] === '\\' && quote === '"') k++;
+    else if (s[k] === quote) {
+      let j = k + 1;
+      while (j < s.length && isSpace(s[j])) j++;
+      // A comment runs to the end, so no line break after its #.
+      if (j === s.length || (s[j] === '#' && lastBreak < j)) return k;
+    }
+  }
+  return -1;
 }
 
 // A file under secrets/: the variables of a .env-style file, the string values
@@ -173,9 +205,13 @@ export class KnownValues {
   private owner = '';
   private unreadFolders = new Set<string>();
   private lookInFolders: boolean;
+  private folderMs: number;
 
-  constructor(opts: { secretsDir?: string; env?: NodeJS.ProcessEnv; home?: string; now?: () => number; onError?: (what: string) => void; folders?: boolean } = {}) {
+  constructor(opts: { secretsDir?: string; env?: NodeJS.ProcessEnv; home?: string; now?: () => number; onError?: (what: string) => void; folders?: boolean; folderMs?: number } = {}) {
     this.secretsDir = opts.secretsDir;
+    // Tests that check what's read, not how fast, give it longer: a busy
+    // check host took over 5 s on 600 small files (7 Nov).
+    this.folderMs = opts.folderMs ?? FOLDER_MS;
     this.lookInFolders = opts.folders !== false;
     this.env = opts.env ?? process.env;
     this.home = opts.home ?? os.homedir();
@@ -286,7 +322,7 @@ export class KnownValues {
       let timer: NodeJS.Timeout | undefined;
       const answered = await Promise.race([
         this.lookInFolder(dir).then(() => true),
-        new Promise<boolean>((r) => (timer = setTimeout(() => r(false), FOLDER_MS))),
+        new Promise<boolean>((r) => (timer = setTimeout(() => r(false), this.folderMs))),
       ]);
       clearTimeout(timer);
       // Not counted as looked through: what's known from it stays.

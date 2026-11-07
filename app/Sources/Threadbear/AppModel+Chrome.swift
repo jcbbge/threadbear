@@ -51,6 +51,7 @@ extension AppModel {
                 guard !Task.isCancelled, self.client === client else { return }
                 self.updateRestart { $0.status(status.pendingRestart, now: Date()) }
                 if self.websiteURL != status.websiteURL { self.websiteURL = status.websiteURL }
+                if self.pushOff != status.pushOff { self.pushOff = status.pushOff }
             } catch RPCError.server(let code, _) where code == -32601 {
                 // A runner older than runner.status: its notices are all there is.
             } catch {
@@ -67,6 +68,9 @@ extension AppModel {
         let restarting = restart.isRestarting(now: max(now, Date()))
         switch connection {
         case .connected:
+            // Mike's own click comes first: he's looking for it.
+            if let note = busyNotes.last { return Banner(style: .quiet, icon: nil, text: note.text) }
+            if let doneNote { return Banner(style: .quiet, icon: "checkmark", text: doneNote) }
             if restarting {
                 return Banner(style: .quiet, icon: nil, text: "The runner is restarting now.")
             }
@@ -195,7 +199,7 @@ extension AppModel {
     func runAction(_ action: Action, in threadId: String) {
         if action.kind == .url {
             if let page = action.webPage {
-                NSWorkspace.shared.open(page)
+                OpenGate.openWeb(page)
             } else {
                 errorMessage = "\(action.title) has no web page to open."
             }
@@ -208,7 +212,7 @@ extension AppModel {
             do {
                 _ = try await client.runAction(threadId: threadId, actionId: action.id)
             } catch {
-                errorMessage = "\(action.title) didn't run: \(error.localizedDescription)"
+                showError("\(action.title) didn't run: \(error.localizedDescription)", in: threadId, doing: "running the \(action.title) action chip")
             }
             runningActions.remove(key)
         }
@@ -218,12 +222,92 @@ extension AppModel {
     /// panel showed them; the runner then loads them.
     func trustPatches(_ patches: [PatchInfo], in threadId: String) {
         let files = patches.compactMap { p in p.file.flatMap { f in p.hash.map { (file: f, hash: $0) } } }
+            .filter { !trustingPatches.contains(Self.trustKey($0.file, $0.hash)) }
         guard !files.isEmpty, let client = client(for: threadId) else { return }
+        let keys = Set(files.map { Self.trustKey($0.file, $0.hash) })
+        trustingPatches.formUnion(keys)
         Task {
             do {
                 try await client.trustPatches(threadId: threadId, files: files)
+                // The row stops waiting when the thread's update says it's
+                // trusted. Let go a little later in case that never comes
+                // (the runner trusted nothing), so it can be pressed again.
+                try? await Task.sleep(for: .seconds(5))
+                trustingPatches.subtract(keys)
             } catch {
-                errorMessage = "Couldn't trust \(patches.count == 1 ? patches[0].id : "the patches"): \(error.localizedDescription)"
+                trustingPatches.subtract(keys)
+                showError("Couldn't trust \(patches.count == 1 ? patches[0].id : "the patches"): \(error.localizedDescription)", in: threadId,
+                          doing: "pressing Trust on \(patches.count == 1 ? "a patch" : "patches") in the Patches panel")
+            }
+        }
+    }
+
+    /// A patch version's key in `trustingPatches`.
+    static func trustKey(_ file: String, _ hash: String) -> String { file + " " + hash }
+
+    /// Whether `patch`'s Trust has been pressed and hasn't landed yet.
+    func isTrusting(_ patch: PatchInfo) -> Bool {
+        guard let file = patch.file, let hash = patch.hash else { return false }
+        return trustingPatches.contains(Self.trustKey(file, hash))
+    }
+
+    /// Shows `message` in the error bar, saying which thread it was about
+    /// and what he was doing, for its Investigate button.
+    func showError(_ message: String, in threadId: String?, doing: String?) {
+        nextErrorThread = threadId
+        nextErrorDoing = doing
+        errorMessage = message
+    }
+
+    /// The checkout this app follows, where a thread can fix it: the
+    /// running build's, the runner's, or for a debug build the one it was
+    /// compiled from. Nil when there's none to work in.
+    var ownCheckout: String? {
+        if let checkout = AppUpdater.shared.running?.checkout ?? runnerUpdates?.upstream?.checkout { return checkout }
+        #if DEBUG
+        // Sources/Threadbear/AppModel+Chrome.swift, four folders down from the repo.
+        var url = URL(fileURLWithPath: #filePath)
+        for _ in 0..<4 { url.deleteLastPathComponent() }
+        return FileManager.default.fileExists(atPath: url.appendingPathComponent("AGENTS.md").path) ? url.path : nil
+        #else
+        return nil
+        #endif
+    }
+
+    /// What the error bar's Investigate hands its new thread.
+    func errorReport() -> InvestigateText.Report? {
+        guard let message = errorMessage else { return nil }
+        let shown = errorShown
+        let thread = shown?.threadId.flatMap { threads[$0] }
+        return InvestigateText.Report(
+            message: message, at: shown?.at ?? Date(),
+            threadId: shown?.threadId, threadTitle: thread?.title, threadFolder: thread?.cwd,
+            doing: shown?.doing,
+            appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+            appCommit: AppUpdater.shared.running?.short,
+            runnerVersion: runnerVersion.isEmpty ? nil : runnerVersion)
+    }
+
+    /// The error bar's Investigate: a new thread in the app's own checkout
+    /// that finds the error's cause and fixes it, made as Bring In makes
+    /// its thread. The bar goes and the new thread opens once it's made;
+    /// a failure says so in the bar instead.
+    func investigateError() {
+        guard let report = errorReport(), let checkout = ownCheckout, let client, !creatingThread else { return }
+        var request = newThreadRequest(text: InvestigateText.prompt(report), images: [])
+        request.cwd = checkout
+        request.permissionMode = .full
+        request.title = InvestigateText.title(report)
+        creatingThread = true
+        Task {
+            defer { creatingThread = false }
+            do {
+                let thread = try await client.createThread(request)
+                if errorMessage == report.message { errorMessage = nil }
+                threads[thread.id] = thread
+                select(thread.id)
+            } catch {
+                show(error)
             }
         }
     }

@@ -15,6 +15,8 @@ import path from 'node:path';
 import type { Logger } from './log.ts';
 import type { ProjectTask, ProjectTasks, TaskColumn } from './protocol.ts';
 import { atomicWriteFileSync, readJsonSync } from './fsutil.ts';
+import { isSpace, seeker } from './linear-text.ts';
+import { credentialUrlProblem } from './secure-url.ts';
 
 // How often a board is read when nobody's asking. Opening the project page
 // asks again once it's older than FRESH_MS.
@@ -39,14 +41,22 @@ export type CallTool = (name: string, args: Record<string, unknown>) => Promise<
 
 // Calls one of the gateway's tools and gives back its text. The answer is
 // JSON or a one-event SSE stream, depending on the gateway's mood.
+//
+// The headers are the gateway's token: only to https, or plain http to this
+// Mac (secure-url.ts), and never a redirect, so a 307 can't send the call on
+// somewhere else. The gateway's sign-in pages are links Mike opens in his
+// browser, never followed from here.
 export function gatewayCaller(opts: { mcpUrl: string; headers: () => Promise<Record<string, string>>; fetch?: typeof fetch }): CallTool {
   const f = opts.fetch ?? fetch;
+  const problem = credentialUrlProblem(opts.mcpUrl);
   let id = 0;
   return async (name, args) => {
+    if (problem) throw new Error(`The Connectors gateway URL ${problem}.`);
     const res = await f(opts.mcpUrl, {
       method: 'POST',
       headers: { ...(await opts.headers()), 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
       body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } }),
+      redirect: 'error',
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`the gateway answered ${res.status}`);
@@ -107,6 +117,8 @@ export function findGatewayClient(raw: { url?: unknown; enabled?: unknown; heade
   const url = typeof raw?.url === 'string' && raw.url.trim() ? raw.url.trim() : entry?.url;
   const helper = typeof raw?.headersHelper === 'string' && raw.headersHelper.trim() ? raw.headersHelper.trim() : entry?.headersHelper;
   if (typeof url !== 'string' || typeof helper !== 'string' || !url || !helper) return undefined;
+  // Its calls carry the token the helper prints (secure-url.ts).
+  if (credentialUrlProblem(url)) return undefined;
   try {
     const u = new URL(url);
     // A bare base (https://host:8443) means its /mcp.
@@ -146,11 +158,7 @@ export async function findSource(call: CallTool, url: string): Promise<TaskSourc
     const ds = text.match(/<data-source url="\{*(collection:\/\/[0-9a-f-]+)\}*"/)?.[1] ?? '';
     return { dataSource: ds, databaseUrl: f.url ? cleanUrl(f.url) : undefined };
   }
-  const dbs = [...text.matchAll(/<database url="([^"]+)" data-source-url="(collection:\/\/[0-9a-f-]+)"[^>]*>\s*([^<]*?)\s*<\/database>/g)].map((m) => ({
-    url: m[1]!,
-    dataSource: m[2]!,
-    title: m[3]!.trim(),
-  }));
+  const dbs = databasesIn(text);
   if (!dbs.length) throw new Error('No database on that Notion page. Add a Tasks database to it (a board grouped by Status).');
   const pick = dbs.find((d) => /^tasks?$/i.test(d.title)) ?? dbs.find((d) => /task/i.test(d.title)) ?? dbs[0]!;
   // The page names the database; the database lists its views.
@@ -159,22 +167,107 @@ export async function findSource(call: CallTool, url: string): Promise<TaskSourc
   return { dataSource: pick.dataSource, databaseUrl: cleanUrl(pick.url), ...(view ? { view } : {}) };
 }
 
+// Each `<database url="…" data-source-url="collection://…" …>title</database>`
+// on a page, as
+// `/<database url="([^"]+)" data-source-url="(collection:\/\/[0-9a-f-]+)"[^>]*>\s*([^<]*?)\s*<\/database>/g`
+// found them, with the title trimmed. The tag's ">" and the title's "<" are
+// each looked for once (seeker), as that regex scanned to the end again from
+// every tag with no ">" after it, and tried every split of a title's spaces.
+function databasesIn(text: string): { url: string; dataSource: string; title: string }[] {
+  const out: { url: string; dataSource: string; title: string }[] = [];
+  const OPEN = '<database url="';
+  const CLOSE = '</database>';
+  const head = /<database url="([^"]+)" data-source-url="(collection:\/\/[0-9a-f-]+)"/y;
+  const tagEnd = seeker(text, (c) => c === '>');
+  const titleEnd = seeker(text, (c) => c === '<');
+  for (let p = text.indexOf(OPEN); p >= 0; ) {
+    head.lastIndex = p;
+    const m = head.exec(text);
+    let end = -1;
+    if (m) {
+      const gt = tagEnd(p + m[0].length);
+      if (gt < 0) break; // no ">" after this tag, nor after any later one
+      const lt = titleEnd(gt + 1);
+      if (lt >= 0 && text.startsWith(CLOSE, lt)) {
+        out.push({ url: m[1]!, dataSource: m[2]!, title: text.slice(gt + 1, lt).trim() });
+        end = lt + CLOSE.length;
+      }
+    }
+    p = text.indexOf(OPEN, end >= 0 ? end : p + 1);
+  }
+  return out;
+}
+
 // A view of the database to read rows through: one with no filter, so no
 // card is hidden, else none (rows are then read straight, which counts
 // against the allowance).
 export function pickView(databaseText: string): string | undefined {
-  for (const m of databaseText.matchAll(/<view url="\{*(view:\/\/[0-9a-f-]+)\}*">\s*(\{[\s\S]*?\})\s*<\/view>/g)) {
+  for (const [url, json] of views(databaseText)) {
     let config: Record<string, unknown> = {};
     try {
       // The fetch tool wraps ids in {{ }}, inside the JSON's strings too.
-      config = JSON.parse(m[2]!.replace(/\{\{(\w+:\/\/[^}]*)\}\}/g, '$1')) as Record<string, unknown>;
+      config = JSON.parse(unwrapIds(json)) as Record<string, unknown>;
     } catch {
       // A view we can't read is no worse than one with a filter: skip it.
       continue;
     }
-    if (!config.filter && !config.filters) return m[1]!;
+    if (!config.filter && !config.filters) return url;
   }
   return undefined;
+}
+
+// `s.replace(/\{\{(\w+:\/\/[^}]*)\}\}/g, '$1')`, reading the text once:
+// that regex scanned to the end from every "{{" with no "}" after it.
+function unwrapIds(s: string): string {
+  const nextBrace = seeker(s, (c) => c === '}');
+  let out = '';
+  let copied = 0;
+  for (let p = s.indexOf('{{'); p >= 0; ) {
+    let i = p + 2;
+    while (i < s.length && /\w/.test(s[i]!)) i++;
+    const k = i > p + 2 && s.startsWith('://', i) ? nextBrace(i + 3) : -1;
+    if (k >= 0 && s[k + 1] === '}') {
+      out += s.slice(copied, p) + s.slice(p + 2, k);
+      copied = k + 2;
+      p = s.indexOf('{{', copied);
+    } else p = s.indexOf('{{', p + 1);
+  }
+  return copied ? out + s.slice(copied) : s;
+}
+
+// Each `<view url="{{view://…}}"> {…} </view>`: its id and its JSON, as
+// `/<view url="\{*(view:\/\/[0-9a-f-]+)\}*">\s*(\{[\s\S]*?\})\s*<\/view>/g`
+// found them, but without scanning to the end again from every view that
+// isn't closed. A view's JSON runs from the "{" after its tag to the first
+// "</view>" with only a "}" and whitespace before it.
+function views(text: string): [string, string][] {
+  const out: [string, string][] = [];
+  const CLOSE = '</view>';
+  // The next "</view>" at or after a place whose JSON could end there, kept
+  // as the views are read in order.
+  let close = -1;
+  const closesJson = (c: number) => {
+    let b = c - 1;
+    while (b >= 0 && isSpace(text[b])) b--;
+    return text[b] === '}';
+  };
+  const open = /<view url="\{*(view:\/\/[0-9a-f-]+)\}*">/g;
+  for (let m = open.exec(text); m; m = open.exec(text)) {
+    let start = m.index + m[0].length;
+    while (start < text.length && isSpace(text[start])) start++;
+    if (text[start] !== '{') continue;
+    if (close <= start && close !== -2) {
+      close = text.indexOf(CLOSE, start + 1);
+      while (close >= 0 && !closesJson(close)) close = text.indexOf(CLOSE, close + 1);
+      if (close < 0) close = -2; // none from here on
+    }
+    if (close === -2) break;
+    let b = close - 1;
+    while (isSpace(text[b])) b--;
+    out.push([m[1]!, text.slice(start, b + 1)]);
+    open.lastIndex = close + CLOSE.length;
+  }
+  return out;
 }
 
 type SchemaProp = {
@@ -196,7 +289,7 @@ export type Board = {
 
 export function readSchema(fetchedText: string): Board {
   const f = JSON.parse(fetchedText) as Fetched;
-  const json = (f.text ?? '').match(/<data-source-state>\s*([\s\S]*?)\s*<\/data-source-state>/)?.[1];
+  const json = between(f.text ?? '', '<data-source-state>', '</data-source-state>')?.trim();
   if (!json) throw new Error("Couldn't read the task database's columns.");
   const props = Object.values((JSON.parse(json) as { schema?: Record<string, SchemaProp> }).schema ?? {});
   const title = props.find((p) => p.type === 'title')?.name ?? 'Name';
@@ -302,11 +395,28 @@ export async function readTasks(
   };
 }
 
+// What's between the first `open` and the first `close` after it, by
+// indexOf, not a lazy regex that tries every split of the spaces around it.
+function between(text: string, open: string, close: string): string | undefined {
+  const o = text.indexOf(open);
+  if (o < 0) return undefined;
+  const c = text.indexOf(close, o + open.length);
+  return c < 0 ? undefined : text.slice(o + open.length, c);
+}
+
 // Notion sometimes hands back a title wrapped in a paragraph, which showed as
 // "<p> WIN TV Book in TVC </p>" on the card. Only the wrapper goes, so a title
 // about <div>s keeps its words.
+//
+// By hand, as `/^\s*<p(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/p>\s*$/i` did it: a
+// paragraph's opening tag at the start and its "</p>" at the end, with
+// the words between them. That regex was cubic in a run of spaces.
 export function cleanTitle(title: string): string {
-  return title.replace(/^\s*<p(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/p>\s*$/i, '$1').trim();
+  const s = title.trim();
+  if (s.slice(0, 2).toLowerCase() !== '<p' || s.slice(-4).toLowerCase() !== '</p>') return s;
+  const open = s[2] === '>' ? 2 : isSpace(s[2]) ? s.indexOf('>', 3) : -1;
+  const close = s.length - 4;
+  return open >= 0 && open < close ? s.slice(open + 1, close).trim() : s;
 }
 
 function asText(v: unknown): string {

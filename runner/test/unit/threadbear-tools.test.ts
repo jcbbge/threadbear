@@ -4,7 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { FakeAccounts, makeHarness, tick, tmpDir, withCodex } from '../helpers/fakes.ts';
 import { copySessionTranscript, projectDirName } from '../../src/transcripts.ts';
-import { buildThreadbearTools, parseWhen, threadbearMcpServer } from '../../src/threadbear-mcp.ts';
+import { buildThreadbearTools, parseWhen, threadbearMcpServer, type RemoteControl } from '../../src/threadbear-mcp.ts';
+import { Relay, type RelayRow } from '../../src/relay.ts';
+import { FakeClock } from '../../src/clock.ts';
+import { nullLogger } from '../../src/log.ts';
+import type { RemoteThreads } from '../../src/thread-index.ts';
 import { needsFromTool } from '../../src/needs.ts';
 import { CodexTools, type ToolDefinition } from '../../src/adapters/codex/tools.ts';
 import { toolTitle } from '../../src/tools.ts';
@@ -563,6 +567,184 @@ test('end_turn is taken once a turn', async () => {
   assert.match(r2.text, /Already ended/);
 });
 
+// Thread 46de9389 (7 Nov 2026): a `tb land` sent to the background finished
+// just before the agent's "landing now" end_turn, in the same CLI turn. The
+// CLI handed the agent its notification with that end_turn's result, and the
+// real report's end_turn was refused, so the card kept "landing now".
+test('a background task that finishes around end_turn opens the turn again once the agent has read it', async () => {
+  const h = makeHarness();
+  const { thread, s } = start(h);
+  const { call } = tools(h, thread.id);
+  const send = async (itemId: string, input: Record<string, unknown>) => {
+    toolCall(s, itemId, END_TURN, input);
+    const r = await call('end_turn', input);
+    s.out({ kind: 'event', event: { type: 'tool.result', itemId, ok: !r.error, text: r.text, truncated: false, images: [] } });
+    return r;
+  };
+  s.out({ kind: 'event', event: { type: 'system.note', text: 'Background command "Land" completed (exit code 0)', wake: true } });
+  s.text('m1', 'tb land is still running. I will finish up when it lands.');
+  const first = await send('e1', { headline: 'Landing now', needs: 'nothing' });
+  assert.equal(first.error, false);
+  // The agent reads the notification, and carries on.
+  toolCall(s, 'b1', 'Bash', { command: 'git push' });
+  toolResult(s, 'b1');
+  s.text('m2', 'Landed on main and pushed.');
+  const second = await send('e2', { headline: 'Landed and pushed', needs: 'nothing' });
+  assert.equal(second.error, false, second.text);
+  assert.ok(h.events(thread.id).some((e) => e.type === 'assistant.text' && e.text === 'Landed on main and pushed.'), 'the report is kept');
+  assert.equal(h.runner.get(thread.id).preview, 'Landed and pushed');
+  s.result('completed');
+  await tick();
+  assert.equal(h.runner.get(thread.id).preview, 'Landed and pushed');
+});
+
+// From Codex's review: a repeat the agent was already writing when the note
+// came wasn't written with it, so it's refused, and the call after it is not.
+test('a background task that finishes after end_turn opens the turn from the step after the next result', async () => {
+  const h = makeHarness();
+  const { thread, s } = start(h);
+  const { call } = tools(h, thread.id);
+  const send = async (itemId: string, input: Record<string, unknown>) => {
+    toolCall(s, itemId, END_TURN, input);
+    const r = await call('end_turn', input);
+    s.out({ kind: 'event', event: { type: 'tool.result', itemId, ok: !r.error, text: r.text, truncated: false, images: [] } });
+    return r;
+  };
+  s.text('m1', 'Waiting on the build.');
+  await send('e1', { headline: 'Building', needs: 'nothing', summary: ['Started the build.'] });
+  s.out({ kind: 'event', event: { type: 'system.note', text: 'Background command "Build" completed (exit code 0)', wake: true } });
+  const stale = await send('e2', { headline: 'Building still', needs: 'nothing' });
+  assert.equal(stale.error, true);
+  assert.match(stale.text, /Already ended/);
+  s.text('m2', 'The build passed, and here is what it found in full.');
+  assert.ok(h.events(thread.id).some((e) => e.type === 'assistant.text' && e.itemId === 'm2'), 'the report is kept');
+  assert.equal(h.runner.get(thread.id).preview, 'The build passed, and here is what it found in full.');
+  const third = await send('e3', { headline: 'Built', needs: 'nothing' });
+  assert.equal(third.error, false, third.text);
+  assert.equal(h.runner.get(thread.id).preview, 'Built');
+});
+
+// From Codex's review: results that come back together are one step, so a
+// Bash result just before end_turn's own doesn't count as the agent reading it.
+test('a background task read with a batch of results opens the turn after the whole batch', async () => {
+  const h = makeHarness();
+  const { thread, s } = start(h);
+  const { call } = tools(h, thread.id);
+  s.text('m1', 'Pushing, and that is it.');
+  toolCall(s, 'b1', 'Bash', { command: 'git push' });
+  const input = { headline: 'Pushing', needs: 'nothing' };
+  toolCall(s, 'e1', END_TURN, input);
+  const r1 = await call('end_turn', input);
+  assert.equal(r1.error, false);
+  s.out({ kind: 'event', event: { type: 'system.note', text: 'Background command "Land" completed (exit code 0)', wake: true } });
+  toolResult(s, 'b1');
+  s.out({ kind: 'event', event: { type: 'tool.result', itemId: 'e1', ok: true, text: r1.text, truncated: false, images: [] } });
+  s.text('m2', 'Landed and pushed.');
+  assert.ok(h.events(thread.id).some((e) => e.type === 'assistant.text' && e.itemId === 'm2'), 'the report is kept');
+  const again = { headline: 'Landed', needs: 'nothing' };
+  toolCall(s, 'e2', END_TURN, again);
+  const r2 = await call('end_turn', again);
+  assert.equal(r2.error, false, r2.text);
+});
+
+// From Codex's review: the agent may stop without another end_turn while
+// other background work runs, and the ask its reply had still stands.
+test('one reply: an ask taken from the reply stands through a wake with no new end_turn', async () => {
+  const h = makeHarness();
+  const { thread, s } = start(h);
+  const { call } = tools(h, thread.id, undefined, () => true);
+  const input = { headline: 'Ready', needs: 'nothing' };
+  toolCall(s, 'e1', END_TURN, input);
+  const r = await call('end_turn', input);
+  s.out({ kind: 'event', event: { type: 'tool.result', itemId: 'e1', ok: !r.error, text: r.text, truncated: false, images: [] } });
+  s.text('m1', 'It is ready.\n\n**What I need from you**\n1. Press Bring Them In, then tell me how it went.');
+  s.out({ kind: 'event', event: { type: 'system.note', text: 'Background command "Build" completed (exit code 0)', wake: true } });
+  toolCall(s, 'b1', 'Bash', { command: 'cat build.log' });
+  toolResult(s, 'b1');
+  s.text('m2', 'The other build passed too.');
+  s.result('completed');
+  await tick();
+  assert.equal(h.runner.get(thread.id).needs, 'you');
+});
+
+// From Codex's review, round two: the SDK can run a call before its frame
+// reaches the events, so a call with the wake handed over and no step since
+// is the agent's step after reading it.
+test('a background task handed over just before an end_turn whose frame has not landed yet', async () => {
+  const h = makeHarness();
+  const { thread, s } = start(h);
+  const { call } = tools(h, thread.id);
+  s.out({ kind: 'event', event: { type: 'system.note', text: 'Background command "Land" completed (exit code 0)', wake: true } });
+  s.text('m1', 'Still landing.');
+  const input = { headline: 'Landing', needs: 'nothing' };
+  toolCall(s, 'e1', END_TURN, input);
+  const r1 = await call('end_turn', input);
+  s.out({ kind: 'event', event: { type: 'tool.result', itemId: 'e1', ok: true, text: r1.text, truncated: false, images: [] } });
+  const r2 = await call('end_turn', { headline: 'Landed', needs: 'nothing', summary: ['Landed and pushed.'] });
+  assert.equal(r2.error, false, r2.text);
+});
+
+test('two background tasks, the second after the first was handed over, open the turn twice', async () => {
+  const h = makeHarness();
+  const { thread, s } = start(h);
+  const { call } = tools(h, thread.id);
+  const send = async (itemId: string, input: Record<string, unknown>) => {
+    toolCall(s, itemId, END_TURN, input);
+    const r = await call('end_turn', input);
+    s.out({ kind: 'event', event: { type: 'tool.result', itemId, ok: !r.error, text: r.text, truncated: false, images: [] } });
+    return r;
+  };
+  const note = (what: string) => s.out({ kind: 'event', event: { type: 'system.note', text: `Background command "${what}" completed (exit code 0)`, wake: true } });
+  note('Build');
+  s.text('m1', 'Waiting on the build and the tests.');
+  await send('e1', { headline: 'Waiting', needs: 'nothing' });
+  note('Tests');
+  s.text('m2', 'The build passed.');
+  assert.equal((await send('e2', { headline: 'Built', needs: 'nothing' })).error, false);
+  s.text('m3', 'The tests passed too.');
+  const third = await send('e3', { headline: 'Built and tested', needs: 'nothing' });
+  assert.equal(third.error, false, third.text);
+  assert.equal(h.runner.get(thread.id).preview, 'Built and tested');
+});
+
+test('one reply: a report written after a wake is marked as the reply too', async () => {
+  const h = makeHarness();
+  const { thread, s } = start(h);
+  const { call } = tools(h, thread.id, undefined, () => true);
+  const input = { headline: 'Landing', needs: 'nothing' };
+  toolCall(s, 'e1', END_TURN, input);
+  const r = await call('end_turn', input);
+  s.out({ kind: 'event', event: { type: 'tool.result', itemId: 'e1', ok: !r.error, text: r.text, truncated: false, images: [] } });
+  s.text('m1', 'Still landing.');
+  s.out({ kind: 'event', event: { type: 'system.note', text: 'Background command "Land" completed (exit code 0)', wake: true } });
+  toolCall(s, 'b1', 'Bash', { command: 'git push' });
+  toolResult(s, 'b1');
+  s.text('m2', 'Landed and pushed.');
+  const m2 = h.events(thread.id).find((e: { type: string; itemId?: string }) => e.type === 'assistant.text' && e.itemId === 'm2');
+  assert.equal(m2?.final, true);
+});
+
+test('a background task the agent had read before its end_turn still leaves a repeat refused', async () => {
+  const h = makeHarness();
+  const { thread, s } = start(h);
+  const { call } = tools(h, thread.id);
+  const send = async (itemId: string, input: Record<string, unknown>) => {
+    toolCall(s, itemId, END_TURN, input);
+    const r = await call('end_turn', input);
+    s.out({ kind: 'event', event: { type: 'tool.result', itemId, ok: !r.error, text: r.text, truncated: false, images: [] } });
+    return r;
+  };
+  s.out({ kind: 'event', event: { type: 'system.note', text: 'Background command "Build" completed (exit code 0)', wake: true } });
+  toolCall(s, 'b1', 'Bash', { command: 'cat build.log' });
+  toolResult(s, 'b1');
+  s.text('m1', 'The build passed.');
+  await send('e1', { headline: 'Built', needs: 'nothing' });
+  const again = await send('e2', { headline: 'Built again', needs: 'nothing' });
+  assert.equal(again.error, true);
+  assert.match(again.text, /Already ended/);
+  assert.equal(h.runner.get(thread.id).preview, 'Built');
+});
+
 // Thread cdfccbc3 (1 Nov 2026): "Archive" sent from the phone just after
 // end_turn, with both ways to do it refused. The agent scheduled a message to
 // itself a minute later, and only that looked like an answer.
@@ -942,6 +1124,30 @@ test("Codex's end_turn comes before the final answer: never refused, and the ans
   assert.ok(h.events(thread.id).some((e) => e.type === 'assistant.text' && e.text === 'Looks fine. Nothing needed from you.'));
 });
 
+// Codex's half of the 6 Nov fix: end_turn asked in "Ask before edits".
+test("A Codex thread in ask mode ends its turn and reads without asking, and asks before changing anything", async () => {
+  const h = makeHarness();
+  const { thread } = start(h);
+  const list = buildThreadbearTools(h.runner, thread.id, Date.now, undefined, undefined, undefined, { provider: 'codex', sleep: async () => {} });
+  const asked: string[] = [];
+  const codex = new CodexTools(list as ToolDefinition[], {
+    requestApproval: async (r) => {
+      asked.push(r.name.split('__').at(-1)!);
+      return { decision: 'deny' };
+    },
+    cwd: () => '/tmp',
+    mode: () => 'ask',
+    rules: () => [],
+    addRules: () => {},
+  });
+  const call = (tool: string, args: Record<string, unknown>) => codex.call({ threadId: 'n', turnId: 't', callId: tool, namespace: 'threadbear', tool, arguments: args }, { fromChild: false, signal: new AbortController().signal });
+  assert.ok((await call('end_turn', { needs: 'nothing', summary: ['Checked it.'] })).success);
+  assert.ok((await call('list_threads', {})).success);
+  assert.deepEqual(asked, []);
+  assert.equal((await call('send_message', { id: thread.id, text: 'hi' })).success, false);
+  assert.deepEqual(asked, ['send_message']);
+});
+
 // A Codex thread's tool list is fixed when it starts, so what it was told
 // end_turn takes can be from before One reply changed (1 Nov 2026, thread
 // d8c829e8, refused for leaving out a question its schema never mentioned).
@@ -1250,6 +1456,18 @@ test('one reply: an end_turn the Stop hook asked for keeps the message already w
   assert.equal(h.runner.get(thread.id).needs, 'nothing');
 });
 
+test("end_turn tells the agent which sub-agents are parked on a card", async () => {
+  const h = makeHarness();
+  const { thread, s } = start(h);
+  const one = tools(h, thread.id, undefined, () => true);
+  void s.sink.requestApproval({ name: 'Write', title: 'Write a.ts', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
+  toolCall(s, 'e1', END_TURN, {});
+  const said = (await one.call('end_turn', {})).text;
+  assert.match(said, /^Noted: this thread/);
+  assert.match(said, /Now write your reply/);
+  assert.match(said, /A sub-agent of yours is parked until the user answers an approval card in this thread, not working: "Write a\.ts"/);
+});
+
 test('one reply: a nudged end_turn with no message to keep still asks for the reply', async () => {
   const h = makeHarness();
   // No words since its last step.
@@ -1277,10 +1495,10 @@ test('one reply: a nudged end_turn with no message to keep still asks for the re
 // 5 Nov 2026, thread 1d9689e6: a Slack draft for Mike to approve was
 // written before end_turn, as narration, and the reply after it was "Nothing
 // has been sent yet." Words since the last step fold away with one reply, so
-// the result asks for them again in full; words before a step don't count.
-test('one reply: words written just before end_turn are asked for again in full, as they fold away', async () => {
+// the result asks for a self-contained answer; words before a step don't count.
+test('one reply: after hidden text, end_turn asks for the answer and evidence, including drafts', async () => {
   const h = makeHarness();
-  const again = /write it again in full as your reply/;
+  const again = /self-contained answer with the result and supporting evidence/;
   const input = { headline: 'Draft update for Jamie ready to send', asks: [{ question: 'Send the Hetzner update to Jamie in your Slack DM?', options: [{ label: 'Send it' }, { label: "I'll edit and send" }] }] };
   // The draft as narration, straight before the call.
   const first = start(h);
@@ -1293,7 +1511,8 @@ test('one reply: words written just before end_turn are asked for again in full,
   assert.equal(r.error, false, r.text);
   assert.match(r.text, /Now write your reply/);
   assert.match(r.text, again);
-  assert.match(r.text, /never see your thinking/);
+  assert.match(r.text, /If the user needs a draft or descriptions of choices/);
+  assert.doesNotMatch(r.text, /thinking|working|write it again/i);
   // Plain text counts too, and a done turn hears it as well.
   const second = start(h);
   const two = tools(h, second.thread.id, undefined, () => true);
@@ -1302,6 +1521,7 @@ test('one reply: words written just before end_turn are asked for again in full,
   r = await two.call('end_turn', { headline: 'Laid out three designs', needs: 'nothing' });
   assert.match(r.text, /^Noted: this thread is done/);
   assert.match(r.text, again);
+  assert.match(r.text, /Include any requested draft, explanation or descriptions of choices in full/);
   // A status line before a step is just working: nothing to write again.
   const third = start(h);
   const three = tools(h, third.thread.id, undefined, () => true);
@@ -1312,7 +1532,7 @@ test('one reply: words written just before end_turn are asked for again in full,
   r = await three.call('end_turn', input);
   assert.match(r.text, /Now write your reply/);
   assert.doesNotMatch(r.text, again);
-  assert.match(r.text, /never see your thinking/, 'what the asks are about always goes in the reply');
+  assert.match(r.text, /If the user needs a draft or descriptions of choices/, 'what the asks are about always goes in the reply');
 });
 
 // One reply (docs/protocol.md, "One reply"; 1 Nov 2026): end_turn carries
@@ -1377,4 +1597,159 @@ test("one reply: a reply that ends in a What I need from you section gives the c
   s.result('completed');
   await tick();
   assert.equal(h.runner.get(thread.id).needs, 'you');
+});
+
+// ------------------------------------------------------------ other runners' threads
+
+// Another runner's thread, reached through the backend as the Mac app does
+// (relay.ts): list_threads lists and searches it with its runner, read_thread
+// reads its messages, send_message queues a send for that runner. On 6 Nov
+// an M5 thread was told there was no "Rust port" thread when Mike's sidebar
+// showed it on the cloud runner.
+function farRelay(opts: { takes?: boolean } = {}) {
+  const at = (s: number) => new Date(Date.parse('2026-10-26T11:00:00Z') + s * 1000).toISOString();
+  const FAR = 'ba5bb5ec-15bf-4382-9812-2b0fe15f4087';
+  const rows: RelayRow[] = [
+    { seq: 3, role: 'user', text: 'Port the runner to Rust for Linux', turn: 't1', at: at(0) },
+    { seq: 5, role: 'tool', text: 'Ran cargo build', toolKind: 'command', turn: 't1', at: at(2) },
+    { seq: 9, role: 'assistant', text: 'The Linux build runs.', turn: 't1', at: at(10) },
+  ];
+  const calls: { fn: string; args: Record<string, unknown> }[] = [];
+  const clock = new FakeClock();
+  const remote: RemoteThreads = {
+    runners: [{ id: 'cloud', name: 'Cloud', online: true, lastSeenAt: at(0) }],
+    threads: [
+      { runnerId: 'cloud', threadId: FAR, title: 'Rust port for Linux and Windows', cwd: '/root/dev/threadbear', accountId: 'claude-main', provider: 'claude', status: 'idle', needsYou: false, unread: false, preview: 'The Linux build runs.', createdAt: at(0), lastActivityAt: at(10) },
+      { runnerId: 'cloud', threadId: 'aaaa0000-old', title: 'Old cloud thing', cwd: '/root', accountId: 'claude-main', provider: 'claude', status: 'idle', needsYou: false, unread: false, preview: '', createdAt: at(0), lastActivityAt: at(0), archivedAt: at(1) },
+    ],
+  };
+  const relay = new Relay({
+    source: () => ({
+      key: 'owner',
+      post: async (_kind, fn, args) => {
+        calls.push({ fn, args });
+        if (fn === 'relay:remoteThread') return { runnerId: 'cloud', status: 'idle', needs: 'nothing' };
+        if (fn === 'relay:remoteMessages') return { messages: args.beforeSeq ? [] : rows, hasMore: false };
+        if (fn === 'relay:queueCommand') return 'cmd1';
+        return null;
+      },
+      // That runner takes the command at once, or (takes: false) never answers.
+      subscribe: (fn, _args, onUpdate) => {
+        if (fn === 'relay:commandState' && opts.takes !== false) queueMicrotask(() => onUpdate({ state: 'done' }));
+        return () => undefined;
+      },
+    }),
+    remote: () => remote,
+    subscribed: () => false,
+    publish: () => undefined,
+    clock,
+    log: nullLogger,
+  });
+  const control: RemoteControl = { list: async () => remote, call: (id, method, p) => relay.call(id, method, { threadId: id, ...p }) };
+  return { FAR, calls, control, relay, clock };
+}
+
+function toolsWith(h: ReturnType<typeof makeHarness>, selfId: string, remote?: RemoteControl) {
+  const list = buildThreadbearTools(h.runner, selfId, () => Date.parse('2026-10-26T12:00:00Z'), undefined, undefined, undefined, { remote: () => remote, sleep: async () => undefined });
+  return async (name: string, args: Record<string, unknown> = {}) => {
+    const r = (await list.find((x) => x.name === name)!.handler(args as never, {})) as { content: { text: string }[]; isError?: boolean };
+    return { text: r.content.map((c) => c.text).join('\n'), error: Boolean(r.isError) };
+  };
+}
+
+test("another runner's threads: listed with their runner, searched, read and messaged through the backend", async () => {
+  const h = makeHarness();
+  const { thread: me } = start(h, 'Review the YouTube comments');
+  const f = farRelay();
+  const call = toolsWith(h, me.id, f.control);
+
+  const inbox = await call('list_threads');
+  assert.match(inbox.text, /ba5bb5ec {2}Rust port for Linux and Windows {2}\[idle, inbox, on Cloud\]/);
+  assert.match(inbox.text, /Review the YouTube comments/);
+  assert.doesNotMatch(inbox.text, /Old cloud thing/, 'archived stays out of the inbox');
+  // Newest activity first: this thread (just made) is newer than the cloud one.
+  assert.ok(inbox.text.indexOf('Review the YouTube') < inbox.text.indexOf('Rust port'));
+  assert.match((await call('list_threads', { include: ['archived'] })).text, /Old cloud thing {2}\[idle, archived, on Cloud\]/);
+  const found = await call('list_threads', { query: 'rust', include: ['inbox', 'snoozed', 'archived'] });
+  assert.match(found.text, /Rust port .*on Cloud/);
+  assert.doesNotMatch(found.text, /YouTube/);
+
+  const read = await call('read_thread', { threadId: 'ba5bb5ec' });
+  assert.equal(read.error, false, read.text);
+  assert.match(read.text, /title: Rust port for Linux and Windows/);
+  assert.match(read.text, /runner: Cloud/);
+  assert.match(read.text, /User \(.*\):\nPort the runner to Rust for Linux/);
+  assert.match(read.text, /Agent \(.*\):\nThe Linux build runs\./);
+  assert.doesNotMatch(read.text, /cargo build/, 'tool calls left out, as for this runner\'s threads');
+
+  const sent = await call('send_message', { threadId: 'ba5bb5ec', text: 'How far did the Linux port get?' });
+  assert.equal(sent.error, false, sent.text);
+  assert.match(sent.text, /Sent to ba5bb5ec "Rust port for Linux and Windows" on Cloud/);
+  const q = f.calls.find((c) => c.fn === 'relay:queueCommand')!;
+  assert.equal(q.args.threadId, f.FAR);
+  assert.equal(q.args.kind, 'send');
+  assert.match(String((q.args.args as { text: string }).text), /^\[Sent by the agent in the thread "Review the YouTube comments"[\s\S]*How far did the Linux port get\?$/);
+
+  // The tools that change a thread here say where it is, not that it's missing.
+  const moved = await call('update_thread', { threadId: 'ba5bb5ec', title: 'x' });
+  assert.equal(moved.error, true);
+  assert.match(moved.text, /runs on Cloud/);
+});
+
+test("another runner's thread can be archived, snoozed and stopped, and says it was an agent; nothing else changes there", async () => {
+  const h = makeHarness();
+  const { thread: me } = start(h, 'Tidier');
+  const f = farRelay();
+  const call = toolsWith(h, me.id, f.control);
+  const updates = () => f.calls.filter((c) => c.fn === 'relay:queueCommand').map((c) => ({ kind: c.args.kind, args: c.args.args }));
+
+  const archived = await call('update_thread', { threadId: 'ba5bb5ec', archived: true });
+  assert.equal(archived.error, false, archived.text);
+  assert.match(archived.text, /"Rust port for Linux and Windows" on Cloud is archived/);
+  assert.deepEqual(updates().at(-1), { kind: 'update', args: { archive: true, by: 'agent' } });
+
+  const snoozed = await call('update_thread', { threadId: 'ba5bb5ec', snooze: '2h' });
+  assert.equal(snoozed.error, false, snoozed.text);
+  assert.deepEqual(updates().at(-1), { kind: 'update', args: { snooze: { until: '2026-10-26T14:00:00.000Z' } } });
+  await call('update_thread', { threadId: 'ba5bb5ec', snooze: 'off' });
+  assert.deepEqual(updates().at(-1), { kind: 'update', args: { wake: true } });
+
+  const stopped = await call('interrupt_thread', { threadId: 'ba5bb5ec' });
+  assert.equal(stopped.error, false, stopped.text);
+  assert.match(stopped.text, /Asked Cloud to stop "Rust port/);
+  assert.equal(updates().at(-1)!.kind, 'interrupt');
+
+  // A title, model, pool or mode stays with that runner; nothing is queued.
+  const before = updates().length;
+  for (const args of [{ title: 'x' }, { model: 'opus' }, { permissionMode: 'ask' }, { snooze: 'release' }, {}]) {
+    const r = await call('update_thread', { threadId: 'ba5bb5ec', ...args });
+    assert.equal(r.error, true, JSON.stringify(args));
+  }
+  assert.equal(updates().length, before);
+  // Moves and deletes still say where it is.
+  assert.match((await call('move_thread', { threadId: 'ba5bb5ec', folder: '/tmp' })).text, /runs on Cloud/);
+});
+
+test("a message another runner hasn't taken yet is said to be queued, not sent", async () => {
+  const h = makeHarness();
+  const { thread: me } = start(h, 'Asker');
+  const f = farRelay({ takes: false });
+  const call = toolsWith(h, me.id, f.control);
+  const sending = call('send_message', { threadId: 'ba5bb5ec', text: 'Hello?' });
+  await tick();
+  f.clock.advance(20_000);
+  const r = await sending;
+  assert.equal(r.error, false, r.text);
+  assert.match(r.text, /^Queued for ba5bb5ec .* on Cloud, which hasn't picked it up yet/);
+});
+
+test("without the backend (sync off, or a runner key) the tools list only this runner's threads", async () => {
+  const h = makeHarness();
+  const { thread: me } = start(h, 'Local only');
+  const call = toolsWith(h, me.id, undefined);
+  assert.doesNotMatch((await call('list_threads', { query: 'rust' })).text, /Rust/);
+  assert.match((await call('read_thread', { threadId: 'ba5bb5ec' })).text, /No thread with id ba5bb5ec/);
+  // And a backend that fails leaves the local list working.
+  const broken = toolsWith(h, me.id, { list: async () => { throw new Error('offline'); }, call: async () => { throw new Error('offline'); } });
+  assert.match((await broken('list_threads')).text, /Local only/);
 });

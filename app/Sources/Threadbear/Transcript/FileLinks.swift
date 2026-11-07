@@ -29,12 +29,17 @@ enum FileLinkAction: String, CaseIterable {
     /// A project file with an app here to open it. Asking for the app means
     /// a missing file, or a Mac without that app, still gets the pane and
     /// its "isn't there any more" rather than a click that does nothing.
+    /// The file itself counts, not the name a symlink gives it: a
+    /// `project.tandem` linked to a `.command` isn't a project (Daybreak,
+    /// 7 Nov). OpenGate looks again before anything opens.
     static func opensInItsApp(_ path: String, appFor: (URL) -> URL? = defaultApp) -> Bool {
-        PreviewRules.isAppProject(path) && appFor(URL(fileURLWithPath: path)) != nil
+        guard PreviewRules.isAppProject(path) else { return false }
+        let real = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        return PreviewRules.isAppProject(real.path) && appFor(real) != nil
     }
 
     static func defaultApp(_ url: URL) -> URL? {
-        FileManager.default.fileExists(atPath: url.path) ? NSWorkspace.shared.urlForApplication(toOpen: url) : nil
+        FileManager.default.fileExists(atPath: url.path) ? OpenGate.appFor(url) : nil
     }
 
     /// The app macOS opens `path` in, for "Open in Xcode".
@@ -192,25 +197,40 @@ enum WebLinkAction: String, CaseIterable {
 }
 
 /// The right-click menu on a web link in the transcript: browser or
-/// panel, Copy Link, and "Default", like FileLinkMenu.
+/// panel, Copy Link, and "Default", like FileLinkMenu. With more than one
+/// Chrome profile open, the browser item is one per profile.
 @MainActor
 final class WebLinkMenu: NSObject {
     let url: URL
     let open: (URL, WebLinkAction) -> Void
+    let profiles: [ChromeProfile]
+    let openInProfile: (URL, ChromeProfile) -> Void
 
-    init(url: URL, open: @escaping (URL, WebLinkAction) -> Void) {
+    init(
+        url: URL,
+        open: @escaping (URL, WebLinkAction) -> Void,
+        profiles: [ChromeProfile] = ChromeProfiles.open(),
+        openInProfile: @escaping (URL, ChromeProfile) -> Void = { url, profile in MainActor.assumeIsolated { ChromeProfiles.open(url, in: profile) } }
+    ) {
         self.url = url
         self.open = open
+        self.profiles = profiles
+        self.openInProfile = openInProfile
     }
 
     func menu() -> NSMenu {
         let menu = NSMenu()
-        for action in [WebLinkAction.browser, .panel] {
-            let item = NSMenuItem(title: action.title, symbol: action.symbol, action: #selector(openItem(_:)), target: self)
-            item.setIcon(action.image)
-            item.representedObject = action.rawValue
-            menu.addItem(item)
+        if profiles.isEmpty {
+            menu.addItem(actionItem(.browser))
+        } else {
+            for (index, profile) in profiles.enumerated() {
+                let item = NSMenuItem(title: ChromeProfiles.title(profile), symbol: WebLinkAction.browser.symbol, action: #selector(openProfile(_:)), target: self)
+                item.setIcon(ChromeProfiles.icon(profile))
+                item.tag = index
+                menu.addItem(item)
+            }
         }
+        menu.addItem(actionItem(.panel))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Copy Link", symbol: "link", action: #selector(copyLink), target: self))
         menu.addItem(.separator())
@@ -231,6 +251,18 @@ final class WebLinkMenu: NSObject {
     }
 
     nonisolated(unsafe) private static var retainKey: UInt8 = 0
+
+    private func actionItem(_ action: WebLinkAction) -> NSMenuItem {
+        let item = NSMenuItem(title: action.title, symbol: action.symbol, action: #selector(openItem(_:)), target: self)
+        item.setIcon(action.image)
+        item.representedObject = action.rawValue
+        return item
+    }
+
+    @objc private func openProfile(_ item: NSMenuItem) {
+        guard profiles.indices.contains(item.tag) else { return }
+        openInProfile(url, profiles[item.tag])
+    }
 
     @objc private func openItem(_ item: NSMenuItem) {
         guard let action = (item.representedObject as? String).flatMap(WebLinkAction.init(rawValue:)) else { return }

@@ -131,6 +131,31 @@ anyone but Mike.
 
 ### 4. Full sync, off by default, on for Mike first
 
+**Built and on for Mike's four runners, 6 Nov** (8b18a30e, backend API 52; "Full
+sync" in docs/protocol.md and docs/convex-backend.md; `sync.full` in each runner's
+runner.json, off for everyone else). Being watched for about a week.
+
+- **Measured** (25 minutes of prod logs, 05:21 to 05:46 UTC on a busy morning, M5
+  doing nearly all of it; Bruce, Hetzner and the Pixel had almost no threads running):
+  `sync:appendBodies` 108.7 MB/day at that rate, 3.9 KB a call, 1.9 MB written and 6 KB
+  read. That's about 98 MB/day of rows, against the 22 MB/day this plan estimated from
+  a quieter 10 days, so the rate is an upper end for now. Overall 599 MB/day, against
+  297 MB/day in the 20 minutes before, though `appendMessages` alone went from 46 to
+  159 MB/day at the same time, which body rows don't touch, so more was running.
+- **Budget:** 100 MB/day across all four, set from 5 Nov's 581 MB (about 390 MB
+  without one-offs). It's at the top of that on a busy morning. **The real figure is
+  the daily usage check's**: at this rate writes are about 3.3 GB a month, and from day
+  31 deleting reads the same rows again, for about 5 GB a month in all, within the 50 GB.
+- **Withheld:** 91 of 1,617 rows (5.6%), 76 of them reading a background job's output.
+- **Left out:** the iPhone (old phones keep working, and it needs a release to open a
+  tool). The Mac shows no reasoning, and its pictures stay "kept" (website only). A
+  thread's first tool in flight across a handover shows as kept on the runner.
+- **Known limits:** a background tool that finishes across a restart stays input-only;
+  a subagent's reply goes up scrubbed like any agent message; the withhold list can't
+  know every command; setup says nothing yet as it's off for new installs (step 6).
+
+The original plan for this step follows.
+
 - New table of bodies by thread and seq, with the small `messages` rows as they
   are. Bodies go through scrubbing and withheld items become a stub saying
   "kept on the runner".
@@ -187,11 +212,34 @@ The original plan for this step follows.
 
 ### 6. On by default
 
+**Free accounts, worked out 6 Nov** from 1.52 hours of real rows: 2,797 bodies, 5.21 MB, 221 M5
+turns, so about 24 KB of body rows a turn. Writes plus 30-day deletion make about 48 KB a turn of
+I/O, and storage levels off at 30 days' writes. These are estimates, before index overhead.
+
+| Turns a day | I/O a month | Storage held |
+|---|---|---|
+| 15 | about 20 MB | about 11 MB |
+| 100 | about 140 MB | about 70 MB |
+| 500 | about 720 MB | about 350 MB |
+
+Free is 1 GB of I/O and 0.5 GB of storage, and they're the team's, shared with other projects. On Free,
+going over means new writes may fail; on Starter it bills at $0.22 a GB. So full sync fits at light and
+ordinary use, and 500 turns a day, a heavy user, is what gets close, on top of the mirror's own reads.
+Mike's real rate is the check: this morning's "3.3 GB a month" assumed a busy morning's pace all day.
+
+**The silent check, reviewed 6 Nov** with every value masked: 32 flagged of 722 checked (4.4%), and none
+looks like a real credential: code and docs about secrets, status text, logs, `ps` output, a public deploy
+key, screenshots of sign-in fields. So holding back on its word would hide about 1 output in 25 for
+nothing today. Keep it counting. It's not ready to hold anything back, and how much it misses on real
+data is still unknown, as nothing in the sample hit the rules either.
+
 - Only once 2, 3 and 4 have run on Mike's runners, and step 5 works.
 - New installs: on, and setup says in plain words what goes up, what can't be
   scrubbed, and where the switch is.
 - Existing installs: asked once, never switched silently.
-- Update `docs/on-your-mac.md`, the README and the guide in the same landing.
+- Update `docs/on-your-mac.md`, the README, the guide and the landing page's
+  "What goes up to Convex?" and "Where your stuff lives" (`site/`) in the same
+  landing.
 
 ### Later, on their own
 

@@ -101,6 +101,8 @@ export class FakeAdapter implements AgentAdapter {
   slowExit = false;
   // Set by a test that wants the runner's model probe to find something.
   models?: (account: Account) => Promise<ModelChoice[]>;
+  // Set by a test of the composer's command picker.
+  commands?: (account: Account, cwd: string, untrusted?: Record<string, unknown>) => Promise<import('../../src/slash-commands.ts').SlashCommand[]>;
   archived: { accountId: string; nativeSessionId: string }[] = [];
   archive?: (account: Account, nativeSessionId: string) => Promise<void>;
   // Set by a test of editing a message; `rewound` keeps what it was asked.
@@ -270,6 +272,9 @@ export function makeHarness(home = tmpDir(), cfgExtra: Partial<Config> = {}, dep
     subagentTranscript: () => null,
     // Never probe the real network: the API is always there unless a test says.
     reachable: async () => true,
+    // Setup and hooks at normal priority: on a busy Mac a background shell
+    // can miss a test's wait. background.test.ts covers the real path.
+    backgroundJobs: false,
     ...depsExtra,
   });
   const notes: Notification[] = [];

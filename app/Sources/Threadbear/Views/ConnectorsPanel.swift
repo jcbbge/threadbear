@@ -52,10 +52,11 @@ struct ConnectorsPanel: View {
                         .foregroundStyle(.secondary)
                         .tip("Manage connectors on \(ConnectorsText.host(status) ?? "the gateway")")
                     }
-                    Button { app.refreshConnectors() } label: {
+                    Button { app.refreshConnectors(shown: true) } label: {
                         Image(systemName: "arrow.clockwise").font(.system(size: zoomed(11)))
                     }
                     .buttonStyle(.borderless)
+                    .busy(app.isBusy(BusyKey.refreshConnectors))
                     .foregroundStyle(.secondary)
                     .tip("Check the gateway again now")
                     Button { aboutShown.toggle() } label: {

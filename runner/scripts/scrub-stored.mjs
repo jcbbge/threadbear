@@ -18,8 +18,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { credentialUrlProblem } from '../src/secure-url.ts';
 
-export const TABLES = ['messages', 'threads', 'threadIndex', 'projects', 'schedules', 'pocketCards', 'accounts', 'commands', 'replyImages', 'shareImages', 'pools', 'runners', 'tokens', 'runnerKeys', 'runnerStats', 'projectIcons', 'projectHeads'];
+export const TABLES = ['messages', 'threads', 'threadIndex', 'projects', 'schedules', 'pocketCards', 'accounts', 'commands', 'replyImages', 'shareImages', 'pools', 'runners', 'tokens', 'runnerKeys', 'runnerStats', 'projectIcons', 'projectHeads', 'projectNotes', 'eventBodies'];
 
 export async function scrubStored({ post, key, tables = TABLES, apply = false, batch = 200, say = () => {} }) {
   const totals = {};
@@ -40,13 +41,18 @@ export async function scrubStored({ post, key, tables = TABLES, apply = false, b
   return totals;
 }
 
+// Every call carries the runner key: https (or plain http to this Mac) and
+// no redirects, as the runner's own poster (src/sync.ts convexPoster).
 function httpPost(url) {
   const base = url.replace(/\/+$/, '');
+  const problem = credentialUrlProblem(base);
+  if (problem) throw new Error(`sync.url in runner.json ${problem}.`);
   return async (fn, args) => {
     const res = await fetch(`${base}/api/mutation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: fn, args, format: 'json' }),
+      redirect: 'error',
       signal: AbortSignal.timeout(60_000),
     });
     const body = await res.json().catch(() => undefined);

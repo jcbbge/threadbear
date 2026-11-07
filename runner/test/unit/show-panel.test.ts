@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeHarness, tmpDir } from '../helpers/fakes.ts';
+import { makeHarness, tick, tmpDir } from '../helpers/fakes.ts';
 import { checkSummary } from '../helpers/protocol-check.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
 import { PANEL_ACK_WAIT_MS, resolvePanel } from '../../src/panel-requests.ts';
@@ -53,6 +53,8 @@ test('show_panel puts a request on the thread, and says it waits when the app do
   const h = makeHarness();
   const { thread } = h.runner.create({ text: 'Set up the schema', accountId: 'claude-3', cwd: convexFolder() });
   const pending = showTool(h, thread.id)({ panel: 'convex', where: 'right' });
+  // The tool first checks the caller isn't sandboxed (a sandboxed one asks).
+  await tick();
   const asked = h.runner.get(thread.id);
   assert.deepEqual(checkSummary(asked as never), []);
   assert.equal(asked.panelRequest?.panel, 'convex.dashboard');
@@ -74,6 +76,7 @@ test('the app showing it clears the request and the tool says Mike has it in fro
   const h = makeHarness();
   const { thread } = h.runner.create({ text: 'hi', accountId: 'claude-3', cwd: tmpDir() });
   const pending = showTool(h, thread.id)({ panel: 'Highlights' });
+  await tick();
   const request = h.runner.get(thread.id).panelRequest!;
   assert.equal(request.where, undefined);
   // A stale id changes nothing.

@@ -2,6 +2,8 @@
 // turns, persistence and the protocol; an adapter only drives one CLI
 // process per live thread and reports normalised output. Claude and Codex
 // are the two implementations of AgentAdapter.
+import type { SlashCommand } from '../slash-commands.ts';
+import type { CodeWrite } from '../code-writes.ts';
 import type {
   Account,
   BackgroundKind,
@@ -26,6 +28,9 @@ export type StartSessionOptions = {
   model?: string;
   effort?: EffortLevel; // undefined: the model's own level
   permissionMode: PermissionMode;
+  // Its CLI must run in a sandbox (sandbox.ts, ThreadRecord.confined): an
+  // adapter that can't put it in one refuses to start it.
+  confined?: boolean;
   // Native session id. With resume=false it's pre-assigned to a brand new
   // session; with resume=true the CLI loads that session's transcript.
   // Codex assigns its own ids, so it ignores this when resume=false and
@@ -56,6 +61,17 @@ export type StartSessionOptions = {
   // local settings and gets these instead: the same settings without the
   // parts that run anything.
   untrustedProjectSettings?: Record<string, unknown>;
+  // Whether an edit of this file (absolute) changes code Threadbear runs
+  // by itself: a patch, what a hashed patch covers, Claude settings and
+  // what they name (code-writes.ts). Outside Full access such an edit
+  // always asks, with no "Always allow". The adapter checks the names in
+  // code-writes.ts too, so leaving this out never asks less.
+  runsAsCode?: (file: string) => CodeWrite;
+  // Claude, in Full with the folder's settings loaded: they hold
+  // permission rules that aren't trusted for a thread that asks first, so
+  // the session must be able to stop them applying if the thread leaves
+  // Full (askBeforeEveryTool).
+  heldGrants?: boolean;
 };
 
 export type TurnResult = {
@@ -108,17 +124,28 @@ export type AdapterOutput =
   | { kind: 'subagent'; update: SubagentUpdate }
   // "Always allow" rules to keep for this thread.
   | { kind: 'allowRules'; rules: string[] }
+  // "Plan first": the agent put its plan to Mike (Claude's ExitPlanMode,
+  // Codex's plan item). The runner shows it as plan.proposed.
+  | { kind: 'planProposed'; itemId: string; text: string }
   // Files an Edit or Write call left, sent only for one the CLI says it
   // made, just before its successful tool.result. Never for a preview (an
   // edit.diff before approval) or a denied or failed edit: the runner
   // trusts patch files by these alone (patch-trust.ts). `sha256` is the
   // hash of the bytes the edit wrote, rebuilt from the result. Only
   // Claude's adapter sends it: a Codex patch's result doesn't say what it
-  // wrote, so a patch file Codex writes waits for Mike.
-  | { kind: 'wrote'; itemId: string; files: AgentWrite[] }
+  // wrote, so a patch file Codex writes waits for Mike. `mode`: the
+  // thread's permission mode when the CLI let the call through, recorded
+  // with the call (not read when the result comes, after a switch to Full
+  // access); only 'full' trusts anything (code-writes.ts). Absent when it
+  // wasn't recorded, which trusts nothing.
+  | { kind: 'wrote'; itemId: string; files: AgentWrite[]; mode?: PermissionMode }
   | { kind: 'result'; result: TurnResult };
 
-export type AgentWrite = { path: string; sha256: string };
+// `base`: the hash of the file an Edit or MultiEdit started from, as the
+// result reports it; null when the call wrote the whole file (a Write, or
+// an edit of a missing or empty one). An edit vouches only for what it
+// changed, so the rest counts only when `base` was trusted (patch-trust.ts).
+export type AgentWrite = { path: string; sha256: string; base: string | null };
 
 // A background shell or subagent the CLI reports. `type` is the CLI's own
 // name for it (Claude: local_bash, local_agent, ...), `kind` the protocol's.
@@ -147,7 +174,12 @@ export type ToolApprovalRequest = {
   signal: AbortSignal;
 };
 
-export type ToolApprovalAnswer = { decision: 'allow' | 'allowAlways' | 'deny' | 'expired'; message?: string };
+// mode: the permission mode to switch to as the call goes ahead (approving
+// a "Plan first" plan takes the thread out of plan mode).
+// stopped: an expired card that Mike pressed Stop on (the Mac app or the
+// phone), as opposed to one that closed unanswered for any other reason. Only then may an agent be told
+// the user stopped it (docs/protocol.md, "Who stopped it").
+export type ToolApprovalAnswer = { decision: 'allow' | 'allowAlways' | 'deny' | 'expired'; message?: string; mode?: PermissionMode; stopped?: boolean };
 
 export type QuestionRequest = {
   toolUseId?: string;
@@ -156,7 +188,8 @@ export type QuestionRequest = {
 };
 
 // answers: question text -> chosen label(s); null when dismissed or expired.
-export type QuestionAnswer = { answers: Record<string, string> | null; message?: string };
+// stopped: as ToolApprovalAnswer's.
+export type QuestionAnswer = { answers: Record<string, string> | null; message?: string; stopped?: boolean };
 
 export interface SessionSink {
   output(o: AdapterOutput): void;
@@ -188,9 +221,17 @@ export interface AgentSession {
   setModel(model: string | undefined): Promise<void>;
   setEffort(effort: EffortLevel | undefined): Promise<void>;
   setPermissionMode(mode: PermissionMode): Promise<void>;
+  // From now on every tool call goes to the approval card's check, past
+  // any allow rule the CLI loaded: a session started in Full with a
+  // folder's untrusted permission rules, after the thread left Full, for
+  // the turns the CLI starts by itself before the next message replaces it.
+  askBeforeEveryTool?(): void;
   // Moves the session to another folder from its next turn, in the same
   // native session. Only on adapters with movesFolders.
   setCwd?(cwd: string): Promise<void>;
+  // The slash commands this session's CLI offers (skills included), for
+  // the composer's picker.
+  commands?(): Promise<SlashCommand[]>;
   // Ends the input so the CLI finishes and exits. Resolves once it has.
   // With hard set it stops the CLI straight away instead (background work
   // it is waiting for would otherwise keep it alive).
@@ -236,6 +277,9 @@ export interface AgentAdapter {
   // What the account's CLI offers as models, without starting a turn.
   // Optional: a provider without a picker leaves it out.
   models?(account: Account): Promise<ModelChoice[]>;
+  // The slash commands the account's CLI offers in a folder (skills
+  // included), without starting a turn, for the composer's picker.
+  commands?(account: Account, cwd: string, untrusted?: Record<string, unknown>): Promise<SlashCommand[]>;
   // A same-account folder change calls setCwd on a live session, or passes
   // the folder to the next start or resume, instead of copying the
   // transcript and adding a handoff (Codex).

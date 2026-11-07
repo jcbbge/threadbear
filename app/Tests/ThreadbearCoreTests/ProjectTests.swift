@@ -6,6 +6,55 @@ final class ProjectTests: XCTestCase {
         try JSONDecoder().decode(type, from: Data(json.utf8))
     }
 
+    // MARK: What a click shows before the runner answers
+
+    func testAProjectUpdateGuessesWhatItChanges() {
+        let now = Date(timeIntervalSince1970: 100)
+        let tasks = ProjectTasks(url: "https://n/1")
+        let project = Project(id: "p", title: "T", folders: ["/a"], goals: "g", state: "s", notes: "n", archived: false, notion: "https://n/1", tasks: tasks)
+        XCTAssertEqual(ProjectUpdate(goals: "G").applied(to: project).goals, "G")
+        XCTAssertEqual(ProjectUpdate(notes: "N").applied(to: project).notes, "N")
+        XCTAssertEqual(ProjectUpdate(folders: []).applied(to: project).folders, [])
+        XCTAssertEqual(ProjectUpdate(archived: true).applied(to: project).archived, true)
+        let state = ProjectUpdate(state: "S").applied(to: project, now: now)
+        XCTAssertEqual(state.state, "S")
+        XCTAssertEqual(state.stateUpdatedAt, now)
+        XCTAssertEqual(ProjectUpdate(title: "").applied(to: project).title, "T", "the runner keeps a title on an empty one")
+        XCTAssertEqual(ProjectUpdate().applied(to: project), project)
+    }
+
+    func testANotionChangeDropsTheOldBoardButTheSamePageKeepsIt() {
+        let tasks = ProjectTasks(url: "https://n/1")
+        let project = Project(id: "p", title: "T", notion: "https://n/1", tasks: tasks)
+        let other = ProjectUpdate(notion: "https://n/2").applied(to: project)
+        XCTAssertEqual(other.notion, "https://n/2")
+        XCTAssertNil(other.tasks)
+        let off = ProjectUpdate(notion: "").applied(to: project)
+        XCTAssertNil(off.notion)
+        XCTAssertNil(off.tasks)
+        XCTAssertEqual(ProjectUpdate(notion: "https://n/1").applied(to: project).tasks, tasks)
+    }
+
+    func testChangingAThreadsProjectsPinsWhatsAddedAndDropsWhatsRemoved() {
+        let now = Date(timeIntervalSince1970: 100)
+        let projects = [ThreadProject(id: "a", title: "A"), ThreadProject(id: "b", title: "B")]
+        let titles = ["c": "C"]
+        let changed = projects.changing(add: ["a", "c", "unknown"], remove: ["b"], title: { titles[$0] }, now: now)
+        XCTAssertEqual(changed.map(\.id), ["a", "c"], "one it can't name waits for the reply")
+        XCTAssertEqual(changed.map(\.pinned), [true, true])
+        XCTAssertEqual(changed[1].by, .mike)
+        XCTAssertEqual(changed[1].at, now)
+    }
+
+    func testPausingTheLibrarianKeepsWhyItsOff() {
+        XCTAssertEqual(LibrarianStatus().setting(paused: true).state, .paused)
+        XCTAssertEqual(LibrarianStatus(state: .paused, paused: true).setting(paused: false).state, .idle)
+        XCTAssertEqual(LibrarianStatus(state: .paused, paused: true, current: LibrarianJob(threadId: "t")).setting(paused: false).state, .working)
+        let off = LibrarianStatus(state: .off, reason: "No login").setting(paused: true)
+        XCTAssertEqual(off.state, .off)
+        XCTAssertEqual(off.paused, true)
+    }
+
     // MARK: Decoding
 
     func testPatchInfoDecodesAnUntrustedPatch() throws {

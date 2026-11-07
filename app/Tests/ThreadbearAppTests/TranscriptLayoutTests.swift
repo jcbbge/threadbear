@@ -335,3 +335,53 @@ final class TranscriptLayoutTests: XCTestCase {
 private final class FlippedDocument: NSView {
     override var isFlipped: Bool { true }
 }
+
+/// Asks sliding like a deck.
+extension TranscriptLayoutTests {
+    private func pagedHost() -> (NSWindow, ComposerCardHost, TranscriptController) {
+        let why = String(repeating: "This one needs a proper explanation so it wraps over a few lines. ", count: 3)
+        let asks = (1...3).map { Ask(action: "Pick number \($0)", why: why, options: ["Yes", "No", "Maybe"], optionNotes: ["Does it", "Doesn't", "Waits"]) }
+        let row = TranscriptRow(id: "ak:1", seq: 1, turnId: "t1", content: .asks(AsksCard(seq: 1, asks: asks)))
+        let controller = TranscriptController()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 800), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let host = ComposerCardHost(controller: controller)
+        host.frame = NSRect(x: 0, y: 0, width: 600, height: 400)
+        host.wantsLayer = true
+        window.contentView?.addSubview(host)
+        host.show(row)
+        host.layoutSubtreeIfNeeded()
+        return (window, host, controller)
+    }
+
+    /// The real card moves to the new page straight away, under the pictures,
+    /// so a click lands on it, and it's back once the slide is over.
+    func testPagingShowsTheNewPageAtOnceAndSlidesOverIt() async throws {
+        let (window, host, controller) = pagedHost()
+        defer { window.close(); _ = controller }
+        let before = host.subviews.count
+        host.showPage(1)
+        XCTAssertEqual(host.page, 1)
+        XCTAssertEqual(host.subviews.count, before + 1, "the pictures are up")
+        // Paging on before it's over goes straight to the page after.
+        host.showPage(2)
+        XCTAssertEqual(host.page, 2)
+        XCTAssertEqual(host.subviews.count, before + 1, "and there's only ever one lot")
+        for _ in 0..<200 where host.subviews.count != before { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(host.subviews.count, before, "they've gone")
+        XCTAssertTrue(host.subviews.allSatisfy { $0.alphaValue == 1 }, "and the real card is back")
+    }
+
+    func testThePageNumberIsFoundInTheHeadingNotInAnAsk() {
+        let text = "Decisions needed\t\u{00A0}\u{00A0}\u{00A0}\u{00A0}12 of 13\u{00A0}\u{00A0}\nIs 2 of 3 enough?"
+        let range = RowRenderer.pageNumberRange(in: text)
+        XCTAssertEqual(range.map { (text as NSString).substring(with: $0) }, "12")
+        XCTAssertNil(RowRenderer.pageNumberRange(in: "Is 2 of 3 enough?"))
+    }
+
+    func testTheHeadingIsCutAroundTheNumber() {
+        let parts = CardDeck.around(NSRect(x: 40, y: 0, width: 10, height: 20), in: NSRect(x: 0, y: 0, width: 100, height: 38))
+        XCTAssertEqual(parts, [NSRect(x: 0, y: 0, width: 40, height: 38), NSRect(x: 50, y: 0, width: 50, height: 38)])
+        XCTAssertEqual(CardDeck.around(nil, in: NSRect(x: 0, y: 0, width: 100, height: 38)), [NSRect(x: 0, y: 0, width: 100, height: 38)])
+    }
+}

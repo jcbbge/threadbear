@@ -82,15 +82,22 @@ extension AppModel {
 
     // MARK: Changing a project
 
-    /// Saves what's given. The reply goes in straight away;
-    /// `projects.updated` brings the whole list a moment later anyway.
+    /// Saves what's given. It shows at once and goes back if the runner
+    /// refuses, unless something else has changed it since. The reply goes
+    /// in straight away; `projects.updated` brings the whole list a moment
+    /// later anyway.
     func updateProject(_ id: String, _ update: ProjectUpdate) {
         guard let client else { return }
+        let before = project(id)
+        let guess = before.map { update.applied(to: $0) }
+        if let guess { replace(guess) }
         Task {
             do {
                 replace(try await client.updateProject(id, update))
             } catch {
+                if let before, project(id) == guess { replace(before) }
                 show(error)
+                loadProjects()
             }
         }
     }
@@ -128,7 +135,7 @@ extension AppModel {
         panel.message = "Choose an icon for \(project.title)"
         if let first = project.folders.first { panel.directoryURL = URL(fileURLWithPath: first) }
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task {
+        whileBusy(BusyKey.projectIcon(id)) { [self] in
             do {
                 replace(try await client.setProjectIcon(id, path: url.standardizedFileURL.path))
             } catch {
@@ -140,7 +147,7 @@ extension AppModel {
     /// Back to the icon the librarian finds in the project's folders.
     func setProjectIconAutomatic(_ id: String) {
         guard let client else { return }
-        Task {
+        whileBusy(BusyKey.projectIcon(id)) { [self] in
             do {
                 replace(try await client.setProjectIcon(id))
             } catch {
@@ -149,12 +156,23 @@ extension AppModel {
         }
     }
 
-    /// Reads the project's Notion board again. Quiet when it fails: the
-    /// board shows the error itself.
+    /// Reads the project's Notion board again. Quiet when it fails on its
+    /// own: the board shows Notion's error itself. `force` is the refresh
+    /// button, whose icon spins and which says if the runner couldn't be asked.
     func refreshProjectTasks(_ id: String, force: Bool = false) {
         guard let client, project(id)?.notion != nil else { return }
-        Task {
-            if let project = try? await client.refreshProjectTasks(id, force: force) { replace(project) }
+        guard force else {
+            Task {
+                if let project = try? await client.refreshProjectTasks(id) { replace(project) }
+            }
+            return
+        }
+        whileBusy(BusyKey.projectTasks(id)) { [self] in
+            do {
+                replace(try await client.refreshProjectTasks(id, force: true))
+            } catch {
+                show(error)
+            }
         }
     }
 
@@ -191,13 +209,25 @@ extension AppModel {
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        confirmedDelete(id, client: client)
+    }
+
+    /// Gone at once, and back where it was if the runner refuses.
+    func confirmedDelete(_ id: String, client: RPCClient) {
+        guard let project = project(id), let index = projects.firstIndex(where: { $0.id == id }) else { return }
+        let wasOpen = openProjectId == id
+        projects.remove(at: index)
+        if wasOpen { openProjectId = nil }
         Task {
             do {
                 try await client.deleteProject(id)
                 projects.removeAll { $0.id == id }
-                if openProjectId == id { openProjectId = nil }
             } catch {
+                if self.project(id) == nil { projects.insert(project, at: min(index, projects.count)) }
+                if wasOpen, openProjectId == nil { openProjectId = id }
                 show(error)
+                // It may have gone through and only the reply been lost.
+                loadProjects()
             }
         }
     }
@@ -211,14 +241,33 @@ extension AppModel {
         alert.addButton(withTitle: "Merge")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        confirmedMerge(id, into: intoId, client: client)
+    }
+
+    /// This one goes at once, and its page becomes the other's, with its
+    /// folders and threads counted there; the reply has the joined notes.
+    /// A refusal puts both back.
+    func confirmedMerge(_ id: String, into intoId: String, client: RPCClient) {
+        guard let project = project(id), let into = self.project(intoId), let index = projects.firstIndex(where: { $0.id == id }) else { return }
+        var guess = into
+        guess.folders += project.folders.filter { !into.folders.contains($0) }
+        guess.threadCount += project.threadCount
+        let wasOpen = openProjectId == id
+        projects.remove(at: index)
+        replace(guess)
+        if wasOpen { openProjectId = intoId }
         Task {
             do {
                 let kept = try await client.mergeProject(id, into: intoId)
                 projects.removeAll { $0.id == id }
                 replace(kept)
-                if openProjectId == id { openProjectId = kept.id }
             } catch {
+                if self.project(id) == nil { projects.insert(project, at: min(index, projects.count)) }
+                if self.project(intoId) == guess { replace(into) }
+                if wasOpen, openProjectId == intoId { openProjectId = id }
                 show(error)
+                // It may have gone through and only the reply been lost.
+                loadProjects()
             }
         }
     }
@@ -227,13 +276,18 @@ extension AppModel {
 
     /// What Mike does by hand: an added project is pinned (so this also
     /// keeps a thread the librarian put somewhere), and a removed one is
-    /// never put back.
+    /// never put back. The chips and menus change at once, and change back
+    /// if the runner refuses.
     func setProjects(_ threadId: String, add: [String] = [], remove: [String] = []) {
         guard let client else { return }
+        let before = threads[threadId]?.projects
+        let guess = before?.changing(add: add, remove: remove) { self.project($0)?.title }
+        if let guess { threads[threadId]?.projects = guess }
         Task {
             do {
                 threads[threadId] = try await client.setThreadProjects(threadId, add: add, remove: remove)
             } catch {
+                if let before, threads[threadId]?.projects == guess { threads[threadId]?.projects = before }
                 show(error)
             }
         }
@@ -243,7 +297,7 @@ extension AppModel {
     /// folder goes in too, unless it's the default folder, which is
     /// everyone's scratch space (misc) rather than a project's.
     func newProject(with threadId: String?) {
-        guard let client else { return }
+        guard let client, !isBusy(BusyKey.newProject) else { return }
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         field.placeholderString = "Name"
         let alert = NSAlert()
@@ -261,7 +315,8 @@ extension AppModel {
            URL(fileURLWithPath: cwd).standardizedFileURL != URL(fileURLWithPath: defaults.cwd).standardizedFileURL {
             folders = [cwd]
         }
-        Task {
+        // From a thread's menu there's no button to spin.
+        whileBusy(BusyKey.newProject, note: threadId == nil ? nil : "Making \(title)…") { [self] in
             do {
                 let project = try await client.createProject(NewProjectRequest(title: title, folders: folders, threadIds: threadId.map { [$0] } ?? []))
                 replace(project)
@@ -274,12 +329,19 @@ extension AppModel {
 
     // MARK: The librarian
 
+    /// Shows at once (a switch that snapped back until the reply looked
+    /// refused), and goes back if the runner refuses. The controls wait for
+    /// one to land before taking another, as with a schedule's pause.
     func setLibrarianPaused(_ paused: Bool) {
-        guard let client else { return }
-        Task {
+        guard let client, !isBusy(BusyKey.pauseLibrarian) else { return }
+        let before = librarian
+        let guess = before?.setting(paused: paused)
+        if let guess { librarian = guess }
+        whileBusy(BusyKey.pauseLibrarian) { [self] in
             do {
                 librarian = try await client.updateLibrarian(paused: paused)
             } catch {
+                if librarian == guess { librarian = before }
                 show(error)
             }
         }
@@ -289,7 +351,8 @@ extension AppModel {
     /// looked at.
     func runLibrarian(threadId: String? = nil) {
         guard let client else { return }
-        Task {
+        // From a thread's menu there's no button to spin.
+        whileBusy(BusyKey.runLibrarian(threadId), note: threadId == nil ? nil : "Asking the librarian to look…") { [self] in
             do {
                 librarian = try await client.runLibrarian(threadId: threadId)
             } catch {

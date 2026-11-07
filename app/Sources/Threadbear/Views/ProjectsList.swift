@@ -28,7 +28,7 @@ struct ProjectsList: View {
         }
         return VStack(spacing: 0) {
             ModeHeader(title: "Projects", count: built.sections.count)
-            SidebarButtonRow(icon: "plus", title: "New project", tip: "Make a new project") {
+            SidebarButtonRow(icon: "plus", title: "New project", tip: "Make a new project", busy: app.isBusy(BusyKey.newProject)) {
                 app.newProject(with: nil)
             }
             .padding(.horizontal, SidebarMetrics.outerInset)

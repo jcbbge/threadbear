@@ -1,6 +1,7 @@
 import SwiftUI
 import ThreadbearKit
 import UIKit
+import UniformTypeIdentifiers
 
 /// A text box that also takes a pasted photo. SwiftUI's TextField only ever
 /// pastes text, so this is UIKit's text view with Paste offered whenever the
@@ -17,12 +18,16 @@ struct PastableTextField: UIViewRepresentable {
     var placeholder: String
     var lines: ClosedRange<Int>
     /// Nil when photos can't be sent: Paste is then text only.
-    var onPasteImages: (([UIImage]) -> Void)?
+    var onPasteImages: (([NSItemProvider]) -> Void)?
     /// The photos whose chips are in the words, in order.
     var photos: Binding<[PickedPhoto]>? = nil
     /// Kept up to date with the cursor, and where it goes after the words
     /// change from outside (photos put in).
     var cursor: TextCursor? = nil
+    /// A pasted thread id (Copy thread ID, here or on the Mac) as the
+    /// `[title](thread:<id>)` link it should go in as, or nil to paste the
+    /// words as they are.
+    var threadReference: ((String) -> String?)? = nil
 
     func makeUIView(context: Context) -> PastingTextView {
         let view = PastingTextView()
@@ -56,6 +61,14 @@ struct PastableTextField: UIViewRepresentable {
         view.placeholderLabel.text = placeholder
         view.placeholderLabel.isHidden = !text.isEmpty
         view.onPasteImages = onPasteImages
+        view.threadReference = threadReference
+        // .disabled() while a send is on its way: the box empties when it
+        // lands, so words typed meanwhile would be lost. Edits are turned
+        // away rather than isEditable going off, which would drop the
+        // keyboard he's about to type the next message on.
+        let locked = !context.environment.isEnabled
+        view.locked = locked
+        view.alpha = locked ? 0.5 : 1
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, uiView view: PastingTextView, context: Context) -> CGSize? {
@@ -100,6 +113,10 @@ struct PastableTextField: UIViewRepresentable {
             view.placeholderLabel.isHidden = !view.text.isEmpty
         }
 
+        func textView(_ view: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String) -> Bool {
+            !((view as? PastingTextView)?.locked ?? false)
+        }
+
         func textViewDidChangeSelection(_ view: UITextView) {
             guard !updating else { return }
             parent.cursor?.range = view.selectedRange
@@ -108,7 +125,10 @@ struct PastableTextField: UIViewRepresentable {
 }
 
 final class PastingTextView: UITextView {
-    var onPasteImages: (([UIImage]) -> Void)?
+    var onPasteImages: (([NSItemProvider]) -> Void)?
+    var threadReference: ((String) -> String?)?
+    /// While a send is on its way: no typing, pasting or cutting.
+    var locked = false
     let placeholderLabel = UILabel()
     /// The photos the chips stand for, to draw them again in the other
     /// appearance.
@@ -211,16 +231,28 @@ final class PastingTextView: UITextView {
     private var pastesImages: Bool { onPasteImages != nil && UIPasteboard.general.hasImages }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if locked, [#selector(paste(_:)), #selector(cut(_:)), #selector(delete(_:))].contains(action) { return false }
         // A plain text view turns Paste off for an image, as it can't hold one.
         if action == #selector(paste(_:)), pastesImages { return true }
         return super.canPerformAction(action, withSender: sender)
     }
 
     override func paste(_ sender: Any?) {
+        // A photo pasted goes round the delegate, so this one's checked here.
+        if locked { return }
+        // A thread's id goes in as a link to it, which the agent can read the
+        // thread from and the bubble draws as a chip, as the Mac does.
+        // insertText goes through the delegate like typing does.
+        if !pastesImages, let words = UIPasteboard.general.string, let reference = threadReference?(words) {
+            return insertText(reference)
+        }
         guard pastesImages, let onPasteImages else { return super.paste(sender) }
-        let images = UIPasteboard.general.images ?? []
-        if images.isEmpty { return super.paste(sender) }
-        onPasteImages(images)
+        // The items, not `images`: those are every picture on it decoded
+        // here, before any limit. An item is read when its turn comes, off
+        // the main thread, and only as many as the message has room for.
+        let items = UIPasteboard.general.itemProviders.filter { $0.hasItemConformingToTypeIdentifier(UTType.image.identifier) }
+        if items.isEmpty { return super.paste(sender) }
+        onPasteImages(items)
     }
 
     // Copied chips go as the markers the agent would get, as plain text:

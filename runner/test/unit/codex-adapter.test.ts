@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { tool } from '@anthropic-ai/claude-agent-sdk';
 import { CodexAdapter, CodexSession, codexModelChoices, type CodexAdapterDeps } from '../../src/adapters/codex/adapter.ts';
 import { OVERSIZED_LINE } from '../../src/adapters/codex/appserver.ts';
+import { FILE_CHANGE_RULE } from '../../src/adapters/codex/approvals.ts';
 import { TOOL_GUIDANCE } from '../../src/adapters/codex/tools.ts';
 import type { CodexNormalizerLike } from '../../src/adapters/codex/types.ts';
 import { CodexNormalizer } from '../../src/adapters/codex/normalize.ts';
@@ -690,6 +691,23 @@ test('subagents: traffic is marked with the child id, approvals reach this sink 
   await h.session.end();
 });
 
+test("a file change that renames a file into .threadbear/patches asks, past the thread's file-change rule, with no Always allow", async () => {
+  const h = await open({ permissionMode: 'ask', allowRules: [FILE_CHANGE_RULE] });
+  await started(h);
+  h.session.send({ id: 'm1', text: 'tidy up', images: [] });
+  await turnStarts(h, 'u1');
+  const cwd = h.opts.cwd;
+  const change = { path: path.join(cwd, 'notes.ts'), kind: { type: 'update', move_path: path.join(cwd, '.threadbear', 'patches', 'notes.ts') }, diff: '' };
+  h.conn.notify('item/started', { threadId: 'th-1', turnId: 'u1', item: { type: 'fileChange', id: 'fc-m', changes: [change], status: 'inProgress' } });
+  await sleep(30);
+  const asked = h.conn.serverRequest('item/fileChange/requestApproval', { threadId: 'th-1', turnId: 'u1', itemId: 'fc-m', reason: null, grantRoot: null });
+  await waitFor(() => h.rec.approvals.length === 1);
+  assert.equal(h.rec.approvals[0].canAlwaysAllow, false);
+  assert.match(h.rec.approvals[0].title, /Threadbear runs this file as code/);
+  await asked;
+  await h.session.end();
+});
+
 test('a child whose spawn was missed is found by rootTurnId, or by thread/read', async () => {
   const h = await open();
   await started(h);
@@ -797,6 +815,28 @@ test('folder, model, effort and mode changes go on the next turn/start', async (
   h.session.send({ id: 'm3', text: 'c', images: [] });
   req = await turnStarts(h, 'u3');
   assert.equal(req.params.cwd, undefined, 'the folder only goes once');
+  await h.session.end();
+});
+
+test('Plan first: plan mode goes on turn/start as the plan collaboration mode, and default goes once after', async () => {
+  const h = await open({ permissionMode: 'plan' });
+  await started(h);
+  h.session.send({ id: 'm1', text: 'a', images: [] });
+  let req = await turnStarts(h, 'u1');
+  assert.equal(req.params.approvalPolicy, 'on-request');
+  assert.deepEqual(req.params.collaborationMode, { mode: 'plan', settings: { model: 'gpt-6-luna', reasoning_effort: null, developer_instructions: null } });
+  complete(h, 'u1');
+  await waitFor(() => h.rec.results().length === 1);
+  await h.session.setPermissionMode('full');
+  h.session.send({ id: 'm2', text: 'Go ahead with the plan.', images: [] });
+  req = await turnStarts(h, 'u2');
+  assert.equal((req.params.collaborationMode as { mode: string }).mode, 'default');
+  assert.equal(req.params.approvalPolicy, 'never');
+  complete(h, 'u2');
+  await waitFor(() => h.rec.results().length === 2);
+  h.session.send({ id: 'm3', text: 'c', images: [] });
+  req = await turnStarts(h, 'u3');
+  assert.equal(req.params.collaborationMode, undefined, 'only sent while it matters');
   await h.session.end();
 });
 
@@ -1040,4 +1080,96 @@ test('auto on Codex is as careful as ask, as Codex has no classifier', async () 
   assert.equal(req.params.approvalPolicy, 'on-request');
   assert.equal(req.params.sandbox, 'read-only');
   h.conn.respond(req.id, threadResult('th-1'));
+});
+
+// Slash commands (docs/protocol.md, "Slash commands"): the ones Codex's
+// terminal app runs become the app-server calls that do them.
+test('/compact is thread/compact/start, and its turn (id from turn/started) answers the message', async () => {
+  const h = await open();
+  await started(h);
+  h.session.send({ id: 'm1', text: '/compact', images: [] });
+  const req = await h.conn.request('thread/compact/start');
+  assert.deepEqual(req.params, { threadId: 'th-1' });
+  // Codex answers first, with no turn, then starts one.
+  h.conn.respond(req.id, {});
+  await sleep(20);
+  h.conn.notify('turn/started', { threadId: 'th-1', turn: { id: 'c1', rootTurnId: 'c1', status: 'inProgress' } });
+  await sleep(20);
+  complete(h, 'c1');
+  await waitFor(() => h.rec.results().length === 1);
+  assert.equal(h.rec.kinds().includes('cliTurn'), false);
+  assert.equal(h.rec.results()[0].answers, 'm1');
+  await h.session.end();
+});
+
+test('/review is review/start: the uncommitted changes, or what it says', async () => {
+  const h = await open();
+  await started(h);
+  h.session.send({ id: 'm1', text: '/review', images: [] });
+  let req = await h.conn.request('review/start');
+  assert.deepEqual(req.params, { threadId: 'th-1', target: { type: 'uncommittedChanges' }, delivery: 'inline' });
+  h.conn.respond(req.id, { turn: { id: 'r1', status: 'inProgress' }, reviewThreadId: 'th-1' });
+  h.conn.notify('turn/started', { threadId: 'th-1', turn: { id: 'r1', rootTurnId: 'r1', status: 'inProgress' } });
+  complete(h, 'r1');
+  await waitFor(() => h.rec.results().length === 1);
+  h.session.send({ id: 'm2', text: '/review the auth change', images: [] });
+  req = await h.conn.request('review/start');
+  assert.deepEqual(req.params.target, { type: 'custom', instructions: 'the auth change' });
+  await h.session.end();
+});
+
+test('/<skill> adds the skill to the turn; other commands and paths go as words', async () => {
+  const h = await open();
+  await started(h);
+  h.session.send({ id: 'm1', text: '/deslop the runner', images: [] });
+  const sk = await h.conn.request('skills/list');
+  h.conn.respond(sk.id, { data: [{ cwd: h.home, skills: [{ name: 'deslop', description: 'd', path: '/s/deslop/SKILL.md', enabled: true }] }] });
+  const req = await turnStarts(h, 'u1');
+  assert.deepEqual(req.params.input, [
+    { type: 'skill', name: 'deslop', path: '/s/deslop/SKILL.md' },
+    { type: 'text', text: '/deslop the runner', text_elements: [] },
+  ]);
+  complete(h, 'u1');
+  await waitFor(() => h.rec.results().length === 1);
+  h.session.send({ id: 'm2', text: '/Users/mike/x.md looks off', images: [] });
+  const words = await h.conn.request('turn/start');
+  assert.deepEqual(words.params.input, [{ type: 'text', text: '/Users/mike/x.md looks off', text_elements: [] }]);
+  await h.session.end();
+});
+
+test('a folder move waits past /compact for the next turn/start, and a Stop during a compaction goes once its turn starts', async () => {
+  const h = await open();
+  await started(h);
+  const other = tmp('tb-cxa-moved-');
+  await h.session.setCwd!(other);
+  h.session.send({ id: 'm1', text: '/compact', images: [] });
+  const req = await h.conn.request('thread/compact/start');
+  h.conn.respond(req.id, {});
+  await sleep(20);
+  const stopping = h.session.interrupt();
+  await sleep(20);
+  assert.equal(h.conn.sent('turn/interrupt').length, 0, 'no turn id yet');
+  h.conn.notify('turn/started', { threadId: 'th-1', turn: { id: 'c1', rootTurnId: 'c1', status: 'inProgress' } });
+  const intr = await h.conn.request('turn/interrupt');
+  assert.equal(intr.params.turnId, 'c1');
+  h.conn.respond(intr.id, {});
+  complete(h, 'c1', 'interrupted');
+  await stopping;
+  await waitFor(() => h.rec.results().length === 1);
+  h.session.send({ id: 'm2', text: 'b', images: [] });
+  const next = await turnStarts(h, 'u2');
+  assert.equal(next.params.cwd, other);
+  await h.session.end();
+});
+
+test('/review with a folder move still to send is a turn, which carries the move', async () => {
+  const h = await open();
+  await started(h);
+  const other = tmp('tb-cxa-moved-');
+  await h.session.setCwd!(other);
+  h.session.send({ id: 'm1', text: '/review', images: [] });
+  const req = await turnStarts(h, 'u1');
+  assert.equal(req.params.cwd, other);
+  assert.equal(h.conn.sent('review/start').length, 0);
+  await h.session.end();
 });

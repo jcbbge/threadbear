@@ -131,11 +131,6 @@ export const Check = () => (
     <path d="m3 8.5 3.3 3.3L13 4.7" />
   </svg>
 );
-export const Minus = () => (
-  <svg {...base} strokeWidth={2}>
-    <path d="M3.5 8h9" />
-  </svg>
-);
 export const Photo = () => (
   <svg {...base}>
     <path d="M2 3h12v10H2zM2 11l3.5-3.5L8 10l2.5-2.5L14 11" />

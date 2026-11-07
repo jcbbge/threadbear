@@ -26,6 +26,11 @@
     <string>26.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <!-- Voice mode (VoiceMode): listening, and turning speech into text on this Mac. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Threadbear listens while Voice is on, so you can talk with a thread out loud.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Threadbear turns what you say in Voice mode into your message, on this Mac.</string>
     <key>NSSupportsAutomaticTermination</key>
     <false/>
     <!-- threadbear://thread/<id> opens a thread (ThreadLink). -->

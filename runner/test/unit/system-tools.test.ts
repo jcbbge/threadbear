@@ -20,13 +20,14 @@ const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../src')
 const KNOWN: Record<string, { everywhere: true } | { linux: string; files: string[] }> = {
   '/bin/sh': { everywhere: true },
   '/bin/ps': { everywhere: true },
+  '/bin/ls': { linux: 'only on darwin, for its access lists (aclProblem)', files: ['shell-allowlist.ts'] },
   '/bin/bash': { everywhere: true },
   '/usr/bin/bash': { linux: 'one of the shells loginShell looks for', files: ['system-tools.ts'] },
   '/bin/zsh': { linux: 'only on darwin; Linux gets loginShell()', files: ['system-tools.ts'] },
   '/usr/sbin/lsof': { linux: "lsofPath's Mac place", files: ['handover.ts'] },
   '/usr/bin/lsof': { linux: "lsofPath's Linux place", files: ['handover.ts'] },
   '/usr/bin/sips': { linux: 'behind MAC; ImageMagick on Linux', files: ['images.ts'] },
-  '/usr/bin/qlmanage': { linux: 'behind MAC; rsvg-convert on Linux', files: ['images.ts'] },
+  '/usr/bin/qlmanage': { linux: 'behind MAC; rsvg-convert on Linux, or ffmpeg for a review clip', files: ['images.ts', 'review-media.ts'] },
   '/usr/sbin/system_profiler': { linux: 'behind a darwin check', files: ['machine.ts'] },
   '/usr/bin/vm_stat': { linux: 'behind a darwin check; /proc/meminfo on Linux', files: ['runner-stats.ts'] },
   '/usr/bin/sw_vers': { linux: 'behind a darwin check; /etc/os-release on Linux', files: ['runner-stats.ts'] },
@@ -35,9 +36,11 @@ const KNOWN: Record<string, { everywhere: true } | { linux: string; files: strin
   '/usr/bin/sandbox-exec': { linux: "a failed sample counts as not stuck", files: ['frozen-cli.ts'] },
   '/usr/bin/sample': { linux: "a failed sample counts as not stuck", files: ['frozen-cli.ts'] },
   '/usr/bin/open': { linux: "rejects with Couldn't open", files: ['runner.ts'] },
-  '/usr/sbin/taskpolicy': { linux: 'behind a darwin check: the secret check is Mac only', files: ['secret-check.ts'] },
+  '/usr/sbin/taskpolicy': { linux: 'behind a darwin check: the secret check is Mac only, and inBackground skips it off a Mac', files: ['secret-check.ts', 'background.ts'] },
   '/usr/bin/xcrun': { linux: 'behind a darwin check: the secret check is Mac only', files: ['secret-check.ts'] },
-  '/usr/bin/pmset': { linux: 'behind a darwin check: the secret check is Mac only', files: ['secret-check.ts'] },
+  '/usr/bin/pmset': { linux: 'behind darwin checks: the secret check and keeping awake are Mac only', files: ['secret-check.ts', 'keep-awake.ts'] },
+  '/usr/bin/caffeinate': { linux: 'behind a darwin check: keeping awake is Mac only', files: ['keep-awake.ts'] },
+  '/usr/bin/lockf': { linux: 'behind a darwin check; flock on Linux', files: ['worktrees.ts'] },
 };
 
 function sources(dir: string): string[] {

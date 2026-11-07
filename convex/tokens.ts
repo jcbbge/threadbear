@@ -13,9 +13,10 @@
 //   clipboard: ios/scripts/pair-qr.swift and web/scripts/sign-in.swift.
 import { v } from 'convex/values';
 import { internalMutation } from './_generated/server';
+import { internal } from './_generated/api';
 import type { MutationCtx, QueryCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
-import { sha256 } from './lib';
+import { pageLimit, sha256 } from './lib';
 import { tiedToRevoked } from './pushTargets';
 
 export const tokenKinds = ['phone', 'browser'] as const;
@@ -43,7 +44,8 @@ export async function issueToken(ctx: MutationCtx, args: { name: string; days?: 
   crypto.getRandomValues(bytes);
   const token = 'tb_' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
   const now = Date.now();
-  const days = Math.min(MAX_DAYS, Math.max(1, Math.floor(args.days ?? DEFAULT_DAYS)));
+  // Not NaN, which would make a token that never expires (expiresAt < now is false).
+  const days = pageLimit(args.days, DEFAULT_DAYS, MAX_DAYS);
   const expiresAt = now + days * 24 * 60 * 60_000;
   const id = await ctx.db.insert('tokens', { hash: await sha256(token), name: args.name, createdAt: now, expiresAt, ...(args.kind ? { kind: args.kind } : {}), ...(args.issuedBy ? { issuedBy: args.issuedBy } : {}), ...(args.ownerKeyPrint ? { ownerKeyPrint: args.ownerKeyPrint } : {}) });
   return { id, token, expiresAt: new Date(expiresAt).toISOString() };
@@ -85,14 +87,39 @@ export async function revokeToken(ctx: MutationCtx, id: string): Promise<boolean
 
 // Deletes the phones registered for push with these (now revoked) tokens,
 // and old rows that only name them (pushTargets.ts): otherwise a revoked
-// phone still gets every push, title and text. devices:targets skips an
-// expired token's phones and every old row too. The table is a handful of
-// rows, so it's read whole.
+// phone's row stays. Later, a batch at a time (dropDevices), never in the
+// mutation that revokes: one token can have registered many rows, and a
+// revoke that read them all could go past Convex's limits and roll back,
+// leaving the token good. Its pushes stop at once all the same, as
+// devices:targets skips a revoked token's phones.
 async function dropDevicesOf(ctx: MutationCtx, revoked: { _id: Id<'tokens'>; name: string }[]): Promise<void> {
-  for (const d of await ctx.db.query('devices').collect()) {
-    if (revoked.some((r) => tiedToRevoked(d, r))) await ctx.db.delete(d._id);
-  }
+  for (const r of revoked) await ctx.scheduler.runAfter(0, internal.tokens.dropDevices, { tokenId: r._id, name: r.name });
 }
+
+const DROP_BATCH = 100;
+export const dropDevices = internalMutation({
+  args: { tokenId: v.id('tokens'), name: v.string() },
+  returns: v.null(),
+  handler: async (ctx, { tokenId, name }) => {
+    // Only ever a revoked token's phones.
+    const t = await ctx.db.get(tokenId);
+    if (t && !t.revokedAt) return null;
+    let n = 0;
+    for (const d of await ctx.db.query('devices').withIndex('by_tokenId', (q) => q.eq('tokenId', tokenId)).take(DROP_BATCH)) {
+      await ctx.db.delete(d._id);
+      n++;
+    }
+    if (n < DROP_BATCH) {
+      for (const d of await ctx.db.query('devices').withIndex('by_tokenName', (q) => q.eq('tokenName', name).eq('tokenId', undefined)).take(DROP_BATCH - n)) {
+        if (!tiedToRevoked(d, { _id: tokenId, name })) continue;
+        await ctx.db.delete(d._id);
+        n++;
+      }
+    }
+    if (n >= DROP_BATCH) await ctx.scheduler.runAfter(0, internal.tokens.dropDevices, { tokenId, name });
+    return null;
+  },
+});
 
 export const issue = internalMutation({
   args: { name: v.string(), days: v.optional(v.number()), kind: v.optional(tokenKind) },

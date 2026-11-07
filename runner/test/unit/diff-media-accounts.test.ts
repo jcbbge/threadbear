@@ -73,6 +73,25 @@ test('image sniffing reads type and size from headers', () => {
   assert.throws(() => copyImageInto(dir, path.join(dir, 'not.txt')), /Not a supported image/);
 });
 
+// A file that can't be read says so, not "Not a supported image": dragging a
+// screenshot's floating thumbnail hands over a temp file macOS deletes as the
+// drop ends, and that read as a bad PNG (issue #2).
+test('copyImageInto says why a file could not be read', () => {
+  const dir = tmpDir();
+  const inbox = path.join(dir, 'inbox');
+  assert.throws(() => copyImageInto(inbox, path.join(dir, 'Screenshot.png')), /went away before it could be added: Screenshot\.png/);
+  const empty = path.join(dir, 'empty.png');
+  fs.writeFileSync(empty, '');
+  assert.throws(() => copyImageInto(inbox, empty), /empty\.png is empty/);
+  assert.throws(() => copyImageInto(inbox, dir), /Not a file/);
+  if (process.getuid?.() !== 0) {
+    const locked = path.join(dir, 'locked.png');
+    fs.writeFileSync(locked, makePng(4, 4));
+    fs.chmodSync(locked, 0o000);
+    assert.throws(() => copyImageInto(inbox, locked), /isn't allowed to read locked\.png/);
+  }
+});
+
 // Dropping an iPhone photo into the composer goes through copyImageInto.
 test('copyImageInto converts HEIC to JPEG and TIFF to PNG', { skip: process.platform !== 'darwin' }, () => {
   const dir = tmpDir();

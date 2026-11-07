@@ -14,5 +14,7 @@
   "preview": "Here it is after a forced quit at about two thirds.",
   "lastSeq": 31,
   "lastSeenSeq": 27,
-  "costUsd": 0.44
+  "costUsd": 0.44,
+  "contextTokens": 642300,
+  "contextWindow": 1000000
 }

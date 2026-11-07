@@ -3,6 +3,7 @@
 // work, then the reply. A port of the iPhone's Turns.fold
 // (ios/ThreadbearKit/Sources/ThreadbearKit/Turns.swift); keep the two
 // picking the same reply. Tests: node --test web/src/turns.test.ts
+import type { MessageButton } from './reply-buttons';
 
 export type TurnMessage = {
   seq: number;
@@ -12,6 +13,8 @@ export type TurnMessage = {
   toolKind?: string;
   summary?: boolean;
   turn?: string;
+  // The reply buttons its text links (API 59, reply-buttons.ts).
+  buttons?: MessageButton[];
   at: string;
 };
 

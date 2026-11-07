@@ -170,7 +170,7 @@ export function checkSummary(t: Obj): string[] {
   const problems: string[] = [];
   for (const k of ['id', 'title', 'cwd', 'accountId', 'preview']) if (!isStr(t[k])) problems.push(k);
   if (!PROVIDERS.includes(t.provider)) problems.push('provider');
-  if (t.permissionMode !== 'full' && t.permissionMode !== 'ask') problems.push('permissionMode');
+  if (!['full', 'ask', 'auto', 'plan'].includes(t.permissionMode)) problems.push('permissionMode');
   if (!STATUSES.includes(t.status)) problems.push('status');
   for (const k of ['live', 'needsYou']) if (typeof t[k] !== 'boolean') problems.push(k);
   for (const k of ['createdAt', 'updatedAt', 'lastActivityAt']) if (!isIso(t[k])) problems.push(k);
@@ -192,6 +192,7 @@ export function checkSummary(t: Obj): string[] {
     if (!(w && typeof w === 'object' && isIso(w.since) && Object.keys(w).every((k) => k === 'since'))) problems.push('waitingForNetwork');
   }
   if (t.snoozedUntilRestart !== undefined && (t.snoozedUntilRestart !== true || !isStr(t.snoozedUntil))) problems.push('snoozedUntilRestart');
+  if (t.snoozedUntilRelease !== undefined && (t.snoozedUntilRelease !== true || t.snoozedUntilRestart !== true)) problems.push('snoozedUntilRelease');
   if (t.wakeWhen !== undefined) {
     const w = t.wakeWhen;
     const ok = w && typeof w === 'object' && isStr(w.said) && isStr(t.snoozedUntil) && (w.topic === undefined || isStr(w.topic)) && (w.pending === undefined || w.pending === true) &&
@@ -236,7 +237,8 @@ export function checkSummary(t: Obj): string[] {
         if (p.untrusted !== undefined && (!['new', 'changed'].includes(p.untrusted) || !/^[0-9a-f]{64}$/.test(p.hash ?? '') || !isStr(p.file))) problems.push('patches: untrusted needs file and hash');
         if (p.hash !== undefined && p.untrusted === undefined) problems.push('patches: hash only with untrusted');
         if (p.helpers !== undefined && (p.untrusted === undefined || !Array.isArray(p.helpers) || !p.helpers.every(isStr))) problems.push('patches: helpers only with untrusted');
-        for (const k of Object.keys(p)) if (!['id', 'source', 'file', 'folder', 'projectId', 'error', 'matched', 'liveError', 'icon', 'iconFile', 'untrusted', 'hash', 'helpers'].includes(k)) problems.push(`patches: unexpected field ${k}`);
+        if (p.grants !== undefined && (p.untrusted === undefined || p.source !== 'claude' || !Array.isArray(p.grants) || !p.grants.every(isStr))) problems.push('patches: grants only with untrusted claude settings');
+        for (const k of Object.keys(p)) if (!['id', 'source', 'file', 'folder', 'projectId', 'error', 'matched', 'liveError', 'icon', 'iconFile', 'untrusted', 'hash', 'helpers', 'grants'].includes(k)) problems.push(`patches: unexpected field ${k}`);
       }
     }
   }
@@ -301,12 +303,21 @@ export function checkSummary(t: Obj): string[] {
       Object.keys(s).every((k) => ['access', 'slug', 'updatedAt'].includes(k));
     if (!ok) problems.push('share');
   }
+  if (t.looseEnds !== undefined) {
+    const l = t.looseEnds;
+    const ok = l && Number.isInteger(l.seq) && isIso(l.at) && Array.isArray(l.ends) &&
+      l.ends.every((e: any) => ['unlanded', 'uncommitted', 'thread', 'scheduled'].includes(e.kind) && isStr(e.text) &&
+        (e.threadId === undefined || isStr(e.threadId)) && (e.at === undefined || isIso(e.at)) &&
+        Object.keys(e).every((k) => ['kind', 'text', 'threadId', 'at'].includes(k))) &&
+      Object.keys(l).every((k) => ['seq', 'ends', 'at'].includes(k));
+    if (!ok) problems.push('looseEnds');
+  }
   const allowed = new Set([
     'id', 'title', 'cwd', 'accountId', 'provider', 'model', 'permissionMode', 'status', 'live', 'needsYou', 'createdAt', 'updatedAt',
-    'lastActivityAt', 'snoozedUntil', 'snoozedUntilRestart', 'archivedAt', 'archivedBy', 'archiveVerdict', 'starredAt', 'preview', 'lastSeq', 'lastSeenSeq', 'nativeSessionId', 'contextTokens', 'costUsd',
+    'lastActivityAt', 'snoozedUntil', 'snoozedUntilRestart', 'snoozedUntilRelease', 'archivedAt', 'archivedBy', 'archiveVerdict', 'starredAt', 'preview', 'lastSeq', 'lastSeenSeq', 'nativeSessionId', 'contextTokens', 'costUsd',
     'poolId', 'waitingForRoom', 'waitingForNetwork', 'wakeWhen', 'waitingOn',
     'effort', 'modelInUse', 'effortInUse', 'contextWindow', 'panels', 'actions', 'hooks', 'patches', 'background', 'subagents', 'projects', 'worktree',
-    'needs', 'asks', 'asksSeq', 'highlightsAt', 'panelRequest', 'share', 'startedBy', 'asked',
+    'needs', 'asks', 'asksSeq', 'highlightsAt', 'panelRequest', 'share', 'startedBy', 'asked', 'looseEnds',
   ]);
   for (const k of Object.keys(t)) if (!allowed.has(k)) problems.push(`unexpected field ${k}`);
   return problems;

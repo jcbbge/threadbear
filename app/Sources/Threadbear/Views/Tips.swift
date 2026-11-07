@@ -77,7 +77,7 @@ private struct TipAnchor: NSViewRepresentable {
     }
 }
 
-final class TipAnchorView: NSView {
+class TipAnchorView: NSView {
     /// Changes while a tip is up are shown in it ("Working 12s").
     var text = "" {
         didSet { if text != oldValue { Tips.shared.textChanged(self) } }

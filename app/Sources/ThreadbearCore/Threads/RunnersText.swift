@@ -83,7 +83,7 @@ public enum RunnersText {
     }
 
     public static func gauges(_ s: RunnerMachineStats) -> [Gauge] {
-        var out = [Gauge(title: "CPU", fraction: min(1, max(0, s.cpuPercent / 100)), text: "\(Int(s.cpuPercent.rounded()))%", high: s.cpuPercent >= 90)]
+        var out = [Gauge(title: "CPU", fraction: min(1, max(0, s.cpuPercent / 100)), text: "\(Int(saturating: s.cpuPercent.rounded()))%", high: s.cpuPercent >= 90)]
         if s.memTotal > 0 {
             let used = s.memUsed / s.memTotal
             out.append(Gauge(title: "Memory", fraction: min(1, used), text: "\(number(s.memUsed)) of \(gb(s.memTotal))", high: used >= 0.9))
@@ -126,9 +126,9 @@ public enum RunnersText {
     /// no ".0".
     public static func number(_ bytes: Double) -> String {
         let g = bytes / pow(1024, 3)
-        if g >= 100 { return "\(Int(g.rounded()))" }
+        if g >= 100 { return "\(Int(saturating: g.rounded()))" }
         let tenth = (g * 10).rounded() / 10
-        return tenth == tenth.rounded() ? "\(Int(tenth))" : String(format: "%.1f", tenth)
+        return tenth == tenth.rounded() ? "\(Int(saturating: tenth))" : String(format: "%.1f", tenth)
     }
 
     public static func span(seconds: Double) -> String {
@@ -137,7 +137,7 @@ public enum RunnersText {
 
     /// "12s", "4m", "3h", "2d", as the website says them.
     public static func span(from start: Date, to now: Date) -> String {
-        let s = max(0, Int(now.timeIntervalSince(start).rounded()))
+        let s = max(0, Int(saturating: now.timeIntervalSince(start).rounded()))
         if s < 60 { return "\(s)s" }
         if s < 3600 { return "\(s / 60)m" }
         if s < 86_400 { return "\(s / 3600)h" }

@@ -8,6 +8,12 @@ import type { ThreadSummary } from '../protocol.ts';
 import type { Drain, ThreadState } from '../runner.ts';
 import { DRAIN_AGENT_MS, DRAIN_BACKGROUND_MS, DRAIN_CHECK_MS, DRAIN_MAX_OLD_MS, DRAIN_SETTLE_MS, newRuntime } from '../runner.ts';
 
+// How long a handover waits for an archive's worktree cleanup (letGo).
+// Removing a big worktree can take a while, and a git change still running
+// when the wait ends can't be stopped (cleanUpWorktree's stillOurs only
+// stops the next one), so this is long: past it, git has hung.
+const CLEANUP_WAIT_MS = 10 * 60_000;
+
 export const handoversPart = {
   // This runner is handing over to a new release. `keep` are the busy
   // threads it goes on running; every other thread is let go now (an idle
@@ -22,8 +28,14 @@ export const handoversPart = {
   async beginDrain(this: Runner, keep: Iterable<string>, opts: { onHandedOver: (threadId: string) => void; backgroundMs?: number; agentMs?: number; checkMs?: number; ready?: () => boolean }): Promise<void> {
     if (this.draining) throw new Error('already draining');
     const d: Drain = {
-      keep: new Set([...keep].filter((id) => this.threads.has(id))),
+      // A thread whose worktree cleanup is running stays until it's done
+      // (letGo), as a busy one would, so the rest go now rather than wait.
+      // So does one with a turn-end hook running: the restarter doesn't
+      // count that as busy, but its result may start a turn, and an archive
+      // waiting for it (archiveWhenGone) isn't saved anywhere to pick up.
+      keep: new Set([...keep, ...[...this.threads.values()].filter((st) => st.rt.cleaning || st.rt.hooksRunning).map((st) => st.rec.id)].filter((id) => this.threads.has(id))),
       going: new Set(),
+      gone: new Set(),
       onHandedOver: opts.onHandedOver,
       since: this.clock.now(),
       backgroundMs: opts.backgroundMs ?? DRAIN_BACKGROUND_MS,
@@ -127,6 +139,20 @@ export const handoversPart = {
       this.releaseSession(st);
     }
     if (rt.closing) await rt.closing;
+    // An archive's worktree cleanup, started as the CLI went: its removedAt
+    // and note belong in the record saved below (THREADBEAR-16). Not for
+    // ever, as git can hang (a hook): past the limit the record goes as it
+    // is, and the adopting runner settles it (settleLostCleanups).
+    if (rt.cleaning) {
+      let timer: { cancel(): void } | undefined;
+      const late = new Promise<void>((resolve) => (timer = this.clock.setTimeout(resolve, CLEANUP_WAIT_MS)));
+      const finished = await Promise.race([rt.cleaning.then(() => true), late.then(() => false)]);
+      timer?.cancel();
+      if (!finished) this.log.warn('handed a thread over before its worktree cleanup finished', { threadId: rec.id });
+    }
+    // Deleted while it waited: its folder has gone to trash, and saving
+    // would bring it back.
+    if (rt.deleted) return;
     rt.deltaTimer?.cancel();
     rt.wakeTimer?.cancel();
     rt.generation++;
@@ -134,6 +160,7 @@ export const handoversPart = {
     rt.deleted = true;
     this.dirty.delete(rec.id);
     this.threads.delete(rec.id);
+    this.draining?.gone.add(rec.id);
     this.store.forget(rec.id);
   },
 
@@ -157,13 +184,15 @@ export const handoversPart = {
     // start, so it learns its "You: ..." line here too.
     if (rec.asked === undefined && !rec.archivedAt) this.backfillAsked(rec);
     this.recoverReviews(st);
+    // Handed over before its worktree cleanup finished (letGo's limit).
+    void this.settleLostCleanups([st], false);
     if (opts.crashed) {
       // main.ts carries it on (carryOnStopped), after any resume of its own.
       if (this.recover(st)) this.notice('info', `The old runner stopped while "${rec.title}" was mid-turn.`);
     }
     // Hibernating until the runner restarts: for this thread, coming across
     // is the restart.
-    if (rec.snoozedUntilRestart || rec.wakeWhen?.pending) this.wake(st, 'restart');
+    if (this.wakesOnStart(rec)) this.wake(st, 'restart');
     else if (rec.queue.length && this.bucket(rec) === 'inbox') {
       this.kickQueue(st);
     }

@@ -433,13 +433,21 @@ final class AppUpdater {
         }
     }
 
+    /// The build takes every core for a minute or two, so it runs at
+    /// macOS's background priority (`taskpolicy -b`, as Mike asks of every
+    /// build on his M5): throttled CPU and disk, off the cores he's using,
+    /// and inherited by swift build and everything else it starts. `nice`
+    /// only lowered its CPU priority.
+    nonisolated static func buildCommand(script: String, checkout: String, next: String) -> (String, [String]) {
+        ("/usr/sbin/taskpolicy", ["-b", "/bin/bash", script, checkout, "--next", next])
+    }
+
     private func startBuild(appTree: String, checkout: String) {
         guard let script = Bundle.main.url(forResource: "stage-update", withExtension: "sh") else { return }
         let process = Process()
-        // The build takes every core for a minute or two; it yields to
-        // whatever Mike and the agents are doing.
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/nice")
-        process.arguments = ["-n", "15", "/bin/bash", script.path, checkout, "--next", Self.nextDir.path]
+        let (executable, arguments) = Self.buildCommand(script: script.path, checkout: checkout, next: Self.nextDir.path)
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
         process.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
         let log = Self.openLog()
         process.standardOutput = log

@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { PersistedEvent } from './protocol.ts';
+import { replaceLinks, trimEndOf } from './linear-text.ts';
 
 export type HighlightKind = 'file' | 'link' | 'pr' | 'commit';
 export type HighlightHow = 'pinned' | 'written' | 'opened' | 'mentioned' | 'created' | 'committed';
@@ -96,7 +97,9 @@ export function observe(state: HighlightState, events: Iterable<PersistedEvent>,
         if (typeof input.command === 'string') {
           const cwd = typeof input.cwd === 'string' ? input.cwd : ctx.cwd;
           for (const target of openTargets(input.command)) {
-            if (/^https?:\/\//i.test(target)) add({ ...linkItem(target), how: 'opened', seq: e.seq }, e);
+            if (/^https?:\/\//i.test(target)) {
+              if (target.length <= MAX_URL) add({ ...linkItem(target), how: 'opened', seq: e.seq }, e);
+            }
             else {
               const abs = absolute(stripFileUrl(target), cwd, home);
               if (isFile(abs)) add({ id: `file:${abs}`, kind: 'file', title: path.basename(abs), path: abs, how: 'opened', seq: e.seq }, e);
@@ -226,14 +229,20 @@ function noteEdited(state: HighlightState, file: string): void {
 
 // ----------------------------------------------------------- finding them
 
+// Longer than this isn't a link anyone will open, as reviews.ts has it.
+export const MAX_URL = 2000;
+
 const PR_URL = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)/i;
 const PR_URL_G = /https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/gi;
 
 export function linkItem(url: string): Pick<Highlight, 'id' | 'kind' | 'title' | 'url'> {
   // Trailing punctuation and Markdown emphasis ("**https://x.dev**") aren't
   // part of the address, and a bare origin's "/" would make
-  // "localhost:5176" and "localhost:5176/" two rows.
-  const clean = url.replace(/[).,;:!?'"*_~]+$/, '').replace(/^(https?:\/\/[^/?#]+)\/$/i, '$1');
+  // "localhost:5176" and "localhost:5176/" two rows. Trimmed from the end
+  // by hand: `/[).,;:!?'"*_~]+$/` started again from every mark of a long
+  // run and scanned to its end, and a model told to write a link then
+  // 300,000 underscores held the runner for minutes (Gautam's scan, F30).
+  const clean = trimEndOf(url, TRAILING_MARKS).replace(/^(https?:\/\/[^/?#]+)\/$/i, '$1');
   const pr = PR_URL.exec(clean);
   if (pr) {
     const prUrl = pr[0];
@@ -241,6 +250,8 @@ export function linkItem(url: string): Pick<Highlight, 'id' | 'kind' | 'title' |
   }
   return { id: `link:${clean}`, kind: 'link', title: linkTitle(clean), url: clean };
 }
+
+const TRAILING_MARKS = `).,;:!?'"*_~`;
 
 // "github.com/mikecann/poddle/pull/19" without the scheme, cut down.
 function linkTitle(url: string): string {
@@ -254,11 +265,14 @@ type Found = Pick<Highlight, 'id' | 'kind' | 'title' | 'url' | 'path'>;
 // the title), bare URLs, and absolute or ~/ paths of files that exist,
 // in a link or in backticks. Code blocks are skipped: what's in them is
 // output to read, not something handed over.
+const MARKDOWN_LINK = { titleStopsAtNewline: true, titleMin: 0, titleMax: 300, targetStopsAtSpace: true, targetMin: 1 };
+
 export function linksIn(text: string, ctx: { cwd: string; home: string; isFile: (p: string) => boolean }): Found[] {
   const out = new Map<string, Found>();
   const prose = text.replace(/```[\s\S]*?(```|$)/g, ' ');
   const seen = new Set<string>();
   const addUrl = (raw: string, title?: string) => {
+    if (raw.length > MAX_URL) return;
     const item = linkItem(raw);
     if (seen.has(item.id) || !/^https?:\/\/[^\s/]+\.[^\s/]|^https?:\/\/(localhost|127\.0\.0\.1)/i.test(item.url!)) return;
     seen.add(item.id);
@@ -274,8 +288,9 @@ export function linksIn(text: string, ctx: { cwd: string; home: string; isFile: 
     seen.add(id);
     out.set(id, { id, kind: 'file', title: title?.trim() && !title.includes('/') ? title.trim().slice(0, 200) : path.basename(abs), path: abs });
   };
-  // [text](target)
-  let rest = prose.replace(/\[([^\]\n]{0,300})\]\(([^)\s]+)\)/g, (_, title: string, target: string) => {
+  // [text](target), as `/\[([^\]\n]{0,300})\]\(([^)\s]+)\)/g` finds them
+  // but reading the text once: the regex was quadratic in a run of "[](".
+  let rest = replaceLinks(prose, MARKDOWN_LINK, (title, target) => {
     if (/^https?:\/\//i.test(target)) addUrl(target, title.replace(/`/g, ''));
     else addPath(decodeURIComponentSafe(target), title.replace(/`/g, ''));
     return ' ';
@@ -348,10 +363,15 @@ export function pushArgBranches(command: string): string[] {
 }
 
 // Branches a git push sent: "   a1b2c3d..e4f5a6b  main -> main" and
-// " * [new branch]      feature -> feature".
+// " * [new branch]      feature -> feature". The leading space is a line's
+// own, and the + or * takes the space after it: `^\s*(?:[+*]?\s*)?` ran
+// on across blank lines with two runs of spaces side by side, which was
+// cubic in a push's output of newlines (64 KB of them is hours). No line
+// break of any kind in that space, as `^` starts again after each one (a
+// \r, U+2028 and U+2029 too), and each start would scan the rest of the run.
 export function pushedBranches(text: string): string[] {
   const out = new Set<string>();
-  for (const m of text.matchAll(/^\s*(?:[+*]?\s*)?(?:[0-9a-f]{7,40}\.{2,3}[0-9a-f]{7,40}|\[new branch\])\s+(\S+)\s+->\s+\S+/gm)) out.add(m[1]!);
+  for (const m of text.matchAll(/^[^\S\n\r\u2028\u2029]*(?:[+*][^\S\n\r\u2028\u2029]*)?(?:[0-9a-f]{7,40}\.{2,3}[0-9a-f]{7,40}|\[new branch\])\s+(\S+)\s+->\s+\S+/gm)) out.add(m[1]!);
   return [...out];
 }
 

@@ -29,6 +29,7 @@ import { SYMBOLS, fileHash, findIcon, storeIcon } from './project-icons.ts';
 import { userLine } from './user-name.ts';
 import type { PocketCardInput, PocketCardSummary } from './sync.ts';
 import { POCKET_ICONS, type PocketIconName } from './pocket-icons.ts';
+import { trimEndOf, trimStartOf } from './linear-text.ts';
 
 // The phone's Pocket, in the Convex backend (sync.ts). Asked for each look,
 // as sync can be off.
@@ -740,7 +741,7 @@ export class Librarian {
         if (!p || !member.has(pid) || !Array.isArray(list)) continue;
         const add = list.filter(
           (l): l is { title?: string; url: string } =>
-            !!l && typeof l === 'object' && typeof (l as { url?: unknown }).url === 'string' && seen.includes((l as { url: string }).url) && !p.links.some((h) => h.url.replace(/\/+$/, '') === (l as { url: string }).url.replace(/\/+$/, '')),
+            !!l && typeof l === 'object' && typeof (l as { url?: unknown }).url === 'string' && seen.includes((l as { url: string }).url) && !p.links.some((h) => trimEndOf(h.url, '/') === trimEndOf((l as { url: string }).url, '/')),
         );
         if (!add.length || p.links.length + add.length > LINKS_MAX) continue;
         try {
@@ -984,7 +985,7 @@ export class Librarian {
     this.rollDay();
     this.used(res);
     const words = res.value.toLowerCase().match(/[a-z0-9.]+/g) ?? [];
-    return words.map((w) => w.replace(/\.+$/, '')).find((w) => SYMBOLS.includes(w));
+    return words.map((w) => trimEndOf(w, '.')).find((w) => SYMBOLS.includes(w));
   }
 
   // ------------------------------------------------------------- notes
@@ -1179,17 +1180,45 @@ function selfFiled(rec: ThreadRecord): boolean {
 
 // The main checkout of a git worktree (its .git is a file naming
 // <main>/.git/worktrees/<name>), else the folder itself.
+//
+// Any folder an agent touched can have a file called .git (an unpacked
+// archive), so only its start is read, and its first line taken apart by
+// hand, as git does: `/^gitdir:\s*(.+?)\s*$/m` on "gitdir: a", a MB of
+// spaces and "b" was some 10^11 steps on the event loop (Gautam's scan,
+// F29). A worktree's .git is one short line.
+const GIT_FILE_BYTES = 4096;
 export function mainCheckout(dir: string): string {
   try {
-    const text = fs.readFileSync(path.join(dir, '.git'), 'utf8');
-    const m = /^gitdir:\s*(.+?)\s*$/m.exec(text);
-    const gitdir = m ? path.resolve(dir, m[1]) : undefined;
+    const gitdir = gitdirOf(readStart(path.join(dir, '.git'), GIT_FILE_BYTES), dir);
     const marker = `${path.sep}.git${path.sep}worktrees${path.sep}`;
     if (gitdir && gitdir.includes(marker)) return gitdir.slice(0, gitdir.indexOf(marker));
   } catch {
     // A .git folder (EISDIR) or none: the folder is its own checkout.
   }
   return dir;
+}
+
+// The folder a .git file's first line names, resolved against the folder
+// it's in, or undefined when that line isn't `gitdir: <path>`.
+export function gitdirOf(text: string, dir: string): string | undefined {
+  const nl = text.indexOf('\n');
+  const line = nl < 0 ? text : text.slice(0, nl);
+  if (!line.startsWith('gitdir:')) return undefined;
+  const target = line.slice('gitdir:'.length).trim();
+  return target ? path.resolve(dir, target) : undefined;
+}
+
+// Up to `max` bytes from the start of a file. Throws as readFileSync does,
+// EISDIR for a folder.
+function readStart(file: string, max: number): string {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  try {
+    const buf = Buffer.alloc(max);
+    const n = fs.readSync(fd, buf, 0, max, 0);
+    return buf.toString('utf8', 0, n);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 const PROJECT_MARKERS = ['.git', 'package.json', 'Package.swift', 'pyproject.toml', 'Cargo.toml', 'go.mod', 'AGENTS.md', 'CLAUDE.md'];
@@ -1301,7 +1330,7 @@ Reply with JSON only, no prose and no code fence:
  "pocket": null, or {"save": [{"title": "short name", "text": "the card", "place": "optional", "icon": "optional"}], "remove": ["title"]} (see below),
  "why": "one short line"}
 
-A reason is under 12 words, about this thread, in the user's plain words: "Edits the Poddle repo", "Shortlists photos for the calendar entry", "Asks how the librarian picks projects". Leaving a project out of projects doesn't take the thread out of it; only leave does. Use leave when the thread clearly isn't about that project: the earlier guess was wrong, or the work has gone elsewhere for good. A thread that has only paused that work stays.
+A reason is under 12 words, about this thread, in the user's plain words: "Edits the podcast app's repo", "Shortlists photos for the calendar entry", "Asks how the librarian picks projects". Leaving a project out of projects doesn't take the thread out of it; only leave does. Use leave when the thread clearly isn't about that project: the earlier guess was wrong, or the work has gone elsewhere for good. A thread that has only paused that work stays.
 
 Folders are repos the work lives in (the thread's folder when it's a repo, the repos it edited, and the ones it ran commands in when the work was about them, not a look at something else), never a catch-all folder. A project with no folders that this thread worked on in a repo should get that repo through addFolders. State is two to four plain sentences about the whole project, not this thread: what's done, what's next, what's blocked. Start from the current state, keep what's still true and fold the change in; don't replace it with this thread's details. Ideas and plans that aren't built yet don't change the state.
 
@@ -1309,7 +1338,7 @@ Links are the few places the user keeps going back to for a project: its live si
 
 Keep the thread's title (title null) unless it no longer says what the thread is about: the work moved on to something else, or the title is only the first words of the first message ("Hey, does the library, sorry, the librarian, does it update"). A better wording of the same subject is no reason. A new title is 2 to 6 words about the whole thread as it is now, in sentence case (a capital for the first word and for names only), with no quotes, full stop, dash or emoji: "Fix the flaky upload test on CI", "Librarian renames threads that move on".
 
-Keep projects' names too, unless one the thread is in has gone out of date: the thing it's about was renamed (a tool renamed from Paws to BrowserBear leaves "Paws" or a vaguer "Chrome browser control" behind), or a project named for what it does now has a name of its own. Give the new name the user would say, keeping the old words in brackets when they still help: "BrowserBear (Chrome browser control)". A better wording of the same name is no reason, and never rename one marked as named by the user. Most looks rename none.
+Keep projects' names too, unless one the thread is in has gone out of date: the thing it's about was renamed (an app renamed from Scribble to Inkwell leaves "Scribble" or a vaguer "drawing app" behind), or a project named for what it does now has a name of its own. Give the new name the user would say, keeping the old words in brackets when they still help: "Inkwell (drawing app)". A better wording of the same name is no reason, and never rename one marked as named by the user. Most looks rename none.
 
 Some hibernating threads are waiting for the user to talk about something again ("woodworking"). Put one in wake when the user's own messages in this thread are about that: they're working on it, planning it or asking about it. A passing mention, or only the agent bringing it up, isn't enough. Most looks wake none.
 
@@ -1386,12 +1415,10 @@ function readNew(v: unknown): { title: string; folders: string[]; goals: string;
 // A project name from the model, tidied like a thread title: no quotes or
 // full stop round it. Too long reads as a sentence, not a name.
 function projectTitle(name: string): string | undefined {
-  const t = name
-    .trim()
-    .replace(/^["'“‘]+|["'”’]+$/g, '')
-    .replace(/\.+$/, '')
-    .replace(/^["'“‘]+|["'”’]+$/g, '')
-    .trim();
+  // By hand, not `/^["'“‘]+|["'”’]+$/g` and `/\.+$/`: a model's name ending
+  // in a long run of quotes or dots made those quadratic.
+  const unquote = (s: string) => trimEndOf(trimStartOf(s, `"'“‘`), `"'”’`);
+  const t = unquote(trimEndOf(unquote(name.trim()), '.')).trim();
   return t && t.length <= 60 ? t : undefined;
 }
 

@@ -78,8 +78,10 @@ private struct LibrarianState: View {
                 .tip("Today's looks, quiet catch-ups it skipped without asking the model, and tokens used on your Claude login")
             HStack(spacing: zoomed(8)) {
                 Button(status.paused ? "Resume" : "Pause") { app.setLibrarianPaused(!status.paused) }
+                    .disabled(app.isBusy(BusyKey.pauseLibrarian))
                     .tip(status.paused ? "Let it look at threads again" : "Stop looking at threads; what's queued waits")
                 Button("Look at everything") { app.runLibrarian() }
+                    .busy(app.isBusy(BusyKey.runLibrarian(nil)))
                     .tip("Queue a look at every thread it hasn't looked at yet, newest first")
             }
             .controlSize(.small)

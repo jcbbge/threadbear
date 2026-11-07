@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeHarness, tmpDir } from '../helpers/fakes.ts';
+import { downgradeFetch, redirectTrap } from '../helpers/redirect-trap.ts';
 import { READS_AT_ONCE, TaskBoards, cleanTitle, findGatewayClient, findSource, gatewayCaller, parseRpc, readSchema, readRows, readTasks, type CallTool } from '../../src/notion-tasks.ts';
 import { Projects, checkNotion, projectMethods } from '../../src/projects.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
@@ -247,6 +248,43 @@ test("the gateway client comes from the main login's connectors entry; runner.js
   assert.deepEqual(findGatewayClient({ headersHelper: '/y/h.sh threadbear' }, cj), { mcpUrl: 'https://bruce:8443/mcp', headersHelper: '/y/h.sh threadbear' });
   assert.equal(findGatewayClient({ enabled: false }, cj), undefined);
   assert.equal(findGatewayClient(undefined, path.join(dir, 'none.json')), undefined);
+});
+
+// Daybreak, 7 Nov: the Notion reader sends the gateway's token with every
+// call (src/secure-url.ts).
+test('the gateway client is refused for a cleartext URL, from runner.json or the main login', () => {
+  const dir = tmpDir();
+  const cj = path.join(dir, 'claude.json');
+  for (const bad of ['http://bruce.tail9ef766.ts.net:8443/mcp', 'http://127.0.0.1.evil.example/mcp', 'http://127.0.0.1@evil.example/mcp']) {
+    fs.writeFileSync(cj, JSON.stringify({ mcpServers: { connectors: { type: 'http', url: bad, headersHelper: '/x/h.sh' } } }));
+    assert.equal(findGatewayClient(undefined, cj), undefined, bad);
+    fs.writeFileSync(cj, JSON.stringify({ mcpServers: { connectors: { type: 'http', url: 'https://bruce:8443/mcp', headersHelper: '/x/h.sh' } } }));
+    assert.equal(findGatewayClient({ url: bad }, cj), undefined, bad);
+  }
+  assert.deepEqual(findGatewayClient({ url: 'http://127.0.0.1:9' }, cj), { mcpUrl: 'http://127.0.0.1:9/mcp', headersHelper: '/x/h.sh' });
+});
+
+test("the gateway caller never follows a redirect with the token, and won't send it in the clear", async () => {
+  const headers = async () => ({ Authorization: 'Bearer secret-token' });
+  const down = downgradeFetch('https://bruce:8443/mcp');
+  await assert.rejects(gatewayCaller({ mcpUrl: 'https://bruce:8443/mcp', headers, fetch: down.fetch })('notion__notion-fetch', { id: 'x' }));
+  assert.equal(down.inits[0]!.redirect, 'error');
+  assert.deepEqual(down.leaked, []);
+  // Real fetch, a 307 to another origin on this Mac.
+  const t = await redirectTrap();
+  try {
+    await assert.rejects(gatewayCaller({ mcpUrl: `${t.url}/mcp`, headers })('notion__notion-fetch', { id: 'x' }));
+    assert.deepEqual(t.hits, []);
+  } finally {
+    await t.close();
+  }
+  let fetched = 0;
+  const fake = (async () => {
+    fetched++;
+    return new Response('{}');
+  }) as unknown as typeof fetch;
+  await assert.rejects(gatewayCaller({ mcpUrl: 'http://bruce:8443/mcp', headers, fetch: fake })('notion__notion-fetch', { id: 'x' }), /plain http/);
+  assert.equal(fetched, 0);
 });
 
 test('a Notion page address: notion.so, notion.site or app.notion.com, or a data source; empty clears', () => {

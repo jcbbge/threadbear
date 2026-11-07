@@ -198,3 +198,10 @@ test('stopped during the first build: no probe, and it never turns on', async ()
   assert.equal(probes, 0);
   assert.notEqual(c.status().state, 'on');
 });
+
+test('before its first look it says it is starting, not unavailable', async () => {
+  const { c } = make({});
+  assert.equal(c.status().state, 'starting');
+  assert.equal(c.on, true);
+  assert.equal(c.status().reason, undefined);
+});

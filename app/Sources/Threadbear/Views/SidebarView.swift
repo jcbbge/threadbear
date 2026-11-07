@@ -62,11 +62,14 @@ private struct InboxList: View {
         // isn't counted or listed there until it lands (`ArchiveFlight`).
         let flying = app.flyingToArchive
         let archived = flying.isEmpty ? sections.archived : sections.archived.filter { !flying.contains($0.id) }
+        // And the same for one sinking into Hibernating.
+        let tucking = app.flyingToHibernate
+        let hibernating = tucking.isEmpty ? sections.hibernating : sections.hibernating.filter { !tucking.contains($0.id) }
         // The Archived section shows the most recent few, or every match
         // while searching.
         let archive = ArchiveRows.shown(archived, limit: archiveLimit, searching: searching, selection: app.selection)
         // Each section's rows as drawn.
-        let drawn: (InboxSection) -> [ThreadSummary] = { $0 == .archived ? archive.rows : sections[$0] }
+        let drawn: (InboxSection) -> [ThreadSummary] = { $0 == .archived ? archive.rows : $0 == .hibernating ? hibernating : sections[$0] }
         // A folded section's rows aren't drawn, so the arrow keys skip
         // them. A search draws every section's matches, folded or not.
         let open = InboxSection.allCases.filter { searching || !app.collapsedSections.contains($0) }
@@ -105,6 +108,11 @@ private struct InboxList: View {
                         if section == .archived {
                             ThreadSection(section: section, threads: archive.rows, total: archived.count, more: archive.more,
                                           searching: searching, showMore: { archiveLimit += ArchiveRows.step }, select: select)
+                        } else if section == .hibernating {
+                            // The heading comes up as the first thread sets
+                            // off for it, so there's a moon to land in.
+                            ThreadSection(section: section, threads: hibernating, searching: searching,
+                                          keepHeading: !tucking.isEmpty && !searching, select: select)
                         } else {
                             ThreadSection(section: section, threads: sections[section], searching: searching, select: select)
                         }
@@ -112,7 +120,10 @@ private struct InboxList: View {
                         // a schedule don't stop it: there's still nothing
                         // for Mike to do.
                         // Nor do starred threads, unless one needs him.
-                        if section == .inbox && !searching && sections.inbox.isEmpty && sections.running.isEmpty && sections.needsYou.isEmpty {
+                        // It comes once the last archived or hibernated page
+                        // has landed: arriving under the heading mid-flight
+                        // pushes it down, and the page lands short.
+                        if section == .inbox && !searching && sections.inbox.isEmpty && sections.running.isEmpty && sections.needsYou.isEmpty && !app.flightLeavingTheInbox {
                             InboxZero()
                         }
                     }
@@ -181,11 +192,13 @@ private struct ThreadSection: View {
     /// back as they were once the search is cleared.
     var searching = false
     var showMore: () -> Void = {}
+    /// Show the heading even with nothing under it yet.
+    var keepHeading = false
     let select: (String) -> Void
 
     var body: some View {
         let count = total ?? threads.count
-        if count > 0 || (section == .inbox && !searching) {
+        if count > 0 || keepHeading || (section == .inbox && !searching) {
             let collapsed = !searching && app.collapsedSections.contains(section)
             SectionHeading(title: section.title, icon: section.icon, fold: searching ? nil : .init(collapsed: collapsed, count: count) {
                 withAnimation(.snappy(duration: 0.2)) {
@@ -195,6 +208,7 @@ private struct ThreadSection: View {
                 if section == .inbox { InboxOrderMenu() }
             }
             .environment(\.archiveLandings, section == .archived ? app.archiveLandings : nil)
+            .environment(\.hibernateLandings, section == .hibernating ? app.hibernateLandings : nil)
             if !collapsed {
                 ForEach(threads.map { SectionRow(section: section.title, thread: $0) }) { row in
                     ThreadRowView(thread: row.thread, mode: RowMode(section, thread: row.thread, now: app.now), section: section) { select(row.thread.id) }
@@ -255,8 +269,8 @@ private struct NewThreadButton: View {
         .animation(Juice.hover, value: hovering)
         // Over the end of the search, since the sidebar's edge is just
         // right of the button.
-        .shortcutHint("⌘N", .before)
-        .tip("Start a new thread (⌘N)")
+        .shortcutHint(AppShortcuts.shared.display(.newThread), .before)
+        .tip(AppShortcuts.shared.tip("Start a new thread", .newThread))
         .accessibilityLabel("New thread")
     }
 }
@@ -349,6 +363,7 @@ struct SectionHeading<Accessory: View>: View {
     @ViewBuilder var accessory: () -> Accessory
     @State private var hovering = false
     @Environment(\.archiveLandings) private var archiveLandings
+    @Environment(\.hibernateLandings) private var hibernateLandings
 
     typealias Fold = SectionFold
 
@@ -387,7 +402,17 @@ struct SectionHeading<Accessory: View>: View {
                     // thread's panel lands, bouncing as it does
                     // (`ArchiveFlight`).
                     .symbolEffect(.bounce, value: archiveLandings ?? 0)
-                    .background { if archiveLandings != nil { FlightMarker(kind: .archiveBox) } }
+                    // Hibernating's moon dips rather than hops, its Zs
+                    // stirring after it, and lifts a shade as it takes the
+                    // thread in.
+                    .symbolEffect(.bounce.down.byLayer, value: hibernateLandings ?? 0)
+                    .phaseAnimator([0, 0.16], trigger: hibernateLandings ?? 0) { moon, lit in
+                        moon.brightness(lit)
+                    } animation: { _ in .easeOut(duration: 0.32) }
+                    .background {
+                        if archiveLandings != nil { FlightMarker(kind: .archiveBox) }
+                        if hibernateLandings != nil { FlightMarker(kind: .hibernateBox) }
+                    }
                     .frame(width: zoomed(14))
             }
             Text(title)
@@ -522,6 +547,12 @@ struct ThreadList<Content: View>: View {
                 app.select(next)
                 proxy.scrollTo(scrollID(next))
             }
+            // Next Inbox Thread (⌥⌘↓) picks a row from the menu: bring it
+            // into view as the arrow keys do.
+            .onChange(of: app.revealSelectionRequests) {
+                guard let id = app.selection, order.contains(id) else { return }
+                withAnimation(Juice.selection) { proxy.scrollTo(scrollID(id)) }
+            }
             .onExitCommand {
                 if app.sidebarMode != .inbox { app.sidebarMode = .inbox }
             }
@@ -583,6 +614,11 @@ struct ThreadRowView: View {
     @State private var landed = false
     /// Two fingers sliding the row left to archive it (RowSwipe.swift).
     @State private var swipe = RowSwipeController()
+    /// The thread's being dragged out (ThreadDrag), till it's let go.
+    @State private var draggingOut = false
+    /// What the window showed before the press opened this thread, to go
+    /// back to if the press turns into dragging it out.
+    @State private var placeBeforePress: NavigationPlace?
     @Environment(\.sidebarRowSpace) private var listSpace
     /// Not in Projects: a thread in two projects has a row under each, and
     /// two rows can't both be the one the highlight and the glide follow.
@@ -598,6 +634,19 @@ struct ThreadRowView: View {
     /// Kept while its moon's menu is open, which the pointer leaves the row
     /// to get into (`MenuAnchor.held`).
     private var showsActions: Bool { (pointerOver || app.menuOpenRow == thread.id) && !swipe.isSwiping && !slidingOff }
+
+    /// The press became dragging the thread out. The press opened it, as
+    /// a click does on mouse down, but it's being dragged into the thread
+    /// that was open, so that one comes back to drop it on.
+    private func dragOut() {
+        guard ThreadDrag.begin(thread, ended: { draggingOut = false }) else { return }
+        draggingOut = true
+        // AppKit has the mouse till the drop, so the gesture may never hear
+        // it come up.
+        pressed = false
+        swipe.dragEnded()
+        if let before = placeBeforePress, app.place != before { app.goBack() }
+    }
 
     var body: some View {
         // The Projects view's rows say what they're doing too: it has no
@@ -719,10 +768,18 @@ struct ThreadRowView: View {
         // Selects on mouse down, as the system list did and Mail does; a
         // tap gesture waits for the mouse to come back up. Dragging left
         // swipes the row, for a mouse (global, as the row moves with it).
+        // Any other way drags the thread out, to drop into the open
+        // thread's message (ThreadDrag).
         .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .global).onChanged { value in
+            guard !draggingOut else { return }
+            if pressed, !swipe.isSwiping, RowSwipe.dragsOut(dx: value.translation.width, dy: value.translation.height) {
+                dragOut()
+                return
+            }
             swipe.drag(value.translation)
             guard !pressed else { return }
             pressed = true
+            placeBeforePress = app.place
             select()
         }.onEnded { _ in
             pressed = false
@@ -753,7 +810,13 @@ struct ThreadRowView: View {
         // The whole title, which the row often cuts short, and where it runs.
         // The status and project marks have their own tips over this one.
         .tip((thread.title.isEmpty ? "Untitled" : thread.title) + "\n" + (place.map { "\($0), in " } ?? "") + thread.cwd.abbreviatingHome)
-        .iconContextMenu { ThreadMenu(thread: thread) }
+        .iconContextMenu {
+            ThreadMenu(thread: thread)
+            Divider()
+            // As in the thread's ... menu, so Mike can grab a thread's id
+            // to point an agent at it without opening the thread (6 Nov).
+            Button("Copy thread id", systemImage: "number") { app.copyToPasteboard(thread.id) }
+        }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { select() }
@@ -763,6 +826,7 @@ struct ThreadRowView: View {
 
     /// A hibernating thread says when it wakes, where the time would be.
     private var wakeText: String? {
+        if thread.snoozedUntilRelease { return "Back on update" }
         if thread.snoozedUntilRestart { return "Back on restart" }
         if let until = thread.snoozedUntil { return "Back \(RelativeTime.until(until, now: app.now))" }
         return nil
@@ -977,7 +1041,7 @@ private struct RowActions: View {
                         app.archive(thread.id)
                     } label: { Image(systemName: "archivebox") }
                         .buttonStyle(RowIconButtonStyle())
-                        .tip("Archive (⌘E)")
+                        .tip(AppShortcuts.shared.tip("Archive", .archive))
                 case .unsnooze:
                     Button { app.unsnooze(thread.id) } label: { Image(systemName: "arrow.uturn.backward") }
                         .buttonStyle(RowIconButtonStyle())
@@ -1046,6 +1110,8 @@ struct SidebarButtonRow: View {
     /// The tooltip, if the title alone doesn't say enough.
     var tip: String? = nil
     var active = false
+    /// Its work is on the way: a spinner for the icon, and no more clicks.
+    var busy = false
     let action: () -> Void
     @State private var hovering = false
     @Environment(\.controlActiveState) private var activeState
@@ -1053,10 +1119,16 @@ struct SidebarButtonRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: zoomed(8)) {
-                Image(systemName: icon)
-                    .font(.system(size: TypeScale.sidebarButton))
-                    .foregroundStyle(.secondary)
-                    .frame(width: zoomed(16))
+                Group {
+                    if busy {
+                        SpinnerMark(color: .secondaryLabelColor).frame(width: zoomed(12), height: zoomed(12))
+                    } else {
+                        Image(systemName: icon)
+                            .font(.system(size: TypeScale.sidebarButton))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(width: zoomed(16))
                 Text(title)
                     .font(.system(size: TypeScale.sidebarButton))
                     .foregroundStyle(.primary)
@@ -1070,6 +1142,7 @@ struct SidebarButtonRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(busy)
         .onHover { hovering = $0 }
         .tip(tip ?? title)
     }
@@ -1136,7 +1209,9 @@ struct ThreadProjectsMenu: View {
             }
             if !live.isEmpty { Divider() }
             Button("New project…", systemImage: "plus") { app.newProject(with: thread.id) }
+                .disabled(app.isBusy(BusyKey.newProject))
             Button("Ask the librarian to look", systemImage: "books.vertical") { app.runLibrarian(threadId: thread.id) }
+                .disabled(app.isBusy(BusyKey.runLibrarian(thread.id)))
         }
     }
 }

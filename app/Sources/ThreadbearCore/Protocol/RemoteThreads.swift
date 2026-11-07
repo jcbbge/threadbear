@@ -8,19 +8,25 @@ import Foundation
 public struct RemoteThreads: Sendable, Hashable, Decodable {
     public var runners: [RemoteRunner]
     public var threads: [RemoteThread]
+    /// Mike's runner order (backend API 58): every runner's id, this one's
+    /// too, the same order the phone sets. Nil from an older runner or
+    /// backend, which has none to give.
+    public var order: [String]?
 
-    public init(runners: [RemoteRunner] = [], threads: [RemoteThread] = []) {
+    public init(runners: [RemoteRunner] = [], threads: [RemoteThread] = [], order: [String]? = nil) {
         self.runners = runners
         self.threads = threads
+        self.order = order
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         runners = c.lossyArray(RemoteRunner.self, forKey: .runners)
         threads = c.lossyArray(RemoteThread.self, forKey: .threads)
+        order = try? c.decodeIfPresent([String].self, forKey: .order)
     }
 
-    enum CodingKeys: String, CodingKey { case runners, threads }
+    enum CodingKeys: String, CodingKey { case runners, threads, order }
 
     public func runner(_ id: String) -> RemoteRunner? { runners.first { $0.id == id } }
 

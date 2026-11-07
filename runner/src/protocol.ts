@@ -13,8 +13,40 @@ export function isProvider(v: unknown): v is Provider {
 
 // auto is Claude Code's auto mode: a separate classifier model approves or
 // blocks each action, and asks only when it can't decide. Codex has no such
-// thing, so there it behaves like ask.
-export type PermissionMode = 'full' | 'ask' | 'auto';
+// thing, so there it behaves like ask. plan is "Plan first": the agent
+// reads and plans but changes nothing until Mike approves its plan
+// (docs/protocol.md, "Plan first").
+export type PermissionMode = 'full' | 'ask' | 'auto' | 'plan';
+export const PERMISSION_MODES: readonly PermissionMode[] = ['full', 'ask', 'auto', 'plan'];
+
+// Every place a mode crosses from one process to another checks it with
+// this, so a mode added later can't be dropped by one hop's own list and
+// leave the thread on the full-access default (Daybreak, 7 Nov 2026: Plan
+// first sent to another Mac arrived as Full access).
+export function isPermissionMode(v: unknown): v is PermissionMode {
+  return typeof v === 'string' && (PERMISSION_MODES as readonly string[]).includes(v);
+}
+
+// A new thread's mode in a `create` command another runner takes through
+// the backend (docs/protocol.md, "Other runners' threads through the
+// backend"). Plan first goes as Ask with `plan: true`: a runner or backend
+// from before it knew Plan first drops the flag and starts the thread on
+// Ask, never on the full access a missing mode means. Unknown modes are
+// refused, not dropped.
+export function remoteCreateMode(mode: unknown): Record<string, unknown> {
+  if (mode === undefined || mode === null) return {};
+  if (!isPermissionMode(mode)) throw new RpcError(ErrorCode.badParams, `permissionMode must be one of ${PERMISSION_MODES.join(', ')}`);
+  return mode === 'plan' ? { permissionMode: 'ask', plan: true } : { permissionMode: mode };
+}
+
+// What the runner taking a `create` command starts the thread on: undefined
+// (the default) only when the command names no mode at all.
+export function remoteCreateModeOf(a: { permissionMode?: unknown; plan?: unknown }): PermissionMode | undefined {
+  if (a.plan === true) return 'plan';
+  if (a.permissionMode === undefined || a.permissionMode === null) return undefined;
+  if (!isPermissionMode(a.permissionMode)) throw new Error(`Unknown permission mode ${JSON.stringify(a.permissionMode)}: the thread wasn't started.`);
+  return a.permissionMode;
+}
 // 'ultra' is Codex's multi-agent level; Claude never offers it.
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 export const EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
@@ -168,6 +200,7 @@ export type ThreadSummary = {
   lastActivityAt: string;
   snoozedUntil?: string;
   snoozedUntilRestart?: boolean; // hibernating until the runner next starts
+  snoozedUntilRelease?: true; // with snoozedUntilRestart: until it starts on a new release
   // Hibernated in Mike's words ("Hibernate in words"): what he said, the
   // topic it waits for, and pending while the time is worked out.
   wakeWhen?: { said: string; topic?: string; pending?: true };
@@ -224,7 +257,20 @@ export type ThreadSummary = {
   // keeps the link for when it's shared again.
   share?: ThreadShare;
   sample?: true; // one of the tour's sample threads (threads.samples): made up, never sent to
+  // What's still open on the done card of its last turn (experiment
+  // looseEnds; docs/protocol.md, "Loose ends"): seq is that card's
+  // turn.completed. ends empty: checked, and nothing's left. Absent: not
+  // checked (the experiment's off, the last turn needs Mike, or it's
+  // still being checked).
+  looseEnds?: { seq: number; ends: LooseEnd[]; at: string };
 };
+
+// unlanded: commits on its branch that main lacks. uncommitted: files in
+// its worktree. thread: one it started, still working or waiting on Mike.
+// scheduled: a schedule that will message it again (at: when), which
+// doesn't stop an archive. Clients show any other kind as its text.
+export type LooseEndKind = 'unlanded' | 'uncommitted' | 'thread' | 'scheduled';
+export type LooseEnd = { kind: LooseEndKind; text: string; threadId?: string; at?: string };
 
 export type ShareAccess = 'off' | 'link';
 
@@ -468,6 +514,7 @@ export type PatchInfo = {
   untrusted?: 'new' | 'changed';
   hash?: string;
   helpers?: string[]; // with untrusted: the local files it imports, which the hash covers too
+  grants?: string[]; // with untrusted, a folder's Claude settings in a thread that asks first: what they'd let run without asking, in words
   icon?: string; // the patch file's icon, an SF Symbol
   iconFile?: string; // or its picture (absolute path: an image or a .app)
 };
@@ -591,12 +638,16 @@ export type CodexTurnUsage = {
 export type ReviewDraft = { pickedId?: string; pickedIds?: string[]; notes: Record<string, string>; reply?: string; none?: true };
 
 // One picture of an option: its first, or another screen or state of it.
-export type ReviewShot = { title?: string; image: ImageRef };
+// media: a video (video/mp4, video/quicktime) or page (text/html) the
+// window plays or shows in place of image, which is then its still.
+export type ReviewShot = { title?: string; image: ImageRef; media?: ImageRef };
 
 export type DesignReview = {
   id: string;
   title: string;
   note?: string;
+  // The option id the agent would pick, marked "my pick" in the window.
+  recommended?: string;
   // image is the option's first shot, kept for clients that only show one.
   // shots, when given, is every shot in order, image included. url: the
   // option running live, to open beside the pictures.
@@ -610,9 +661,36 @@ export type DesignReview = {
   replyTurnId?: string;
 };
 
+// A button an agent put in its reply (docs/protocol.md, "Reply buttons"):
+// pressing it starts a thread with the brief, or sends a message to a
+// thread. Exactly one of start and send.
+export type ReplyButtonStart = {
+  text: string;
+  title?: string;
+  cwd: string;
+  accountId?: string;
+  poolId?: string;
+  model?: string;
+  effort?: EffortLevel;
+  permissionMode: PermissionMode;
+  why?: string;
+};
+export type ReplyButtonSend = { threadId: string; threadTitle: string; text: string };
+export type ReplyButton = {
+  id: string;
+  title: string;
+  createdAt: string;
+  turnId?: string;
+  start?: ReplyButtonStart;
+  send?: ReplyButtonSend;
+  pressed?: { at: string; threadId: string };
+  failed?: { at: string; error: string };
+};
+
 // Persisted event bodies, without the envelope.
 export type EventBody =
   | { type: 'review.updated'; review: DesignReview }
+  | { type: 'button.updated'; button: ReplyButton }
   // origin is set only on messages the runner sent by itself (the resume
   // after a restart).
   | { type: 'user.message'; text: string; images: ImageRef[]; origin?: MessageOrigin; scheduleId?: string; reviewId?: string; reviewResponse?: ReviewDraft; answers?: AskAnswer[]; editOf?: number }
@@ -651,6 +729,10 @@ export type EventBody =
   | { type: 'secret.requested'; approvalId: string; itemId?: string; label: string; reason: string; placeholder?: string }
   | { type: 'approval.resolved'; approvalId: string; decision: ApprovalDecision; message?: string }
   | { type: 'plan.updated'; entries: PlanEntry[] }
+  // "Plan first" (docs/protocol.md): the agent's plan, waiting for Mike,
+  // and what became of it.
+  | { type: 'plan.proposed'; itemId: string; text: string }
+  | { type: 'plan.resolved'; itemId: string; decision: 'go' | 'revise' }
   // wokeBy: the background work that finished and started this turn (docs/protocol.md)
   | { type: 'turn.started'; turnId: string; wokeBy?: { kind: BackgroundKind; description: string }[] }
   | {
@@ -670,7 +752,10 @@ export type EventBody =
     }
   // The ticks on a card of asks, the whole set each time. Outside any turn.
   | { type: 'asks.ticked'; asksSeq: number; ticked: number[] }
-  | { type: 'system.note'; text: string }
+  // wake: a background task's notification that went into the running
+  // turn, which opens a turn that's had its end_turn again (needs.ts,
+  // takenEndTurn).
+  | { type: 'system.note'; text: string; wake?: true }
   | { type: 'error'; message: string }
   // A command action that ran (patches.ts): its output, truncated like a
   // tool result. Outside any turn.
@@ -730,6 +815,7 @@ export type AnyEvent = PersistedEvent | TransientEvent;
 
 export const PERSISTED_TYPES = new Set<string>([
   'review.updated',
+  'button.updated',
   'user.message',
   'assistant.text',
   'reasoning',
@@ -741,6 +827,8 @@ export const PERSISTED_TYPES = new Set<string>([
   'secret.requested',
   'approval.resolved',
   'plan.updated',
+  'plan.proposed',
+  'plan.resolved',
   'turn.started',
   'turn.completed',
   'asks.ticked',
@@ -774,6 +862,11 @@ export type Schedule = {
   model?: string;
   effort?: EffortLevel;
   permissionMode?: PermissionMode;
+  // A shell command run first, in its folder; a run whose check prints
+  // nothing is skipped (experiment scheduleChecks, schedule-check.ts).
+  check?: string;
+  // How long the check may take, in seconds (at most 300); absent, 60.
+  checkTimeoutSecs?: number;
   paused: boolean;
   createdAt: string;
   updatedAt: string;

@@ -1,21 +1,10 @@
 // A small button with a menu under it: the thread's ..., the sidebar's sort
 // and filter. A <details>, so it opens with no state of its own; this adds
 // what <details> doesn't do, closing on a click outside or Escape.
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 
-// With a label it's a worded button (the done card's Archive) in place of an
-// icon one. `above` opens the menu over the button, fixed to the window, for
-// a button inside a box that clips (the dock's card scrolls, and the dock's
-// box hides what spills out), so the menu isn't cut off there.
-export function Pop({ title, icon, label, lit, above, children }: { title: string; icon?: ReactNode; label?: string; lit?: boolean; above?: boolean; children: (close: () => void) => ReactNode }) {
+export function Pop({ title, icon, lit, children }: { title: string; icon: ReactNode; lit?: boolean; children: (close: () => void) => ReactNode }) {
   const ref = useRef<HTMLDetailsElement>(null);
-  const [place, setPlace] = useState<CSSProperties>();
-  const onToggle = () => {
-    const summary = ref.current?.querySelector('summary');
-    if (!above || !ref.current?.open || !summary) return;
-    const r = summary.getBoundingClientRect();
-    setPlace({ position: 'fixed', top: 'auto', right: window.innerWidth - r.right, bottom: window.innerHeight - r.top + 6 });
-  };
   const close = () => {
     if (ref.current) ref.current.open = false;
   };
@@ -34,14 +23,11 @@ export function Pop({ title, icon, label, lit, above, children }: { title: strin
     };
   }, []);
   return (
-    <details className="pop" ref={ref} onToggle={onToggle}>
-      <summary className={label ? 'btn plain' : `icon-btn ${lit ? 'lit-btn' : ''}`} title={title} aria-label={title}>
+    <details className="pop" ref={ref}>
+      <summary className={`icon-btn ${lit ? 'lit-btn' : ''}`} title={title} aria-label={title}>
         {icon}
-        {label}
       </summary>
-      <div className="pop-panel menu" style={above ? (place ?? { visibility: 'hidden' }) : undefined}>
-        {children(close)}
-      </div>
+      <div className="pop-panel menu">{children(close)}</div>
     </details>
   );
 }

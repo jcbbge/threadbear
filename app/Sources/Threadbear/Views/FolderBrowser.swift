@@ -47,6 +47,10 @@ struct FolderBrowser: NSViewRepresentable {
 
     final class Coordinator {
         var opened: Int?
+        /// The preview this browser shows now, which a file or folder
+        /// opened from it comes Back to. Kept up to date here, as the view
+        /// outlives a preview replaced by another of the same folder.
+        var showing: PanePreview?
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -65,8 +69,11 @@ struct FolderBrowser: NSViewRepresentable {
             source = { folder in try await Task.detached(priority: .userInitiated) { try FolderListing.read(folder) }.value }
         }
         let view = FolderPaneView(path: path, away: preview.away, memory: preview.folderMemory, mode: mode, source: source)
-        view.onOpen = { [weak app] entry, memory in app?.openFromFolder(entry, from: memory, in: thread) }
-        view.onBrowse = { [weak app] folder, memory, selecting in app?.browseFolder(folder, from: memory, selecting: selecting, in: thread) }
+        let coordinator = context.coordinator
+        coordinator.showing = preview
+        let first = preview
+        view.onOpen = { [weak app] entry, memory in app?.openFromFolder(entry, from: memory, showing: coordinator.showing ?? first, in: thread) }
+        view.onBrowse = { [weak app] folder, memory, selecting in app?.browseFolder(folder, from: memory, selecting: selecting, showing: coordinator.showing ?? first, in: thread) }
         view.onExternal = { [weak app] url in app?.openExternally(url) }
         view.onReveal = { [weak app] file in app?.revealInFinder(file) }
         return view
@@ -77,6 +84,7 @@ struct FolderBrowser: NSViewRepresentable {
         // Opened again (a link clicked, Back): read it again.
         if context.coordinator.opened != nil, context.coordinator.opened != preview.opened { view.refresh() }
         context.coordinator.opened = preview.opened
+        context.coordinator.showing = preview
     }
 
     static func dismantleNSView(_ view: FolderPaneView, coordinator: Coordinator) {
@@ -110,6 +118,8 @@ final class FolderPaneView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
     private let path: String
     /// "bruce": it's a folder on that Mac, so nothing here can touch it.
     private let away: String?
+    /// Folders on another Mac opened and not read yet.
+    private var loadingFolders: Set<String> = []
     private let source: Source
     private var mode: FolderViewMode
     private var sort = FolderPaneView.savedSort
@@ -320,6 +330,18 @@ final class FolderPaneView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
     }
 
     private func failed(_ folder: String, _ error: Error) {
+        // One that was spinning closes again and says so, rather than
+        // sitting open and empty.
+        if loadingFolders.remove(folder) != nil, let node = nodes[folder] {
+            AppLog.write("rpc", "reading folder \(folder) failed: \(error.localizedDescription)")
+            outline.collapseItem(node)
+            outline.reloadItem(node)
+            note.stringValue = "Couldn't read \(node.entry.name)\(away.map { " on \($0)" } ?? "")."
+            note.isHidden = false
+            note.setTip(error.localizedDescription)
+            needsLayout = true
+            return
+        }
         // A row that's gone is dealt with when its parent is next read.
         guard folder == path else { return }
         AppLog.write("rpc", "reading folder \(folder) failed: \(error.localizedDescription)")
@@ -334,6 +356,7 @@ final class FolderPaneView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
 
     private func apply(_ contents: FolderContents, for folder: String) {
         let hadIt = listings[folder] != nil
+        loadingFolders.remove(folder)
         if listings[folder] == contents, failure == nil { return }
         listings[folder] = contents
         failure = nil
@@ -746,6 +769,12 @@ final class FolderPaneView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
 
     func outlineViewItemDidExpand(_ notification: Notification) {
         guard let node = notification.userInfo?["NSObject"] as? FolderNode else { return }
+        // Another Mac's folder takes a moment over the network, and would
+        // open looking empty: its row spins until the listing comes.
+        if away != nil, node.children == nil {
+            loadingFolders.insert(node.entry.path)
+            outline.reloadItem(node)
+        }
         load(node.entry.path)
     }
 
@@ -754,6 +783,7 @@ final class FolderPaneView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
         // It isn't showing, so it's not worth watching until it opens again.
         watchers.removeValue(forKey: node.entry.path)?.cancel()
         listings[node.entry.path] = nil
+        if loadingFolders.remove(node.entry.path) != nil { outline.reloadItem(node) }
     }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
@@ -770,6 +800,7 @@ final class FolderPaneView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
             // A picture or a video's own frame, as the Finder's list shows;
             // a code file's "thumbnail" would be a smudge of its text.
             if hasRealThumbnails, FolderThumbnails.isPicture(node.entry) { cell.loadThumbnail(of: node.entry) }
+            if loadingFolders.contains(node.entry.path) { cell.showLoading() }
         case dateColumn.identifier:
             cell.show(text: node.entry.modifiedAt.map(Self.dateText) ?? "", icon: nil, secondary: true, dimmed: node.entry.hidden, alignment: .left)
         default:
@@ -1144,6 +1175,7 @@ private final class FolderPathButton: NSButton {
 final class FolderRowCell: NSTableCellView {
     private let label = NSTextField(labelWithString: "")
     private let iconView = NSImageView()
+    private let spinner = Spinner.make()
     private var thumbnail = FolderThumbnails.Loader()
 
     init(withIcon: Bool, identifier: NSUserInterfaceItemIdentifier) {
@@ -1160,7 +1192,11 @@ final class FolderRowCell: NSTableCellView {
             iconView.imageScaling = .scaleProportionallyUpOrDown
             addSubview(iconView)
             imageView = iconView
+            spinner.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(spinner)
             constraints += [
+                spinner.centerXAnchor.constraint(equalTo: iconView.centerXAnchor),
+                spinner.centerYAnchor.constraint(equalTo: iconView.centerYAnchor),
                 iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: zoomed(2)),
                 iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
                 iconView.widthAnchor.constraint(equalToConstant: zoomed(18)),
@@ -1182,8 +1218,17 @@ final class FolderRowCell: NSTableCellView {
         label.font = .systemFont(ofSize: secondary ? TypeScale.detail : TypeScale.label)
         label.textColor = secondary ? .secondaryLabelColor : .labelColor
         iconView.image = icon
+        // Cells are reused: only a folder still being read shows the spinner.
+        iconView.isHidden = false
+        spinner.stopAnimation(nil)
         // Hidden files look it, as they do in the Finder.
         alphaValue = dimmed ? 0.55 : 1
+    }
+
+    /// A spinner for the icon, while this folder's listing is on its way.
+    func showLoading() {
+        iconView.isHidden = true
+        spinner.startAnimation(nil)
     }
 
     func loadThumbnail(of entry: FolderEntry) {

@@ -275,7 +275,7 @@ final class QuickAskModel {
         awaitingReply = nil
         isPresented = true
         guard settings.isReady else {
-            phase = .idle(notice: "Add your archive server in Settings to use Ask.")
+            phase = .idle(notice: "Add your Ask server in Settings to use Ask.")
             return
         }
         prepare()
@@ -323,7 +323,7 @@ final class QuickAskModel {
     }
 
     func openSystemSettings() {
-        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+        if let url = URL(string: UIApplication.openSettingsURLString) { LinkGate.shared.openOwn(url) }
     }
 
     // MARK: - Buttons and taps
@@ -393,7 +393,7 @@ final class QuickAskModel {
             return
         }
         guard settings.isReady else {
-            phase = .idle(notice: "Add your archive server in Settings to use Ask.")
+            phase = .idle(notice: "Add your Ask server in Settings to use Ask.")
             return
         }
         if phase == .listening { stopListening() }

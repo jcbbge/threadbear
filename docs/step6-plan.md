@@ -1,7 +1,10 @@
 # Step 6: a second runner (Bruce)
 
-Draft, 29 Oct 2026. Nothing here is built. It follows `docs/plan.md`
-("Build order") and the multi-runner notes in `docs/convex-backend.md`.
+The design this started from, 29 Oct 2026, kept as a record. Second runners
+are built and supported: INSTALL.md sets one up, and the guide's "If you run
+Threadbear on more than one Mac" says how it behaves today, which differs
+from this draft in places. It follows `docs/plan.md` ("Build order") and the
+multi-runner notes in `docs/convex-backend.md`.
 
 The plan said Tinker Desk. On 29 Oct Mike moved it to Bruce: Tinker Desk is
 kept for testing clean installs of Threadbear as a new user would, and a

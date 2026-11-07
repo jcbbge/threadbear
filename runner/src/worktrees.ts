@@ -10,6 +10,7 @@ import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { WorktreePatch } from './patches.ts';
+import { inBackground } from './background.ts';
 
 // What a thread's record keeps about its worktree.
 export type WorktreeRecord = {
@@ -19,6 +20,10 @@ export type WorktreeRecord = {
   branch: string; // "thread/<id8>"
   base: string; // main's commit when it was made
   removedAt?: string; // cleaned up when the thread was archived
+  // Archived, and the cleanup hasn't had its say yet: it waits for the CLI and
+  // turn-end hooks, so a runner stopping or crashing can come first. The next
+  // runner does it (settleLostCleanups).
+  cleanupOwed?: boolean;
   // The patch's worktree.keep: the folder is set aside for another thread
   // when this one's done with it, rather than removed (see "spares").
   keep?: string[];
@@ -246,6 +251,9 @@ export type LandOptions = {
   err?: (line: string) => void;
   // How the check runs; tests pass a plain shell.
   shell?: string[];
+  // The CLI reads the patch after rebasing, including changes to the
+  // required check made by a landing it just waited for.
+  readCheck?: () => Promise<string | undefined>;
 };
 
 // How many lines of a failed check's output are shown.
@@ -255,6 +263,65 @@ const CHECK_TAIL_LINES = 40;
 // check, fast-forwards main in its checkout and prints what landed.
 // Returns the exit code. Every refusal leaves main as it was.
 export async function land(t: LandTarget, opts: LandOptions = {}): Promise<number> {
+  const common = await gitOut(t.path, ['rev-parse', '--git-common-dir']);
+  if (!common) {
+    (opts.err ?? console.error)(`${t.path} isn't a git checkout, so there's nothing to land.`);
+    return 1;
+  }
+  // The remote check queue only serializes checks, after their snapshots
+  // have been copied. Serialize the entire landing before rebasing, across
+  // CLI processes, so waiting for that queue cannot stale another landing.
+  let release: () => Promise<void>;
+  try {
+    release = await lockLanding(path.resolve(t.path, common, 'threadbear-land.lock'), opts.out ?? console.log);
+  } catch (e) {
+    (opts.err ?? console.error)(`Couldn't lock the repo for landing: ${(e as Error).message}`);
+    return 1;
+  }
+  try {
+    return await landLocked(t, opts);
+  } finally {
+    await release();
+  }
+}
+
+// Advisory locks are released by the OS, including when tb crashes. The
+// holder exits when its parent's pipe closes; no PID files to go stale or
+// delete under another waiter. Keep the lock file itself between runs.
+async function lockLanding(file: string, out: (line: string) => void): Promise<() => Promise<void>> {
+  const holder = "process.stdin.resume(); process.stdin.on('end', () => process.exit(0)); process.stdout.write('locked');";
+  const mac = process.platform === 'darwin';
+  const take = async (wait: boolean): Promise<(() => Promise<void>) | undefined> => {
+    // 75 is EX_TEMPFAIL for lockf, and explicitly chosen for flock. A
+    // nonblocking try distinguishes contention from a slow Node startup.
+    const args = mac ? ['-k', ...(wait ? [] : ['-t', '0'])] : ['-x', '-E', '75', ...(wait ? [] : ['-n'])];
+    const child = spawn(mac ? '/usr/bin/lockf' : 'flock', [...args, file, process.execPath, '-e', holder], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+    let errors = '';
+    child.stderr.on('data', (d) => { errors += d; });
+    const acquired = await new Promise<boolean>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code) => {
+        if (!wait && code === 75) resolve(false);
+        else reject(new Error(errors.trim() || `landing lock exited (${code})`));
+      });
+      child.stdout.once('data', () => resolve(true));
+    });
+    if (!acquired) return undefined;
+    return async () => {
+      child.stdin.end();
+      await closed;
+    };
+  };
+  const release = await take(false);
+  if (release) return release;
+  out('Waiting for another landing of this repo to finish...');
+  return (await take(true))!;
+}
+
+async function landLocked(t: LandTarget, opts: LandOptions): Promise<number> {
   const out = opts.out ?? ((l: string) => process.stdout.write(l + '\n'));
   const err = opts.err ?? ((l: string) => process.stderr.write(l + '\n'));
   const fail = (...lines: string[]): number => {
@@ -324,10 +391,19 @@ export async function land(t: LandTarget, opts: LandOptions = {}): Promise<numbe
     return 0;
   }
 
-  // 3. The repo's check, in the worktree.
-  if (t.check) {
-    out(`Running the check: ${t.check}`);
-    const r = await runCheck(t.check, t.path, opts.shell);
+  // 3. The repo's check, in the worktree. Pin what passed, rather than
+  // merging a branch name that another process could move during checks.
+  const checked = await gitOut(t.path, ['rev-parse', 'HEAD']);
+  if (!checked) return fail(`Couldn't read HEAD in ${t.path}.`);
+  let check: string | undefined;
+  try {
+    check = opts.readCheck ? await opts.readCheck() : t.check;
+  } catch (e) {
+    return fail(`Couldn't read the repo's patches for its check: ${(e as Error).message}`);
+  }
+  if (check) {
+    out(`Running the check: ${check}`);
+    const r = await runCheck(check, t.path, opts.shell);
     if (!r.ok) {
       const tail = r.text.trimEnd().split('\n').slice(-CHECK_TAIL_LINES);
       return fail(
@@ -341,6 +417,13 @@ export async function land(t: LandTarget, opts: LandOptions = {}): Promise<numbe
     out(`The check passed (${Math.round(r.durationMs / 1000)} s).`);
   }
 
+  if ((await gitOut(t.path, ['rev-parse', 'HEAD'])) !== checked ||
+      (await gitOut(t.path, ['rev-parse', t.branch])) !== checked ||
+      (await gitOut(t.path, ['rev-parse', '--abbrev-ref', 'HEAD'])) !== t.branch ||
+      (await gitOut(t.path, ['status', '--porcelain', '--untracked-files=all'])) !== '') {
+    return fail(`The branch or files in ${t.path} changed while the check ran, so nothing landed. Commit the changes and run tb land again.`);
+  }
+
   if (opts.dryRun) {
     out(`Would land on ${MAIN} in ${t.mainCheckout}:`);
     out(commits);
@@ -349,7 +432,7 @@ export async function land(t: LandTarget, opts: LandOptions = {}): Promise<numbe
 
   // 4. Fast-forward main where it's checked out.
   const before = await gitOut(t.mainCheckout, ['rev-parse', MAIN]);
-  const merge = await git(t.mainCheckout, ['merge', '--ff-only', t.branch]);
+  const merge = await git(t.mainCheckout, ['merge', '--ff-only', checked]);
   if (!merge.ok) {
     const text = merge.stderr + merge.stdout;
     const files = overwrittenFiles(text);
@@ -389,7 +472,8 @@ export function overwrittenFiles(text: string): string[] {
 // where a test runner says what failed).
 function runCheck(command: string, cwd: string, shell = ['/bin/sh', '-c']): Promise<{ ok: boolean; code?: number; text: string; durationMs: number }> {
   const started = Date.now();
-  const [bin, ...args] = shell;
+  // At background priority: a land's check is the full quick suite.
+  const [bin, args] = inBackground(shell[0], [...shell.slice(1), command]);
   const keep = 256 * 1024;
   return new Promise((resolve) => {
     let text = '';
@@ -397,7 +481,7 @@ function runCheck(command: string, cwd: string, shell = ['/bin/sh', '-c']): Prom
       text += b.toString('utf8');
       if (text.length > keep * 2) text = text.slice(-keep);
     };
-    const child = spawn(bin, [...args, command], { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(bin, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', take);
     child.stderr.on('data', take);
     child.on('error', (e) => resolve({ ok: false, text: `${text}\n${e.message}`, durationMs: Date.now() - started }));
@@ -421,19 +505,59 @@ export async function landTargetFromGit(cwd: string): Promise<{ target?: Omit<La
 
 // ------------------------------------------------------------- cleaning up
 
-export type Cleanup = { removed: true; spare?: boolean } | { removed: false; reason: string };
+// `taken`: the folder is another checkout's now (another thread's worktree,
+// a spare or a borrowed one), so it was left alone; only this thread's
+// landed branch, if it was still there, went.
+export type Cleanup = { removed: true; spare?: boolean; taken?: boolean } | { removed: false; reason: string };
+
+// Whether a worktree the record still has is gone: its branch has, and its
+// folder either has too ('gone') or is another checkout's now ('taken', a
+// reused slot). Reads only, for records that missed hearing it went.
+export async function worktreeGone(w: WorktreeRecord): Promise<false | 'gone' | 'taken'> {
+  const branch = await git(w.mainCheckout, ['rev-parse', '--verify', '--quiet', `refs/heads/${w.branch}`]);
+  // 1 is "no such ref"; anything else (no repo there) proves nothing.
+  if (branch.ok || branch.code !== 1) return false;
+  if (!isDir(w.path)) return 'gone';
+  const checkouts = await listCheckouts(w.mainCheckout);
+  if (!checkouts) return false;
+  const here = realpath(w.path);
+  return checkouts.some((c) => realpath(c.path) === here && c.branch === w.branch) ? false : 'taken';
+}
 
 // When its thread is archived or deleted: a worktree whose branch is all
 // on main is removed with its branch (`--force` only for untracked
 // files), or, with `keep` and room for another spare, set aside as one;
 // otherwise both stay, and the reason says why.
-export async function cleanUpWorktree(w: WorktreeRecord): Promise<Cleanup> {
+export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolean = () => true): Promise<Cleanup> {
+  // Checked before each change: a runner handing the thread over stops
+  // waiting for a slow git after a while, and from then the folder may be
+  // the new runner's to use, so nothing more is changed here.
+  const LET_GO: Cleanup = { removed: false, reason: 'the thread was handed to another runner' };
   let branchThere = (await git(w.mainCheckout, ['rev-parse', '--verify', '--quiet', `refs/heads/${w.branch}`])).ok;
   if (branchThere) {
     const merged = await git(w.mainCheckout, ['merge-base', '--is-ancestor', w.branch, MAIN]);
     if (!merged.ok) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
   }
+  // A record can outlive its worktree without hearing (THREADBEAR-16: a
+  // handover saved it while the cleanup ran), and slot folders are reused.
+  // So the folder is only touched if it's still this branch's checkout:
+  // otherwise it may be another thread's, and --force would take its work.
+  let ours = false;
   if (fs.existsSync(w.path)) {
+    const checkouts = await listCheckouts(w.mainCheckout);
+    if (!checkouts) return { removed: false, reason: `git couldn't list the worktrees of ${w.mainCheckout}` };
+    const here = realpath(w.path);
+    ours = checkouts.some((c) => realpath(c.path) === here && c.branch === w.branch);
+    if (!ours) {
+      if (branchThere) {
+        if (!stillOurs()) return LET_GO;
+        const del = await git(w.mainCheckout, ['branch', '-D', w.branch]);
+        if (!del.ok) return { removed: false, reason: `deleting ${w.branch} failed: ${firstLine(del.stderr)}` };
+      }
+      return { removed: true, taken: true };
+    }
+  }
+  if (ours) {
     const status = await gitOut(w.path, ['status', '--porcelain', '--untracked-files=all']);
     if (status === undefined) return { removed: false, reason: `git couldn't read ${w.path}` };
     const lines = status ? status.split('\n') : [];
@@ -441,20 +565,26 @@ export async function cleanUpWorktree(w: WorktreeRecord): Promise<Cleanup> {
     if (w.keep && (await spares(w.mainCheckout, path.dirname(w.path))).length < MAX_SPARES) {
       // Detached where it is (no files change), so the branch can go; its
       // untracked files go when the next thread takes it.
+      if (!stillOurs()) return LET_GO;
       if ((await git(w.path, ['checkout', '-q', '--detach'])).ok) {
+        if (!stillOurs()) return LET_GO;
         if (branchThere && (await git(w.mainCheckout, ['branch', '-D', w.branch])).ok) branchThere = false;
+        if (!stillOurs()) return LET_GO;
         if (!branchThere && (await git(w.mainCheckout, ['worktree', 'lock', '--reason', SPARE, w.path])).ok) return { removed: true, spare: true };
       }
       // Couldn't be set aside: removed instead, below.
     }
     const args = ['worktree', 'remove', ...(lines.length ? ['--force'] : []), w.path];
+    if (!stillOurs()) return LET_GO;
     const rm = await git(w.mainCheckout, args);
     if (!rm.ok) return { removed: false, reason: `git worktree remove failed: ${firstLine(rm.stderr)}` };
   } else {
+    if (!stillOurs()) return LET_GO;
     await git(w.mainCheckout, ['worktree', 'prune']);
   }
   // Checked above that it's all on main, so -D loses nothing.
   if (branchThere) {
+    if (!stillOurs()) return LET_GO;
     const del = await git(w.mainCheckout, ['branch', '-D', w.branch]);
     if (!del.ok) return { removed: false, reason: `the worktree went, but deleting ${w.branch} failed: ${firstLine(del.stderr)}` };
   }

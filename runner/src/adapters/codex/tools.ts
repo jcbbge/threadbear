@@ -15,7 +15,7 @@
 import { z } from 'zod';
 import type { ToolApprovalAnswer, ToolApprovalRequest } from '../types.ts';
 import type { PermissionMode } from '../../protocol.ts';
-import { ALWAYS_ASK_TOOLS, FILING_PROJECTS, guideLine, POCKET_LINE, SERVER_NAME, SHOWING_THE_USER } from '../../threadbear-mcp.ts';
+import { ALWAYS_ASK_TOOLS, FILING_PROJECTS, NEVER_ASK_TOOLS, guideLine, POCKET_LINE, SERVER_NAME, SHOWING_THE_USER } from '../../threadbear-mcp.ts';
 import { userLine } from '../../user-name.ts';
 import { CODEX_ONE_REPLY_DESCRIPTION, END_TURN_TOOL } from '../../needs.ts';
 import { toolTitle, truncateInput } from '../../tools.ts';
@@ -96,12 +96,6 @@ function text(t: string, success: boolean): DynamicToolCallResponse {
   return { contentItems: [{ type: 'inputText', text: t }], success };
 }
 
-// The threadbear tools that only read. Everything else changes something
-// (another thread, this thread's own settings, schedules), so in ask mode it
-// asks first, as Claude's tools do: otherwise an ask-mode thread could give
-// itself full access with update_thread.
-export const READ_ONLY_TOOLS = new Set(['list_threads', 'read_thread', 'list_accounts', 'list_schedules']);
-
 export type CodexToolsDeps = {
   // Codex never asks before a client-side tool, so the runner does: before
   // delete_thread always, and before any tool that changes something when
@@ -145,7 +139,7 @@ export class CodexTools {
     const args = parsed.data as Record<string, unknown>;
     const fullName = `mcp__${NAMESPACE}__${name}`;
     const alwaysAsk = ALWAYS_ASK_TOOLS.has(fullName);
-    const readOnly = READ_ONLY_TOOLS.has(name) || tool.annotations?.readOnlyHint === true;
+    const readOnly = NEVER_ASK_TOOLS.has(fullName) || tool.annotations?.readOnlyHint === true;
     const allowed = !alwaysAsk && [...this.deps.rules()].includes(fullName);
     if (alwaysAsk || (this.deps.mode() !== 'full' && !readOnly && !allowed)) {
       const ans = await this.deps.requestApproval({
@@ -162,7 +156,7 @@ export class CodexTools {
       if (ans.decision === 'allowAlways' && !alwaysAsk) this.deps.addRules([fullName]);
     }
     try {
-      const result = await tool.handler(args, {});
+      const result = await tool.handler(args, { signal: o.signal });
       const out = (result.content ?? [])
         .map((c) => (c && typeof c === 'object' && (c as { type?: string }).type === 'text' ? String((c as { text?: unknown }).text ?? '') : ''))
         .filter(Boolean)

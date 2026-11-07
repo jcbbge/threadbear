@@ -20,12 +20,20 @@ export type UsageReading = { windows: UsageWindow[]; blocked?: boolean; blockedU
 // Another runner's reading of one of its logins, from the backend's
 // accounts table (sync.ts). A subscription is one limit wherever it's
 // signed in, so the same provider and email here is the same login.
-export type SharedReading = { runnerId: string; provider: Provider; email: string; usage: AccountUsage };
+// `byOwnerKey`: the main Mac's key wrote it (convex/sync.ts sharedUsage).
+// Only those count: a runner key's reading says whatever that key likes,
+// and even one window of it could keep this runner's pools off a login
+// (Gautam's 6 Nov convex scan, F1). A backend from API 53 sends no other;
+// an older one sends everyone's unmarked, and this runner takes none.
+// No runnerId for a runner key's runner, which isn't told whose it is.
+export type SharedReading = { runnerId?: string; provider: Provider; email: string; usage: AccountUsage; byOwnerKey?: boolean };
 
 // Token Stats hasn't written limits.json for this long: its numbers are old.
 export const STALE_MS = 15 * 60_000;
 // limits.json is replaced by rename and watched; this catches a missed event.
 export const POLL_MS = 60_000;
+// The longest delay setTimeout takes (scheduleWake).
+export const MAX_TIMER_MS = 2 ** 31 - 1;
 
 const WINDOW_KINDS: readonly UsageWindowKind[] = ['five_hour', 'weekly', 'weekly_model', 'daily', 'monthly', 'allowance', 'other'];
 // Kinds an account has at most one of. The rest (per-model weeks,
@@ -159,7 +167,7 @@ export class UsageStore {
   private live = new Map<string, LiveAccount>();
   private known = new Map<string, KnownAccount>();
   private sent = new Map<string, AccountUsage | undefined>(); // last reported, per account
-  // The newest reading other runners have of each login, by provider:email.
+  // The newest reading the main Mac's key wrote of each login, by provider:email.
   private shared = new Map<string, { at: number; usage: AccountUsage }>();
   private listeners = new Set<(ids: string[]) => void>();
   private watcher?: fs.FSWatcher;
@@ -254,12 +262,12 @@ export class UsageStore {
 
   // Other runners' readings (setShared from sync.ts, with this runner's own
   // rows left out). Only the newest per login is kept, and none Token
-  // Stats called stale.
+  // Stats called stale, and none without `byOwnerKey` (SharedReading).
   setShared(rows: SharedReading[]): void {
     const next = new Map<string, { at: number; usage: AccountUsage }>();
     for (const r of rows) {
       const at = Date.parse(r.usage?.readAt ?? '');
-      if (!r.email || !Number.isFinite(at) || r.usage.stale || !Array.isArray(r.usage.windows)) continue;
+      if (r.byOwnerKey !== true || !r.email || !Number.isFinite(at) || r.usage.stale || !Array.isArray(r.usage.windows)) continue;
       const key = `${r.provider}:${r.email.toLowerCase()}`;
       const have = next.get(key);
       if (!have || at > have.at) next.set(key, { at, usage: r.usage });
@@ -418,10 +426,13 @@ export class UsageStore {
     if (this.wakeTimer && this.wakeAt === next) return;
     this.wakeTimer?.cancel();
     this.wakeAt = next;
+    // Node fires a timer over 2^31-1 ms (24.8 days) at once, so a monthly
+    // window's reset would wake this every millisecond: wake at the cap
+    // instead, which works it out again.
     this.wakeTimer = this.clock.setTimeout(() => {
       this.wakeTimer = undefined;
       this.changed(true);
-    }, next - now);
+    }, Math.min(next - now, MAX_TIMER_MS));
   }
 
   // Tells listeners which accounts' usage changed since it was last

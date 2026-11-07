@@ -1,4 +1,5 @@
 import AppKit
+import BearDock
 import SwiftUI
 import ThreadbearCore
 import UniformTypeIdentifiers
@@ -12,6 +13,8 @@ import UniformTypeIdentifiers
 struct ComposerView: View {
     @Environment(AppModel.self) private var app
     @Environment(\.colorScheme) private var colorScheme
+    /// The copy drawn while a panel is picked up in the dock.
+    @Environment(\.isDockGhost) private var isGhost
     let thread: ThreadSummary?
     /// The thread's transcript and the controller drawing it, for its open
     /// card (ComposerCard); none for a new thread.
@@ -20,11 +23,14 @@ struct ComposerView: View {
     @State private var height: CGFloat = ComposerTextField.minHeight
     @State private var importing = 0
     @State private var handle = ComposerHandle()
+    @State private var palette = PaletteState()
 
     static var cornerRadius: CGFloat { zoomed(20) }
     static var padding: CGFloat { zoomed(14) }
 
     private var draftKey: String { thread?.id ?? "new" }
+    /// Messages sent from this box, for the send arrow's nudge.
+    @State private var sends = 0
 
     var body: some View {
         // Normalized, so a picture added from outside the box (an ask's
@@ -37,7 +43,7 @@ struct ComposerView: View {
         let picks = thread.map { app.picks(for: $0) } ?? [:]
         // So are follow-ups ticked on a done card.
         let followUps = thread.map { app.pickedFollowUps(threadId: $0.id) } ?? FollowUpPicks()
-        let canSend = !picks.isEmpty || !followUps.isEmpty || ComposerChips.canSend(text: draft.wrappedValue.text, imageCount: draft.wrappedValue.images.count)
+        let canSend = Self.canSend(draft.wrappedValue, picks: picks, followUps: followUps)
         // A new thread on its way: what was sent stays, greyed and locked,
         // until the runner has made the thread.
         let creating = thread == nil && app.creatingThread
@@ -47,6 +53,13 @@ struct ComposerView: View {
         let needsYou = cardRow.map { row in if case .asks(let card) = row.content { !card.isDone } else { false } } ?? false
         let cardCollapsed = needsYou && thread.map { app.collapsedCards[$0.id] == cardRow?.seq } == true
         VStack(alignment: .leading, spacing: 0) {
+        if let thread {
+            RefusalOffer(thread: thread)
+        }
+        // Voice mode's bear, over the box while it's on for this thread.
+        if VoiceMode.shared.isOn(for: thread?.id ?? VoiceMode.newThread) {
+            VoiceStage(threadId: thread?.id ?? VoiceMode.newThread)
+        }
         // The folder's actions (patches), on shelves sitting on the box's
         // top edge, in from its rounded corner (ActionChips).
         if let thread, !thread.actions.isEmpty || thread.patches.contains(where: { $0.untrusted != nil }) {
@@ -87,10 +100,11 @@ struct ComposerView: View {
                 focusTrigger: app.focusRequests[draftKey] ?? 0,
                 placeholder: placeholder(picks, followUps: followUps, needsYou: needsYou),
                 onSend: { send() },
-                onReturnWhenEmpty: { returnWhenEmpty(draft.wrappedValue) },
+                onReturnWhenEmpty: { command in returnWhenEmpty(draft.wrappedValue, command: command) },
                 pictures: ComposerTextView.Pictures(allowed: { picturesAllowed() }, importOne: { await importPicture($0) }),
                 handle: handle,
                 onEscape: { cancelEdit() },
+                onPaletteKey: { paletteKey($0, text: draft.wrappedValue.text) },
                 editable: !creating
             )
             .frame(height: height)
@@ -104,10 +118,39 @@ struct ComposerView: View {
                 onSend: { send() },
                 onSchedule: { app.newSchedule(from: thread, draftKey: draftKey) }
             )
+            .environment(\.sendNudges, sends)
         }
         .padding(Self.padding)
         }
-        .background { card(attention: needsYou) }
+        .background {
+            ZStack {
+                card(attention: needsYou)
+                ComposerDropArea(handle: handle)
+            }
+        }
+        // The transcript above is drop space for this box too.
+        // Not the dock's ghost of the panel: its box goes when the ghost
+        // does, and the transcript would have turned drops away after a
+        // panel was picked up (Codex's review, 6 Nov).
+        .onAppear { if !isGhost { controller?.composerHandle = handle } }
+        }
+        // The slash command palette, in a panel of its own just above the
+        // box (SlashPalettePanel): drawn here it was cut off at the pane.
+        .overlay(alignment: .top) {
+            SlashPaletteHost(
+                content: paletteContent(draft),
+                autoHeight: paletteHeight,
+                layout: Binding(get: { app.slashPaletteLayout }, set: { app.slashPaletteLayout = $0 })
+            )
+            .frame(height: 1)
+        }
+        .task(id: thread.flatMap { paletteQuery(draft.wrappedValue.text) != nil ? $0.id : nil }) {
+            if let thread, paletteQuery(draft.wrappedValue.text) != nil { app.loadSlashCommands(thread.id) }
+        }
+        // Esc closed the palette at that text only: any change reopens it,
+        // even back to the same words later.
+        .onChange(of: draft.wrappedValue.text) { _, text in
+            if palette.closedAt != nil, palette.closedAt != text { palette.closedAt = nil }
         }
         // The transcript's reading column: 780 wide at most at 100%,
         // centred, with the same side insets once the window is narrower.
@@ -132,8 +175,95 @@ struct ComposerView: View {
             .fill(dark ? Color.primary.opacity(0.085) : Color.white)
             .shadow(color: .black.opacity(dark ? 0 : 0.08), radius: zoomed(14), y: zoomed(4))
             .overlay(shape.strokeBorder(attention ? Color(nsColor: .controlAccentColor) : Color(nsColor: .separatorColor), lineWidth: attention ? 1 : 0.5))
+            // Fades up with a card settling in, rather than snapping on. Not
+            // going to a thread that's waiting already: this box is reused
+            // from thread to thread, and those change over at once.
+            .animation(session?.arrivingCard != nil ? .easeOut(duration: 0.2) : nil, value: attention)
             .contentShape(shape)
             .onTapGesture { app.focusComposer(draftKey) }
+    }
+
+    /// What's typed while the palette is open: the command so far. Not
+    /// in a new thread (it has no CLI yet), and not once Esc closed it at
+    /// this text.
+    private func paletteQuery(_ text: String) -> String? {
+        guard thread != nil, palette.closedAt != text else { return nil }
+        return SlashPalette.query(in: text)
+    }
+
+    /// About half the window: read when the palette draws, which it does
+    /// with each key, so a resized window is caught on the next one.
+    /// One he dragged it to, kept to what this window has room for.
+    private var paletteHeight: CGFloat {
+        let window = paletteWindow.height
+        if let chosen = app.slashPaletteLayout.height { return SlashPalette.Layout.height(chosen, window: window) }
+        return SlashPalette.height(window: window, least: zoomed(300), most: zoomed(560))
+    }
+
+    private var paletteWindow: CGSize {
+        handle.textView?.window?.contentLayoutRect.size ?? NSApp.keyWindow?.contentLayoutRect.size ?? CGSize(width: 1200, height: 800)
+    }
+
+    /// The palette for what's typed, or nil when it's closed.
+    private func paletteContent(_ draft: Binding<Draft>) -> SlashPaletteView? {
+        guard let thread, let query = paletteQuery(draft.wrappedValue.text) else { return nil }
+        return SlashPaletteView(
+            commands: app.slashCommands[thread.id],
+            query: query,
+            provider: thread.provider,
+            recent: app.recentSlashCommands,
+            state: $palette,
+            current: paletteCurrent(thread),
+            onFill: { pick($0, run: false) },
+            onRun: { pick($0, run: true) },
+            // Another Mac's runner found the file there, not here.
+            onOpen: app.runnerName(of: thread) == nil ? { path in
+                palette.closedAt = draft.wrappedValue.text
+                app.preview(path: path, in: thread)
+            } : nil,
+            layout: Binding(get: { app.slashPaletteLayout }, set: { app.slashPaletteLayout = $0 })
+        )
+    }
+
+    /// What /model and /effort would change, as the thread has it now.
+    private func paletteCurrent(_ thread: ThreadSummary) -> [String: String] {
+        var out: [String: String] = [:]
+        let account = app.logins(for: thread)?.account(thread.accountId)
+        if let model = thread.model ?? thread.modelInUse ?? account?.defaultModel {
+            out["model"] = ComposerChips.modelTitle(model, choices: account?.models ?? []) + (thread.model == nil ? ", the default" : "")
+        }
+        if let level = thread.effort ?? thread.effortInUse {
+            out["effort"] = ComposerChips.effortTitle(level) + (thread.effort == nil ? ", the model's own" : "")
+        }
+        return out
+    }
+
+    /// Arrows, Tab, Return and Esc while the palette is open. False lets
+    /// the box have the key as usual.
+    private func paletteKey(_ key: PaletteKey, text: String) -> Bool {
+        guard let thread, let query = paletteQuery(text) else { return false }
+        let matches = SlashPalette.matches(app.slashCommands[thread.id] ?? [], query: query, category: palette.category, recent: app.recentSlashCommands)
+        // Return with nothing to pick sends what's typed, as words.
+        if key == .enter, matches.isEmpty { return false }
+        if let (command, run) = SlashPaletteView.handle(key, matches: matches, state: &palette, text: text) {
+            pick(command, run: run)
+        }
+        return true
+    }
+
+    /// Puts the command in the box: to send now, or with a space after it
+    /// for its arguments. Through the text view, so it's one undo.
+    private func pick(_ command: SlashCommand, run: Bool) {
+        app.recentSlashCommands = SlashPalette.used(command.name, recent: app.recentSlashCommands)
+        palette = PaletteState()
+        let text = SlashPalette.fill(command, forArguments: !run)
+        if let textView = handle.textView {
+            textView.insertText(text, replacementRange: NSRange(location: 0, length: (textView.string as NSString).length))
+            textView.window?.makeFirstResponder(textView)
+        } else {
+            app.drafts[draftKey, default: Draft()].text = text
+        }
+        if run { send() }
     }
 
     /// Esc while editing a message leaves the edit.
@@ -155,18 +285,32 @@ struct ComposerView: View {
     /// AppModel empties the box, and puts the draft back if it isn't sent.
     /// Picked answers go with it.
     private func send() {
+        // Return in an empty box comes here too, with nothing to go.
+        if Self.canSend((app.drafts[draftKey] ?? Draft()).normalized,
+                        picks: thread.map { app.picks(for: $0) } ?? [:],
+                        followUps: thread.map { app.pickedFollowUps(threadId: $0.id) } ?? FollowUpPicks()) {
+            sends &+= 1
+        }
         app.send(threadId: thread?.id)
     }
 
-    /// Return with nothing typed sends picked answers on their own, or
-    /// else allows the sole approval (below).
-    private func returnWhenEmpty(_ draft: Draft) -> Bool {
+    private static func canSend(_ draft: Draft, picks: [Int: Int], followUps: FollowUpPicks) -> Bool {
+        !picks.isEmpty || !followUps.isEmpty || ComposerChips.canSend(text: draft.text, imageCount: draft.images.count)
+    }
+
+    /// Return with nothing typed sends picked answers on their own (once
+    /// every ask has one, or with ⌘), or else allows the sole approval (below).
+    private func returnWhenEmpty(_ draft: Draft, command: Bool) -> Bool {
         // An edit with only pictures left still sends; an empty one does nothing.
         if let thread, app.editing[thread.id] != nil {
             if !draft.images.isEmpty { send() }
             return true
         }
         if let thread, !app.picks(for: thread).isEmpty || !app.pickedFollowUps(threadId: thread.id).isEmpty {
+            // Picks with asks still unanswered: on to the next of those, as
+            // in a Something else box; ⌘Return sends them as they are.
+            if !app.picks(for: thread).isEmpty, !command,
+               controller?.returnWithUnanswered() == true { return true }
             send()
             return true
         }
@@ -182,6 +326,10 @@ struct ComposerView: View {
         let session = app.session(for: thread.id)
         let pending = session.model.pendingApprovalIds
         guard pending.count == 1, let id = pending.first else { return false }
+        // Another runner asking for a thread is started only by a click on
+        // its card, after reading it: a card that lands as Mike presses
+        // Return in an empty box mustn't start what he never saw.
+        if case .approval(let item)? = session.model.item(id: "ap:" + id)?.content, item.isStartRequest { return false }
         session.respond(approvalId: id, decision: .allow, answers: nil, message: nil)
         return true
     }
@@ -360,9 +508,110 @@ private struct AsyncThumbnail: View {
 }
 
 /// The composer's text view, for the "+" button and the strip's remove
-/// buttons, which work on the words where the cursor is.
+/// buttons, which work on the words where the cursor is, and for a file
+/// dropped on the thread around it (`ComposerDropView`).
 final class ComposerHandle {
     weak var textView: ComposerTextView?
+}
+
+/// Takes files dragged onto it and hands them to the composer, so the whole
+/// thread is somewhere to drop a picture and not only the box you type in
+/// (Jamie Turner, 6 Nov). It has to be AppKit: the file behind a screenshot's
+/// floating thumbnail only lasts until the drop ends, and SwiftUI's drop
+/// handlers give it back after that (DroppedFiles).
+class ComposerDropView: NSView {
+    /// The composer's, once there is one.
+    var handle: ComposerHandle? { nil }
+    /// Whether to mark the whole view while a file is over it.
+    var marksDrop: Bool { false }
+    private var mark: NSView?
+
+    /// The composer, while it's on screen in this window. A sub-agent's
+    /// transcript has none, and goes back to turning drops away.
+    private var composer: ComposerTextView? {
+        guard let view = handle?.textView, view.window === window, !view.isHiddenOrHasHiddenAncestor else { return nil }
+        return view
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let takes = composer?.takesDropFromThread(sender) == true
+        showMark(takes)
+        return takes ? .copy : []
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        composer?.takesDropFromThread(sender) == true ? .copy : []
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) { showMark(false) }
+    override func draggingEnded(_ sender: NSDraggingInfo) { showMark(false) }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        showMark(false)
+        return composer?.takeDropFromThread(sender) == true
+    }
+
+    private func showMark(_ show: Bool) {
+        guard marksDrop else { return }
+        guard show else {
+            mark?.removeFromSuperview()
+            mark = nil
+            return
+        }
+        guard mark == nil else { return }
+        // Added now, not kept, so it's above whatever the view holds by then.
+        // Near the edges, clear of the messages' text.
+        let view = DropMark(frame: bounds.insetBy(dx: 8, dy: 8))
+        view.autoresizingMask = [.width, .height]
+        addSubview(view)
+        mark = view
+    }
+}
+
+/// The outline over a thread while a file is dragged over it.
+private final class DropMark: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been used") }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    // Colours resolve here, so the mark follows light and dark mode.
+    override func updateLayer() {
+        guard let layer else { return }
+        layer.cornerRadius = zoomed(12)
+        layer.borderWidth = 2
+        layer.borderColor = NSColor.controlAccentColor.cgColor
+        layer.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.06).cgColor
+    }
+
+    /// Only ever a picture: clicks and the drag itself go to what's under it.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// The composer's card around the box: its padding and controls row are part
+/// of the same target as the words.
+private struct ComposerDropArea: NSViewRepresentable {
+    let handle: ComposerHandle
+
+    final class Area: ComposerDropView {
+        var composerHandle: ComposerHandle?
+        override var handle: ComposerHandle? { composerHandle }
+    }
+
+    func makeNSView(context: Context) -> Area {
+        let view = Area()
+        view.registerForDraggedTypes(ComposerTextView.droppedTypes)
+        view.composerHandle = handle
+        return view
+    }
+
+    func updateNSView(_ view: Area, context: Context) {
+        view.composerHandle = handle
+    }
 }
 
 /// NSTextView-backed field that grows with its text: two lines at least,
@@ -376,11 +625,13 @@ struct ComposerTextField: NSViewRepresentable {
     var placeholder: String
     var onSend: () -> Void
     /// Return with nothing typed: true if it did something.
-    var onReturnWhenEmpty: () -> Bool = { false }
+    var onReturnWhenEmpty: (_ command: Bool) -> Bool = { _ in false }
     var pictures: ComposerTextView.Pictures?
     var handle: ComposerHandle?
     /// Esc: true if it did something (left an edit).
     var onEscape: () -> Bool = { false }
+    /// The slash command palette's keys, first: true if it took the key.
+    var onPaletteKey: (PaletteKey) -> Bool = { _ in false }
     /// False while what's in it is being sent (a new thread being made).
     var editable = true
 
@@ -456,6 +707,7 @@ struct ComposerTextField: NSViewRepresentable {
         textView.onReturnWhenEmpty = onReturnWhenEmpty
         textView.pictures = pictures
         textView.onEscape = onEscape
+        textView.onPaletteKey = onPaletteKey
         textView.placeholder = placeholder
         handle?.textView = textView
         if textView.isEditable != editable { textView.isEditable = editable }
@@ -529,7 +781,13 @@ final class ComposerTextView: NSTextView {
     /// composer: lookups for the composer skip it.
     var inAnswerBox = false
     var onSend: (() -> Void)?
-    var onReturnWhenEmpty: (() -> Bool)?
+    /// With whether ⌘ was held.
+    var onReturnWhenEmpty: ((_ command: Bool) -> Bool)?
+    /// An answer box's Return, with whether ⌘ was held, in place of
+    /// `onSend` and `onReturnWhenEmpty`: there Return goes on to the next
+    /// unanswered ask and only ⌘Return always sends (AskAnswerBox).
+    var onAnswerReturn: ((_ command: Bool) -> Void)?
+    var onPaletteKey: ((PaletteKey) -> Bool)?
     var onEscape: (() -> Bool)?
     /// Pictures pasted or dropped in an ask's box, which keeps them beside
     /// its words (AskAnswerBox). The composer sets `pictures` instead.
@@ -544,7 +802,7 @@ final class ComposerTextView: NSTextView {
 
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
         super.init(frame: frameRect, textContainer: container)
-        registerForDraggedTypes([.fileURL, .png, .tiff])
+        registerForDraggedTypes(Self.droppedTypes)
     }
 
     /// Builds its own TextKit 1 stack. `init(frame:textContainer: nil)` makes
@@ -691,11 +949,14 @@ final class ComposerTextView: NSTextView {
 
     override func keyDown(with event: NSEvent) {
         hoverChip(nil)
+        if !hasMarkedText(), let key = Self.paletteKey(event), onPaletteKey?(key) == true { return }
         let isReturn = event.keyCode == 36 || event.keyCode == 76
         if isReturn, !hasMarkedText() {
             if event.modifierFlags.contains(.shift) || event.modifierFlags.contains(.option) {
                 insertLineContinuingList()
-            } else if string.isEmpty, onReturnWhenEmpty?() == true {
+            } else if let onAnswerReturn {
+                onAnswerReturn(event.modifierFlags.contains(.command))
+            } else if string.isEmpty, onReturnWhenEmpty?(event.modifierFlags.contains(.command)) == true {
                 // Allowed the waiting approval.
             } else {
                 onSend?()
@@ -703,6 +964,20 @@ final class ComposerTextView: NSTextView {
             return
         }
         super.keyDown(with: event)
+    }
+
+    /// The palette's keys, bare (Shift-Return is still a new line).
+    static func paletteKey(_ event: NSEvent) -> PaletteKey? {
+        let mods = event.modifierFlags.intersection([.shift, .option, .command, .control])
+        guard mods.isEmpty else { return nil }
+        switch event.keyCode {
+        case 126: return .up
+        case 125: return .down
+        case 48: return .tab
+        case 36, 76: return .enter
+        case 53: return .escape
+        default: return nil
+        }
     }
 
     /// A new line that carries on a markdown list ("2. " after "1. foo"),
@@ -746,7 +1021,47 @@ final class ComposerTextView: NSTextView {
         // Where it's dropped, as a paste goes where the cursor is.
         let at = characterIndexForInsertion(at: convert(sender.draggingLocation, from: nil))
         if takeImages(from: sender.draggingPasteboard, at: NSRange(location: at, length: 0)) { return true }
+        if Self.isThread(sender.draggingPasteboard) {
+            window?.makeFirstResponder(self)
+            setSelectedRange(NSRange(location: at, length: 0))
+            return takeThread(from: sender.draggingPasteboard)
+        }
         return super.performDragOperation(sender)
+    }
+
+    /// Text too, for a thread dragged out of the sidebar (ThreadDrag): its id.
+    static let droppedTypes: [NSPasteboard.PasteboardType] = [.fileURL, .png, .tiff, .string]
+
+    /// Whether a drag over the rest of the thread (`ComposerDropView`) is one
+    /// for this box: a thread from the sidebar, or files from another app.
+    /// A file being dragged from this app isn't: it's on its way out to
+    /// another app, and letting go of it back over the thread shouldn't
+    /// attach it. The box itself still takes those.
+    func takesDropFromThread(_ sender: NSDraggingInfo) -> Bool {
+        guard isEditable else { return false }
+        if Self.isThread(sender.draggingPasteboard) { return true }
+        return sender.draggingSource == nil && hasFiles(sender.draggingPasteboard)
+    }
+
+    /// One let go over the rest of the thread goes where the cursor is, as a
+    /// paste does, and the cursor stays here to carry on writing.
+    func takeDropFromThread(_ sender: NSDraggingInfo) -> Bool {
+        guard takesDropFromThread(sender) else { return false }
+        window?.makeFirstResponder(self)
+        if Self.isThread(sender.draggingPasteboard) { return takeThread(from: sender.draggingPasteboard) }
+        return takeImages(from: sender.draggingPasteboard)
+    }
+
+    /// A thread's id (or link) and nothing else, as a sidebar row's drag
+    /// carries. Words that merely contain one aren't.
+    private static func isThread(_ pasteboard: NSPasteboard) -> Bool {
+        guard let words = pasteboard.string(forType: .string) else { return false }
+        return threadReference(words) != nil
+    }
+
+    /// The thread's chip where the cursor is, as pasting its id gives.
+    private func takeThread(from pasteboard: NSPasteboard) -> Bool {
+        readSelection(from: pasteboard, type: .string)
     }
 
     private func fileURLs(_ pasteboard: NSPasteboard) -> [URL] {
@@ -766,13 +1081,28 @@ final class ComposerTextView: NSTextView {
     /// raw image data (a screenshot on the clipboard) is written to a temp
     /// PNG first. Any other file (a video, a PDF, a folder) goes in as its
     /// full path, for the agent to open where it is: nothing's copied, so
-    /// a big one costs nothing. In the composer they go in place of
-    /// `range` (the selection, for a paste).
+    /// a big one costs nothing, except one macOS is about to take back (a
+    /// floating thumbnail's), where an APFS clone keeps it for free.
+    /// In the composer they go in place of `range` (the selection, for a paste).
     func takeImages(from pasteboard: NSPasteboard, at range: NSRange? = nil) -> Bool {
-        let urls = fileURLs(pasteboard)
+        var urls = fileURLs(pasteboard)
+        // A photo copied in Photos is a file in the Photos library, which
+        // the runner isn't allowed to read, with the image itself beside it.
+        // Each of those goes in as its saved image, or its file if it has
+        // none. Anything else copied with it goes in as usual.
+        if urls.contains(where: DroppedFiles.isInPhotosLibrary) {
+            urls = (pasteboard.pasteboardItems ?? []).compactMap { item in
+                let file = item.string(forType: .fileURL).flatMap(URL.init(string:))
+                if let file, !DroppedFiles.isInPhotosLibrary(file) { return file }
+                return savedImage(item) ?? file
+            }
+        }
         if !urls.isEmpty {
-            let images = urls.filter(isImage)
-            let others = urls.filter { !isImage($0) }
+            // A screenshot's or screen recording's floating thumbnail is a
+            // temp file macOS deletes as the drop ends, so copy those now,
+            // not when the runner (or the agent) reads them.
+            let images = DroppedFiles.keepingTransient(urls.filter(isImage))
+            let others = DroppedFiles.keepingVanishing(urls.filter { !isImage($0) })
             var at = range
             if !others.isEmpty { at = insertPaths(others, replacing: range) }
             if !images.isEmpty { deliver(images, at: at) }
@@ -788,7 +1118,7 @@ final class ComposerTextView: NSTextView {
             png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:])
         }
         guard let png else { return false }
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("threadbear-paste", isDirectory: true)
+        let folder = DroppedFiles.keepFolder
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let url = folder.appendingPathComponent("pasted-\(UUID().uuidString.prefix(8)).png")
         do {
@@ -798,6 +1128,23 @@ final class ComposerTextView: NSTextView {
         } catch {
             return false
         }
+    }
+
+    /// One clipboard item's image data, saved under its file's name. The
+    /// runner takes JPEG, PNG and HEIC as they are; TIFF goes in as PNG.
+    private func savedImage(_ item: NSPasteboardItem) -> URL? {
+        let file = item.string(forType: .fileURL).flatMap(URL.init(string:))
+        let base = file?.deletingPathExtension().lastPathComponent ?? "photo"
+        for (type, ext) in [("public.jpeg", "jpeg"), ("public.heic", "heic"), ("public.png", "png")] {
+            if let data = item.data(forType: NSPasteboard.PasteboardType(type)) {
+                return DroppedFiles.save(data, named: "\(base).\(ext)")
+            }
+        }
+        if let tiff = item.data(forType: .tiff),
+           let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+            return DroppedFiles.save(png, named: "\(base).png")
+        }
+        return nil
     }
 
     /// What a dropped file that isn't a picture puts in the words: its

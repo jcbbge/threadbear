@@ -78,9 +78,9 @@ extension AppModel {
             // The default browser, found before the token was issued so the
             // name on the token matches where the link goes.
             if let browser {
-                NSWorkspace.shared.open([link], withApplicationAt: browser.url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+                OpenGate.openWeb(link, withApplicationAt: browser.url)
             } else {
-                NSWorkspace.shared.open(link)
+                OpenGate.openWeb(link)
             }
             return true
         } catch {

@@ -126,7 +126,10 @@ extension AppModel {
         guard let login = Pools.pickLogin(pool, accounts: logins.accounts, provider: provider, current: lastAccountId(provider: provider)) else { return }
         var change = ThreadUpdate(accountId: login, model: .some(model))
         if let effort = lastEfforts[provider] { change.effort = .some(effort) }
+        let moving = BusyKey.moving(threadId)
+        beginBusy(moving)
         Task {
+            defer { endBusy(moving) }
             do {
                 _ = try await client.updateThread(threadId, change)
                 threads[threadId] = try await client.updateThread(threadId, ThreadUpdate(poolId: .some(poolId)))

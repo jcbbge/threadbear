@@ -45,6 +45,10 @@ extension AppModel {
                 // did before them.
                 pools = hello.pools ?? []
                 poolsSupported = hello.pools != nil
+                experiments = hello.experiments
+                // Voice mode is an experiment: turned off in runner.json
+                // since it started, it ends here.
+                if !VoiceMode.available { VoiceMode.shared.stop() }
                 if hello.clis.isEmpty { loadClis() }
                 // Maybe a newer runner than last time.
                 highlightsUnsupported = false
@@ -67,6 +71,7 @@ extension AppModel {
                 threads = fresh
                 threadsLoaded = true
                 onThreadsLoaded?()
+                threadCountMayHaveChanged()
                 servePanelRequest()
                 loadSchedules()
                 loadRunners()
@@ -74,6 +79,7 @@ extension AppModel {
                 loadProjects()
                 loadConnectors()
                 loadSettings()
+                loadStandingInstructions()
                 // Other runners' threads come back with their own connection.
                 for session in sessions.values where session.state == .loaded && !viaDirectLink(session.threadId) {
                     await session.subscribe()
@@ -125,10 +131,16 @@ extension AppModel {
         for await notification in client.notifications {
             switch notification {
             case .threadUpdated(let thread):
+                // Another runner's thread from this Mac's runner is the
+                // relay's (a share changing there), a summary from the
+                // sidebar's table: on the direct link its own runner's
+                // fuller one is what counts, card and seqs and all.
+                if directRemoteLink, threads[thread.id]?.isRemote == true { break }
                 receive(thread)
             case .threadEvent(let threadId, let event):
                 sessions[threadId]?.receive(event)
                 if case .reviewUpdated(let review) = event.payload { receiveReview(review, threadId: threadId) }
+                if case .buttonUpdated(let button) = event.payload { ReplyButtons.shared.receive(button, threadId: threadId) }
             case .threadDeleted(let threadId):
                 forget(threadId)
             case .accountsUpdated(let list):
@@ -156,6 +168,8 @@ extension AppModel {
                 connectors = status
             case .settingsUpdated(let settings):
                 receive(settings)
+            case .standingInstructions(let instructions):
+                standingInstructions = instructions
             case .runnerNotice(let level, let message):
                 notice(level: level, message)
             case .runnerUpdates(let updates):
@@ -212,7 +226,7 @@ extension AppModel {
     }
 
     func startRunner() {
-        Task {
+        whileBusy(BusyKey.startRunner) { [self] in
             let result = await RunnerLauncher.start()
             if let failure = result { errorMessage = failure }
             try? await Task.sleep(for: .milliseconds(600))
@@ -243,9 +257,11 @@ extension AppModel {
     private func apply(_ thread: ThreadSummary) {
         let previous = threads[thread.id]
         threads[thread.id] = thread
+        threadCountMayHaveChanged()
         // The open transcript's "3 sub-agents working in the background"
         // line follows the summary, not the events.
         if previous?.background != thread.background { sessions[thread.id]?.setBackground(thread.background) }
+        if previous?.looseEnds != thread.looseEnds { sessions[thread.id]?.setLooseEnds(thread.looseEnds) }
         // The open sub-agent did something: read its transcript again.
         if let ref = subagentSelection, ref.threadId == thread.id,
            previous?.subagents.first(where: { $0.id == ref.subagentId }) != thread.subagents.first(where: { $0.id == ref.subagentId }) {
@@ -260,6 +276,14 @@ extension AppModel {
         // and that Mac's app says so there.
         if becameNeedy && !showing && notificationsEnabled && !thread.isRemote {
             Notifier.post(thread: thread)
+        }
+        // The ding for a finished thread (Settings > General >
+        // Notifications), wherever you are looking. Not another runner's,
+        // as with notifications, nor a scripted app's.
+        // Nor the thread you're talking with in Voice: its reply is being
+        // read out.
+        if notificationsEnabled, !thread.isRemote, !VoiceMode.shared.isOn(for: thread.id), let previous {
+            DingPlayer.threadChanged(from: previous.status, to: thread.status)
         }
         if showing && thread.lastSeq > thread.lastSeenSeq && thread.status != .waiting {
             scheduleMarkSeen(thread.id)

@@ -36,5 +36,11 @@ export default defineSchema({
     // only happened on 5 Nov 2026 (that way in is gone; kept so old day
     // rows still match the schema).
     legacyRegistrations: v.optional(v.number()),
+    // Why the failed ones failed, as "<status> <reason>" (Apple's status
+    // and reason, or 0 and the relay's own, like "0 timeout"): the only
+    // way to tell a relay problem (its key turned down) from a backend's
+    // (a stale token) without logging anything per install. Since 6 Nov
+    // 2026, when 65 sends in two days failed and nothing said why.
+    reasons: v.optional(v.record(v.string(), v.number())),
   }).index('by_day', ['day']),
 });

@@ -28,5 +28,12 @@ final class ClaudeSettingsTrustTests: XCTestCase {
         let info = try JSONDecoder().decode(PatchInfo.self, from: Data(json.utf8))
         XCTAssertEqual(info.source, "claude")
         XCTAssertEqual(info.helpers, ["/r/.claude/hooks/start.mjs"])
+        XCTAssertNil(info.grants)
+    }
+
+    func testWhatTheirPermissionRulesAllowDecodes() throws {
+        let json = #"{"id":"claude-settings","source":"claude","file":"/r/.claude/settings.json","untrusted":"new","hash":"aa","grants":["Allows Bash without asking (.claude/settings.json)"]}"#
+        let info = try JSONDecoder().decode(PatchInfo.self, from: Data(json.utf8))
+        XCTAssertEqual(info.grants, ["Allows Bash without asking (.claude/settings.json)"])
     }
 }

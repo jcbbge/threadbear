@@ -8,15 +8,22 @@ import UniformTypeIdentifiers
 /// it, code coloured (highlight.js through Highlightr, Xcode's colours),
 /// plain text plain, all selectable. Quick Look showed these as text
 /// nobody could select (Mike, 28 Oct). The bar's pencil switches to the
-/// raw text, editable: what's typed is saved into the file a moment
-/// after the typing stops, and when Done. The file is watched, so an
-/// agent's rewrite shows up by itself; if it lands while there are
-/// unsaved edits, a bar asks which to keep rather than losing either.
+/// raw text, editable, with line numbers: what's typed is saved into the
+/// file a moment after the typing stops, on ⌘S, and when Done. The file
+/// is watched, so an agent's rewrite shows up by itself; if it lands
+/// while there are unsaved edits, a bar asks which to keep rather than
+/// losing either.
 struct TextFileView: View {
     let url: URL
     /// Bumped by each open, so the same file opened again is read again.
     let opened: Int
     let editing: Bool
+    /// The thread whose pane it's in: its links are followed in that thread
+    /// (another Mac's copy names that Mac's files), not the selected one.
+    var threadId: String? = nil
+    /// Done didn't take (what's typed couldn't be saved): the pencil's
+    /// state goes back to editing.
+    var stayedEditing: () -> Void = {}
     /// Made on appear, once: SwiftUI runs a view's init on every update,
     /// and a controller a go would be a text view a go.
     @State private var controller: TextFileController?
@@ -64,12 +71,17 @@ struct TextFileView: View {
         .onAppear {
             guard controller == nil else { return }
             let made = TextFileController(url: url)
+            made.textView.threadId = threadId
             made.start(editing: editing, dark: colorScheme == .dark)
             controller = made
         }
         .onDisappear { controller?.stop() }
         .onChange(of: opened) { _, _ in controller?.check() }
-        .onChange(of: editing) { _, editing in controller?.setEditing(editing) }
+        .onChange(of: editing) { _, editing in
+            guard let controller else { return }
+            controller.setEditing(editing)
+            if controller.editing != editing { stayedEditing() }
+        }
         .onChange(of: colorScheme) { _, scheme in controller?.setDark(scheme == .dark) }
     }
 }
@@ -152,6 +164,10 @@ final class TextFileController: NSObject, NSTextViewDelegate {
     /// Which text was sent off to be rendered or coloured; a result for an
     /// older one is dropped.
     @ObservationIgnored private var generation = 0
+    /// Typed since the last save or load: the view holds text the file
+    /// doesn't. (Not just the view differing from the file: a cut-off
+    /// file's view has a line saying so at the end.)
+    @ObservationIgnored private var drafted = false
 
     /// The newest one, for the automation's `preview` command.
     nonisolated(unsafe) static weak var current: TextFileController?
@@ -166,6 +182,9 @@ final class TextFileController: NSObject, NSTextViewDelegate {
     static let saveDelay: DispatchTimeInterval = .milliseconds(800)
 
     var isMarkdown: Bool { PreviewRules.isMarkdown(url.path) }
+    /// A copy of another Mac's file draws no pictures from this Mac: its
+    /// `![](/path)` are that Mac's paths (MarkdownRenderer.localPictures).
+    var localPictures: Bool { !AppModel.shared.isRemoteCopy(url) }
     var language: String? { PreviewRules.codeLanguage(forPath: url.path) }
 
     init(url: URL) {
@@ -208,6 +227,11 @@ final class TextFileController: NSObject, NSTextViewDelegate {
         scroll.documentView = textView
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
+        // Line numbers, for the raw text while editing (not rendered Markdown).
+        scroll.verticalRulerView = LineNumberRuler(textView: textView)
+        scroll.hasVerticalRuler = true
+        scroll.rulersVisible = false
+        textView.onSave = { [weak self] in _ = self?.saveNow() }
     }
 
     // MARK: Lifecycle
@@ -223,12 +247,15 @@ final class TextFileController: NSObject, NSTextViewDelegate {
             return
         }
         show(document.saved, keepPlace: false)
+        // Opened again while it was being edited (Back to it, another
+        // thread and back): it takes typing again.
+        if editing { applyEditing() }
         document.watch(shown: { [weak self] in self?.shownText ?? "" }) { [weak self] change in
             self?.fileChanged(change)
         }
         // Quitting mid-edit: write what's typed before the app goes.
         terminating = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.saveNow() }
+            MainActor.assumeIsolated { _ = self?.saveNow() }
         }
     }
 
@@ -252,10 +279,10 @@ final class TextFileController: NSObject, NSTextViewDelegate {
 
     // MARK: Showing
 
-    /// What the view holds now, as the file's text: the raw text while
-    /// editing, else what was loaded (a rendered view can't be typed in).
+    /// What the view holds now, as the file's text: what's typed while
+    /// there's any, else what was loaded (a rendered view can't be typed in).
     private var shownText: String {
-        editing ? textView.string : document.saved
+        editing && drafted ? textView.string : document.saved
     }
 
     /// Puts `text` in the view the way the mode wants it, keeping the
@@ -272,13 +299,14 @@ final class TextFileController: NSObject, NSTextViewDelegate {
         let storage = textView.textStorage!
         if !editing && isMarkdown {
             if text.utf8.count <= Self.renderInline {
-                storage.setAttributedString(MarkdownRenderer.render(text).string)
+                storage.setAttributedString(MarkdownRenderer.withLocalPictures(localPictures) { MarkdownRenderer.render(text).string })
                 textView.textContainerInset = NSSize(width: 14, height: 12)
             } else {
                 setPlain(text)
                 let mine = generation
+                let localPictures = localPictures
                 DispatchQueue.global(qos: .userInitiated).async {
-                    let rendered = MarkdownRenderer.render(text).string
+                    let rendered = MarkdownRenderer.withLocalPictures(localPictures) { MarkdownRenderer.render(text).string }
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
                             guard mine == self.generation else { return }
@@ -344,26 +372,42 @@ final class TextFileController: NSObject, NSTextViewDelegate {
 
     // MARK: Editing
 
+    /// Done while what's typed can't be saved (a conflict waiting, the
+    /// file unreadable) stays in editing, so the typed text is still there
+    /// for the conflict bar or another try; TextFileView puts the pencil's
+    /// state back to match.
     func setEditing(_ editing: Bool) {
         guard self.editing != editing else { return }
-        if !editing { saveNow() }
+        if !editing, !saveNow() { return }
+        // Leaving: nothing typed is waiting any more (saved, or a file that
+        // never took typing).
+        if !editing { drafted = false }
         self.editing = editing
-        if editing && !document.isEditable {
-            // Shown, but never written back: it would change what's there.
-            note = document.truncated ? "Only the start of this file is shown, so it can't be edited here."
-                : "This file isn't UTF-8 text, so it can't be edited here."
-        }
-        textView.isEditable = editing && document.isEditable
+        applyEditing()
         // Markdown changes shape; code and text only change whether they
         // take typing.
         if isMarkdown { show(document.saved, keepPlace: true) }
         if editing { textView.window?.makeFirstResponder(textView) }
     }
 
+    /// The view's side of `editing`: whether it takes typing, the line
+    /// numbers, and why a file that can't be written back can't.
+    private func applyEditing() {
+        if editing && !document.isEditable {
+            // Shown, but never written back: it would change what's there.
+            note = document.truncated ? "Only the start of this file is shown, so it can't be edited here."
+                : "This file isn't UTF-8 text, so it can't be edited here."
+        }
+        textView.isEditable = editing && document.isEditable
+        scroll.rulersVisible = editing
+    }
+
     func textDidChange(_ notification: Notification) {
         guard editing else { return }
+        drafted = true
         generation += 1
         scheduleSave()
+        scroll.verticalRulerView?.needsDisplay = true
         colourTimer?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.colour() }
         colourTimer = item
@@ -372,20 +416,63 @@ final class TextFileController: NSObject, NSTextViewDelegate {
 
     private func scheduleSave() {
         saveTimer?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.saveNow() }
+        let item = DispatchWorkItem { [weak self] in _ = self?.saveNow() }
         saveTimer = item
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.saveDelay, execute: item)
     }
 
-    /// Writes what's typed, unless a conflict is waiting on Mike.
-    func saveNow() {
+    /// Writes what's typed, unless a conflict is waiting on Mike. If the
+    /// file changed on disk since it was read (an agent's edit the watch
+    /// hasn't reported yet), it isn't written over: the conflict bar asks.
+    /// False when what's typed is still unsaved and could be lost.
+    @discardableResult
+    func saveNow() -> Bool {
         saveTimer?.cancel()
         saveTimer = nil
-        guard editing, conflict == nil, document.isEditable else { return }
+        guard editing, drafted else { return true }
+        if let fileText = conflict {
+            // Undone back to what was saved: nothing of Mike's left to keep,
+            // so the file's side wins without asking.
+            guard textView.string == document.saved else { return false }
+            useFile(fileText)
+            return true
+        }
+        // Typed, but the file can't take it now (too big, not UTF-8): it
+        // stays on screen, read only, rather than go.
+        guard document.isEditable else {
+            applyEditing()
+            note = cantSave
+            return false
+        }
+        let typed = textView.string
+        guard typed != document.saved else {
+            drafted = false
+            return true
+        }
         do {
-            try document.save(textView.string)
+            let onDisk = try document.changedOnDisk()
+            // It turned too big or not UTF-8: never written back. What's
+            // typed stays on screen, read only, to copy out.
+            guard document.isEditable else {
+                applyEditing()
+                note = cantSave
+                return false
+            }
+            if let onDisk, onDisk != typed {
+                conflict = onDisk
+                return false
+            }
+        } catch {
+            note = "Couldn't read the file to check it before saving: \(error.localizedDescription)"
+            return false
+        }
+        do {
+            try document.save(typed)
+            drafted = false
+            return true
         } catch {
             note = "Couldn't save: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -397,9 +484,14 @@ final class TextFileController: NSObject, NSTextViewDelegate {
             break
         case .reload(let text):
             conflict = nil
+            drafted = false
+            // It may have turned read only, or back.
+            applyEditing()
             show(text, keepPlace: true)
         case .conflict(let text):
             conflict = text
+            // It may have turned read only: no more typing it can't take.
+            applyEditing()
         case .gone:
             conflict = nil
             note = "This file isn't there any more."
@@ -409,14 +501,31 @@ final class TextFileController: NSObject, NSTextViewDelegate {
     /// The conflict bar's "Use the file's": the file wins.
     func useFile(_ text: String) {
         conflict = nil
+        drafted = false
         document.adopt(text)
+        // It may have become read only (too big, not UTF-8).
+        applyEditing()
         show(text, keepPlace: true)
     }
 
-    /// Its "Keep mine": what's typed is written over the file.
+    /// Its "Keep mine": what's typed is written over the file. The file's
+    /// text is taken as read first, so the save doesn't find it changed
+    /// and ask again. A file that's turned too big or not UTF-8 isn't
+    /// written: what's typed stays on screen, read only.
     func keepMine() {
+        if let onDisk = conflict { document.adopt(onDisk) }
         conflict = nil
+        guard document.isEditable else {
+            applyEditing()
+            note = cantSave
+            return
+        }
         saveNow()
+    }
+
+    private var cantSave: String {
+        (document.truncated ? "The file is now too big to edit here" : "The file is no longer UTF-8 text")
+            + ", so what you typed can't be saved into it. Copy it out, or go Back to leave it."
     }
 
     /// For the automation: types `text` at the end, as a keystroke would.
@@ -436,8 +545,29 @@ final class FileTextView: NSTextView {
 
     /// The file's folder, which relative links are from.
     var base: URL?
+    /// ⌘S while it's being edited: save now rather than after the pause.
+    var onSave: (() -> Void)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if isEditable, window?.firstResponder === self, flags == .command, event.charactersIgnoringModifiers == "s", let onSave {
+            onSave()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+    /// The thread whose pane this is in (TextFileView.threadId).
+    var threadId: String?
 
     override func clicked(onLink link: Any, at charIndex: Int) {
+        let app = AppModel.shared
+        let saved = app.linkThreadId
+        app.linkThreadId = threadId ?? saved
+        defer { app.linkThreadId = saved }
+        follow(link, at: charIndex)
+    }
+
+    private func follow(_ link: Any, at charIndex: Int) {
         let commandKey = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
         let url = (link as? URL) ?? (link as? String).flatMap(URL.init(string:))
         if let url, url.isFileURL {
@@ -446,6 +576,13 @@ final class FileTextView: NSTextView {
             let target = URL(fileURLWithPath: url.path, relativeTo: base).standardizedFileURL
             if FileManager.default.fileExists(atPath: target.path),
                MainActor.assumeIsolated({ AppModel.shared.openTranscriptFileLink(FilePathRefs.withQuery(target, query: url.query, fragment: url.fragment), commandKey: commandKey) }) { return }
+        }
+        // A web page goes to the browser as AppKit does; any other scheme
+        // (a file's `[Continue](x-apple.systempreferences:...)`) through
+        // OpenGate, which asks first (Codex review, 7 Nov).
+        guard let url, LinkPolicy.web(url) != nil else {
+            if let url, url.scheme != nil { MainActor.assumeIsolated { _ = OpenGate.openLink(url) } } else { NSSound.beep() }
+            return
         }
         super.clicked(onLink: link, at: charIndex)
     }

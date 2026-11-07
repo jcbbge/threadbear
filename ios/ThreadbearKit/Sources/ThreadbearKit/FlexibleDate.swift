@@ -12,7 +12,11 @@ public struct FlexibleDate: Codable, Sendable, Hashable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()
         if let ms = try? c.decode(Double.self) {
-            wrappedValue = Date(timeIntervalSince1970: ms / 1000)
+            // Held to JavaScript's own dates (±8.64e15 ms): a runner writes
+            // these, and 1e300 made "5m ago" trap in Int(_:). Held rather
+            // than refused, as one thread's bad date mustn't empty the inbox.
+            guard ms.isFinite else { throw DecodingError.dataCorruptedError(in: c, debugDescription: "Not a date: \(ms)") }
+            wrappedValue = Date(timeIntervalSince1970: min(max(ms, -8.64e15), 8.64e15) / 1000)
         } else {
             let text = try c.decode(String.self)
             guard let date = ISODate.parse(text) else {

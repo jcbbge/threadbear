@@ -31,7 +31,10 @@ if [[ -n "${THREADBEAR_SCRATCH_PATH:-}" ]]; then
   SCRATCH_ARGS=(--scratch-path "$THREADBEAR_SCRATCH_PATH")
 fi
 echo "Building Threadbear ($BUILD_CONFIGURATION)..."
-swift build --package-path "$SCRIPT_DIR" ${SCRATCH_ARGS[@]+"${SCRATCH_ARGS[@]}"} -c "$BUILD_CONFIGURATION" --product Threadbear
+# Every dependency is a public download: never ask the keychain for GitHub
+# credentials (a background or scripted setup can't answer that prompt, and
+# SwiftPM then fails with "status -128").
+swift build --disable-keychain --package-path "$SCRIPT_DIR" ${SCRATCH_ARGS[@]+"${SCRATCH_ARGS[@]}"} -c "$BUILD_CONFIGURATION" --product Threadbear
 BIN_DIR="$(swift build --package-path "$SCRIPT_DIR" ${SCRATCH_ARGS[@]+"${SCRATCH_ARGS[@]}"} -c "$BUILD_CONFIGURATION" --show-bin-path)"
 BINARY="$BIN_DIR/Threadbear"
 if [[ ! -x "$BINARY" ]]; then

@@ -81,15 +81,11 @@ export class FolderCache {
     });
   }
 
-  // A small text file (a .env); undefined when it can't be read.
+  // A small text file (a .env); undefined when it can't be read, or is
+  // over MAX_TEXT_BYTES. These are a cloned repo's files, read again every
+  // few seconds, so a huge one is left out rather than read whole.
   text(file: string): string | undefined {
-    return this.cached(this.texts, file, () => {
-      try {
-        return fs.readFileSync(file, 'utf8');
-      } catch {
-        return undefined;
-      }
-    });
+    return this.cached(this.texts, file, () => readSmallSync(file));
   }
 
   // Lists these folders off the event loop, at most once each however many
@@ -114,12 +110,7 @@ export class FolderCache {
   async warmTexts(files: Iterable<string>): Promise<void> {
     await Promise.all(
       [...new Set(files)].map((f) =>
-        this.load(this.texts, 't:', f, () =>
-          fs.promises.readFile(f, 'utf8').then(
-            (t) => t,
-            () => undefined,
-          ),
-        ),
+        this.load(this.texts, 't:', f, () => readSmall(f)),
       ),
     );
   }
@@ -162,6 +153,46 @@ export class FolderCache {
     } finally {
       this.loading.delete(id);
     }
+  }
+}
+
+// A .env is a few hundred bytes; convex dev's is under 1 KB.
+export const MAX_TEXT_BYTES = 64 * 1024;
+
+// The file's text, or undefined when it can't be read or has more than
+// MAX_TEXT_BYTES. Reads one byte past the limit rather than trusting a
+// stat, so a file that grows in between is still caught. Opened without
+// blocking, so a FIFO named .env.local reads as empty rather than waiting
+// for a writer with the event loop held.
+const READ_FLAGS = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
+
+function readSmallSync(file: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, READ_FLAGS);
+    const buf = Buffer.alloc(MAX_TEXT_BYTES + 1);
+    let got = 0;
+    for (let n; got < buf.length && (n = fs.readSync(fd, buf, got, buf.length - got, got)) > 0; ) got += n;
+    return got > MAX_TEXT_BYTES ? undefined : buf.toString('utf8', 0, got);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+async function readSmall(file: string): Promise<string | undefined> {
+  let fh: fs.promises.FileHandle | undefined;
+  try {
+    fh = await fs.promises.open(file, READ_FLAGS);
+    const buf = Buffer.alloc(MAX_TEXT_BYTES + 1);
+    let got = 0;
+    for (let n; got < buf.length && (n = (await fh.read(buf, got, buf.length - got, got)).bytesRead) > 0; ) got += n;
+    return got > MAX_TEXT_BYTES ? undefined : buf.toString('utf8', 0, got);
+  } catch {
+    return undefined;
+  } finally {
+    await fh?.close();
   }
 }
 

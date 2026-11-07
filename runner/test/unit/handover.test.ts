@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { phoneCommands, ThreadRouter } from '../../src/handover.ts';
 import { FakeAccounts, FakeAdapter, makeHarness, testConfig, tick, type Harness } from '../helpers/fakes.ts';
 import { Runner, type Notification } from '../../src/runner.ts';
 import { ThreadStore } from '../../src/store.ts';
@@ -77,6 +78,26 @@ test('a draining runner lets idle threads go at once and keeps a busy one until 
   b.runner.send(busy.id, 'and then');
   assert.equal(b.adapter.last.opts.resume, true);
   assert.equal(b.adapter.last.opts.sessionId, s2.opts.sessionId);
+});
+
+// The old runner still answers the app on the runner's port for a few
+// seconds after letting the idle threads go, until its drain port is up.
+// Mike picked an effort then and saw "Thread not found" (7 Nov): the app
+// tries again on the new runner on these words (AppModel.turnedAwayByRestart).
+test('a thread a draining runner has let go is "handing over", not "not found", until the new runner has it', async () => {
+  const h = makeHarness();
+  const idle = create(h, 'idle one').thread;
+  h.adapter.last.init();
+  h.adapter.last.result('completed');
+  await h.runner.beginDrain([], { onHandedOver: () => {}, backgroundMs: 30 * MIN });
+  assert.equal(h.runner.has(idle.id), false);
+  const handingOver = (e: unknown) => e instanceof RpcError && e.code === ErrorCode.busy && e.message.startsWith('The runner is handing over to a new one');
+  assert.throws(() => h.runner.update({ threadId: idle.id, effort: 'high' }), handingOver);
+  assert.throws(() => h.runner.get(idle.id), handingOver);
+  assert.throws(() => h.runner.send(idle.id, 'hello'), handingOver);
+  // Without a drain, a thread that isn't there is still not found.
+  const fresh = makeHarness();
+  assert.throws(() => fresh.runner.get(idle.id), (e: unknown) => e instanceof RpcError && e.code === ErrorCode.threadNotFound);
 });
 
 test('a message queued during the turn moves across with the thread and starts on the new runner', async () => {
@@ -609,4 +630,109 @@ test('lsof is looked for only where a Mac and Linux keep it', async () => {
   assert.equal(lsofPath((f) => f === '/usr/sbin/lsof'), '/usr/sbin/lsof');
   assert.equal(lsofPath((f) => f === '/usr/bin/lsof'), '/usr/bin/lsof');
   assert.equal(lsofPath(() => false), '/usr/sbin/lsof', 'neither: fails as a missing tool, and the check refuses');
+});
+
+// From the cross-lab review of the sync fixes (Codex, 7 Nov 2026): a draining
+// runner whose socket closes is let go of before its threads are taken in, so
+// for a few seconds they were on no runner, and the mirror's prune or its
+// missing-row check could take their rows and messages for stale.
+test('Peers: the threads of a draining runner that went are arriving until they are taken in', async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, Peers } = await import('../../src/handover.ts');
+  writeDrainInfo(h.home, { pid: 424243, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-old'] });
+  let closed!: () => void;
+  const client = {
+    call: async (method: string) => (method === 'drain.hello' ? { threads: ['t-old'] } : method === 'threads.list' ? { threads: [{ id: 't-old', title: 'Old', lastActivityAt: '' }] } : {}),
+    onNotification: () => () => {},
+    waitClosed: () => new Promise<void>((r) => (closed = r)),
+    close: () => {},
+  };
+  const adopted: string[] = [];
+  let seenWhileWaiting: boolean | undefined;
+  let alive = true;
+  let gone = false;
+  const peers = new Peers({
+    home: h.home, token: 't', log: nullLogger, sweep: async () => {}, goneWaitMs: 400,
+    alive: () => {
+      if (gone && alive) seenWhileWaiting ??= peers.isArriving('t-old') && !peers.owns('t-old');
+      return alive;
+    },
+    runner: { adopt: (id) => (adopted.push(id), undefined), publish: () => {}, waitedOnDeleted: () => {} },
+    connect: async () => client as any,
+  });
+  await peers.connectAll();
+  assert.equal(peers.owns('t-old'), true);
+  gone = true;
+  closed();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(seenWhileWaiting, true, 'between the socket closing and being taken in');
+  assert.deepEqual(peers.arrivingIds(), ['t-old']);
+  alive = false;
+  await new Promise((r) => setTimeout(r, 600));
+  assert.deepEqual(adopted, ['t-old']);
+  assert.equal(peers.isArriving('t-old'), false);
+});
+
+test("Peers: a thread that can't be taken in stays arriving, and one being handed over itself stops nothing", async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, removeDrainInfo, Peers } = await import('../../src/handover.ts');
+  const make = (pid: number, threads: string[], adopt: (id: string) => void, staysUp = false) => {
+    writeDrainInfo(h.home, { pid, port: 1, version: 'old', since: new Date().toISOString(), threads });
+    let closed!: () => void;
+    let gone = false;
+    const swept: number[] = [];
+    const peers = new Peers({
+      home: h.home, token: 't', log: nullLogger, goneWaitMs: staysUp ? 400 : 50, alive: () => staysUp || !gone,
+      sweep: async (p) => void swept.push(p),
+      runner: { adopt: (id) => (adopt(id), undefined), publish: () => {}, waitedOnDeleted: () => {} },
+      connect: async () => ({
+        call: async (method: string) => (method === 'drain.hello' ? { threads } : method === 'threads.list' ? { threads: threads.map((id) => ({ id, title: id, lastActivityAt: '' })) } : {}),
+        onNotification: () => () => {},
+        waitClosed: () => new Promise<void>((r) => (closed = r)),
+        close: () => {},
+      }) as any,
+    });
+    return { peers, close: () => ((gone = true), closed()), swept };
+  };
+  const adopted: string[] = [];
+  const a = make(424250, ['bad', 'good'], (id) => {
+    if (id === 'bad') throw new Error('disk full');
+    adopted.push(id);
+  });
+  await a.peers.connectAll();
+  a.close();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.deepEqual(adopted, ['good'], 'the rest are still taken in');
+  assert.deepEqual(a.peers.arrivingIds(), ['bad']);
+  removeDrainInfo(h.home, 424250);
+
+  // Handing over itself while it waits: the draining runner isn't stopped from here.
+  const took: string[] = [];
+  const b = make(424251, ['t'], (id) => took.push(id), true);
+  await b.peers.connectAll();
+  b.close();
+  await new Promise((r) => setTimeout(r, 100));
+  b.peers.close();
+  await new Promise((r) => setTimeout(r, 700));
+  assert.deepEqual(b.swept, []);
+  assert.deepEqual(took, []);
+});
+
+// docs/protocol.md, "Who stopped it": his Stop on the phone says so; an agent's
+// interrupt_thread, which goes through the router, doesn't.
+test("only the phone's Stop counts as Mike's, not an agent's interrupt_thread", async () => {
+  const h = makeHarness();
+  const ask = () => {
+    const { thread } = h.runner.create({ text: 'go', cwd: h.cfg.defaults.cwd, accountId: 'claude-3', permissionMode: 'ask' });
+    const s = h.adapter.last;
+    s.init();
+    s.result();
+    return { id: thread.id, answer: s.sink.requestApproval({ name: 'Write', title: 'Write a', input: {}, canAlwaysAllow: false, signal: new AbortController().signal }) };
+  };
+  const phone = ask();
+  await phoneCommands(h.runner).interrupt!(phone.id);
+  assert.equal((await phone.answer).stopped, true);
+  const agent = ask();
+  await new ThreadRouter(h.runner, () => undefined).interrupt(agent.id);
+  assert.equal((await agent.answer).stopped, undefined);
 });

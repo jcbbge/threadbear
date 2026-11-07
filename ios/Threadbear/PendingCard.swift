@@ -9,9 +9,20 @@ struct PendingCard: View {
     let runnerId: String
     let pending: PendingApproval
     var onSent: (String) -> Void
-    @State private var busy = false
     @State private var chosen: [Int: Set<String>] = [:]
     @State private var typed = ""
+
+    private enum Tapped: Equatable {
+        case option(ApprovalOption)
+        case sendAnswer
+    }
+
+    /// The button that's been tapped, spinning until the card goes
+    /// (AppModel.answerCard), there still if he leaves and comes back.
+    private var tapped: Tapped? {
+        guard let choice = model.cardAnswers[pending.id]?.choice else { return nil }
+        return ApprovalOption(rawValue: choice).map(Tapped.option) ?? .sendAnswer
+    }
 
     var body: some View {
         switch pending {
@@ -41,15 +52,21 @@ struct PendingCard: View {
                 }
                 HStack {
                     ForEach(options, id: \.self) { option in
+                        let spins = tapped == .option(option)
                         Button { respond(id, option) } label: {
-                            Text(label(option)).frame(maxWidth: .infinity)
+                            Text(label(option))
+                                .frame(maxWidth: .infinity)
+                                .spinning(spins, tint: option == .allow ? .white : nil)
                         }
                         .buttonStyle(option == .allow ? AnyButtonStyle(.borderedProminent) : AnyButtonStyle(.bordered))
                         // Accent only on the one that moves things along.
                         .tint(option == .deny ? .red : option == .allow ? .accentColor : .secondary)
+                        // The tapped one keeps its colour, with the spinner in it.
+                        .disabled(tapped != nil && !spins)
+                        .accessibilityLabel(spins ? "\(label(option)), sending" : label(option))
                     }
                 }
-                .disabled(busy)
+                .allowsHitTesting(tapped == nil)
             case let .question(id, questions):
                 ForEach(Array(questions.enumerated()), id: \.offset) { index, question in
                     VStack(alignment: .leading, spacing: 8) {
@@ -61,13 +78,17 @@ struct PendingCard: View {
                 }
                 TextField("Something else", text: $typed, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
+                    .disabled(tapped != nil)
                 Button {
                     answer(id, questions)
                 } label: {
-                    Text("Send answer").frame(maxWidth: .infinity)
+                    Text("Send answer")
+                        .frame(maxWidth: .infinity)
+                        .spinning(tapped == .sendAnswer, tint: .white)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(busy || Answers.build(questions, chosen: chosen, typed: typed).isEmpty)
+                .allowsHitTesting(tapped == nil)
+                .disabled(tapped == nil && Answers.build(questions, chosen: chosen, typed: typed).isEmpty)
             case .secret, .other:
                 // A kind this build doesn't know (a secret is SecretCard's).
                 Label("Answer this on the Mac.", systemImage: "laptopcomputer")
@@ -77,6 +98,16 @@ struct PendingCard: View {
         }
         .padding()
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        // Only for taps, never a card turning up. A soft tick to say no, a light
+        // tap for what moves things along.
+        .sensoryFeedback(trigger: tapped) { _, new in
+            switch new {
+            case nil: nil
+            case .option(.deny): .selection
+            default: .impact(weight: .light)
+            }
+        }
+        .sensoryFeedback(.selection, trigger: chosen)
     }
 
     private func optionRow(index: Int, question: Question, option: Question.Option) -> some View {
@@ -94,6 +125,7 @@ struct PendingCard: View {
                 Image(systemName: isOn ? (question.multiSelect ? "checkmark.square.fill" : "largecircle.fill.circle")
                                        : (question.multiSelect ? "square" : "circle"))
                     .foregroundStyle(isOn ? Color.accentColor : .secondary)
+                    .contentTransition(.symbolEffect(.replace))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(option.label).foregroundStyle(.primary)
                     if let description = option.description {
@@ -105,6 +137,7 @@ struct PendingCard: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(tapped != nil)
     }
 
     private func label(_ option: ApprovalOption) -> String {
@@ -116,26 +149,32 @@ struct PendingCard: View {
     }
 
     private func respond(_ approvalId: String, _ decision: ApprovalOption) {
-        guard let backend = model.backend else { return }
-        busy = true
-        Task {
-            defer { busy = false }
-            do { onSent(try await backend.respond(threadId: threadId, approvalId: approvalId, decision: decision)) }
-            catch { model.report(error) }
-        }
+        let threadId = threadId
+        // ThreadView says why under the transcript if it's refused.
+        model.answerCard(approvalId, choice: decision.rawValue, send: { backend in
+            try await backend.respond(threadId: threadId, approvalId: approvalId, decision: decision)
+        }, sent: onSent)
     }
 
     private func answer(_ approvalId: String, _ questions: [Question]) {
-        guard let backend = model.backend else { return }
+        let threadId = threadId
         let answers = Answers.build(questions, chosen: chosen, typed: typed)
-        busy = true
-        Task {
-            defer { busy = false }
-            do {
-                onSent(try await backend.answer(threadId: threadId, approvalId: approvalId, answers: answers,
-                                                summary: Answers.summary(questions, answers: answers)))
-            } catch { model.report(error) }
-        }
+        let summary = Answers.summary(questions, answers: answers)
+        model.answerCard(approvalId, choice: "send", send: { backend in
+            try await backend.answer(threadId: threadId, approvalId: approvalId, answers: answers, summary: summary)
+        }, sent: onSent)
+    }
+}
+
+extension View {
+    /// A button's label with a spinner in place of its words, keeping its size.
+    func spinning(_ on: Bool, tint: Color? = nil) -> some View {
+        opacity(on ? 0 : 1)
+            .overlay {
+                if on {
+                    ProgressView().controlSize(.small).tint(tint)
+                }
+            }
     }
 }
 

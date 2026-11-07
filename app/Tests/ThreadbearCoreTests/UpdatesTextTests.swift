@@ -112,6 +112,13 @@ final class UpdatesTextTests: XCTestCase {
         XCTAssertEqual(UpdatesText.iconTooltip(app: Side(), runner: updates, clis: []), "Updates\n12 new changes from Mike")
         XCTAssertEqual(UpdatesText.upstreamLine(updates.upstream), "Mike's release of 30 Oct has 12 new changes.")
         XCTAssertTrue(UpdatesText.bringInPrompt(updates.upstream!.release!).contains("docs/bringing-in-updates.md"))
+        // The verified commit goes in the prompt, so the thread merges that
+        // and not a ref a later fetch could move (Gautam's scan, F31).
+        let sha = String(repeating: "a", count: 40)
+        let verified = RunnerUpdates.Upstream.Release(tag: "release/2026-10-30", commit: sha, changes: 2)
+        XCTAssertTrue(UpdatesText.bringInPrompt(verified).contains("Merge its commit \(sha)"))
+        XCTAssertTrue(UpdatesText.discussPrompt(verified).contains(sha))
+        XCTAssertFalse(UpdatesText.bringInPrompt(updates.upstream!.release!).contains("Merge its commit"), "not an id")
         let discuss = UpdatesText.discussPrompt(updates.upstream!.release!)
         XCTAssertTrue(discuss.contains("release/2026-10-30 has 12 new changes"))
         XCTAssertTrue(discuss.contains("Don't change anything yet"))
@@ -124,6 +131,27 @@ final class UpdatesTextTests: XCTestCase {
         let mikes = try JSONDecoder().decode(RunnerUpdates.self, from: Data(#"{"state":"idle","upstream":{"state":"off","reason":"upstream is this repo","published":{"tag":"release/2026-10-30","at":"x"}}}"#.utf8))
         XCTAssertEqual(UpdatesText.upstreamLine(mikes.upstream), "Your last release for everyone else is release/2026-10-30.")
         XCTAssertFalse(UpdatesText.needsYou(app: Side(), runner: mikes))
+        // Unless GitHub's checks are holding today's back: then it says why.
+        let held = try JSONDecoder().decode(RunnerUpdates.self, from: Data(#"{"state":"idle","upstream":{"state":"off","published":{"tag":"release/2026-10-30","at":"x"},"held":{"commit":"abc","why":"\"Builds on Xcode 26\" didn't pass on it","at":"x"}}}"#.utf8))
+        XCTAssertEqual(UpdatesText.upstreamLine(held.upstream), #"Your next release for everyone else is waiting: "Builds on Xcode 26" didn't pass on it."#)
         XCTAssertNil(UpdatesText.upstreamLine(nil))
+    }
+
+    func testReleaseLinesPreferMikesNotes() throws {
+        let json = #"{"tag":"release/2026-11-06","changes":40,"subjects":["Convex I/O: round 5"],"notes":[{"tag":"release/2026-11-06","lines":["Search finds goals again"]},{"tag":"release/2026-11-05","lines":["Private card for keys"]},{"tag":"x","lines":[]}]}"#
+        let r = try JSONDecoder().decode(RunnerUpdates.Upstream.Release.self, from: Data(json.utf8))
+        XCTAssertEqual(r.notes.count, 2, "a release with no lines is dropped")
+        let groups = UpdatesText.releaseLines(r)
+        XCTAssertEqual(groups.map(\.heading), ["6 Nov", "5 Nov"])
+        XCTAssertEqual(groups.map(\.lines), [["Search finds goals again"], ["Private card for keys"]])
+        let one = RunnerUpdates.Upstream.Release(tag: "release/2026-11-06", changes: 3, subjects: ["a"], notes: [.init(tag: "release/2026-11-06", lines: ["b"])])
+        XCTAssertNil(UpdatesText.releaseLines(one)[0].heading)
+        let older = RunnerUpdates.Upstream.Release(tag: "release/2026-11-07", changes: 3, subjects: ["new work"], notes: one.notes)
+        XCTAssertEqual(UpdatesText.releaseLines(older)[0].heading, "6 Nov")
+        XCTAssertEqual(UpdatesText.releaseLines(older).last?.lines, ["new work"])
+        let odd = RunnerUpdates.Upstream.Release(tag: "release/2026-13-01", changes: 3, notes: [.init(tag: "release/2026-13-01", lines: ["one"]), .init(tag: "release/2026-11-06", lines: ["two"])])
+        XCTAssertEqual(UpdatesText.releaseLines(odd)[0].heading, "release/2026-13-01")
+        let old = RunnerUpdates.Upstream.Release(tag: "release/2026-11-01", changes: 9, subjects: (1...9).map(String.init))
+        XCTAssertEqual(UpdatesText.releaseLines(old).first?.lines, ["1", "2", "3", "4", "5"], "older tags: the first subjects")
     }
 }

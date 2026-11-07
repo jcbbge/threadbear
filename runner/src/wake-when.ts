@@ -5,6 +5,9 @@
 // ordinary snoozedUntil; a topic is the librarian's to notice, in the next
 // thread Mike talks about it in (librarian.ts).
 
+import { trimEndOfOrSpace } from './linear-text.ts';
+import { cutSafely, safeEnd } from './safe-cut.ts';
+
 export type WakeWhen = {
   // What Mike typed.
   said: string;
@@ -55,8 +58,8 @@ export function wakePrompt(input: WakeInput): string {
 export function readWakeAnswer(text: string, now: number): WakeAnswer | { error: string } {
   const obj = parseObject(text);
   if (!obj) return { error: "The model's answer wasn't JSON." };
-  const why = typeof obj.why === 'string' ? obj.why.trim().slice(0, 200) : '';
-  const topic = typeof obj.topic === 'string' && obj.topic.trim() ? obj.topic.trim().replace(/[.\s]+$/, '').slice(0, TOPIC_MAX) : undefined;
+  const why = typeof obj.why === 'string' ? cutSafely(obj.why.trim(), 200) : '';
+  const topic = typeof obj.topic === 'string' && obj.topic.trim() ? cutSafely(trimEndOfOrSpace(obj.topic.trim(), '.'), TOPIC_MAX) : undefined;
   let until: string | undefined;
   if (typeof obj.until === 'string' && obj.until.trim()) {
     const t = Date.parse(obj.until);
@@ -103,7 +106,7 @@ export function localWhen(t: number, timeZone: string): string {
   return `${day}, ${time}`;
 }
 
-const cut = (t: string, n: number) => (t.length > n ? t.slice(0, n) + '…' : t);
+const cut = (t: string, n: number) => (t.length > n ? t.slice(0, safeEnd(t, n)) + '…' : t);
 
 function parseObject(text: string): Record<string, unknown> | undefined {
   const t = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');

@@ -2,6 +2,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import type { Duplex } from 'node:stream';
+import { awakeTimeout, type AwakeTimer } from './awake-timer.ts';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Runner, Notification, CliControl } from './runner.ts';
 import type { Logger } from './log.ts';
@@ -10,6 +11,7 @@ import type { ArchiveVerdict, ApprovalDecision, AskAnswer, CliPolicy, EffortLeve
 import { MAX_BYLINE } from './needs.ts';
 import { isMoved, mergeSummaries, type Bucket } from './handover.ts';
 import { AUTH_VERSION, authProof, isNonce, newNonce, proofMatches, type AuthChannel } from './rpc-auth.ts';
+import { cutSafely } from './safe-cut.ts';
 
 type Conn = {
   id: number;
@@ -17,8 +19,12 @@ type Conn = {
   authed: boolean;
   subs: Set<string>;
   client?: string;
+  // hello's version and pid, and when it connected, for the log.
+  clientVersion?: string;
+  clientPid?: number;
+  since: number;
   browserPanel?: boolean;
-  authTimer?: NodeJS.Timeout;
+  authTimer?: AwakeTimer;
   // This connection's auth.challenge nonce (docs/protocol.md, "Auth").
   challenge?: string;
 };
@@ -52,6 +58,8 @@ const THREAD_METHODS = new Set([
   'reviews.save',
   'reviews.respond',
   'reviews.cancel',
+  'buttons.list',
+  'buttons.press',
   'threads.send',
   'threads.edit',
   'threads.interrupt',
@@ -59,8 +67,10 @@ const THREAD_METHODS = new Set([
   'threads.delete',
   'threads.events',
   'threads.subscribe',
+  'threads.heldBody',
   'threads.markSeen',
   'threads.highlights',
+  'threads.commands',
   'threads.explain',
   'threads.hibernateWhen',
   'threads.removeHighlight',
@@ -69,12 +79,15 @@ const THREAD_METHODS = new Set([
   'threads.tickAsk',
   'threads.share',
   'approvals.respond',
+  'plans.approve',
   'secrets.answer',
   'panels.render',
   'panels.convexKey',
   'panels.convexDeployments',
   'panels.convexLogin',
   'actions.run',
+  'patches.trust',
+  'threads.subagent',
 ]);
 
 // Draining runners' threads, as the primary's server sees them (handover.ts
@@ -179,7 +192,7 @@ export class RpcServer {
   async close(): Promise<void> {
     this.unlisten();
     for (const c of this.conns) {
-      clearTimeout(c.authTimer);
+      c.authTimer?.clear();
       c.ws.close(1001, 'runner stopping');
     }
     // wss.close waits for every client to answer the close, and ws gives a
@@ -260,7 +273,7 @@ export class RpcServer {
   // (ws 8.x; rpc.test.ts fails if a ws update moves it).
   private unlock(conn: Conn): void {
     conn.authed = true;
-    clearTimeout(conn.authTimer);
+    conn.authTimer?.clear();
     conn.challenge = undefined;
     const receiver = (conn.ws as unknown as { _receiver?: { _maxPayload?: unknown } })._receiver;
     if (receiver && typeof receiver._maxPayload === 'number') receiver._maxPayload = MAX_PAYLOAD;
@@ -272,7 +285,7 @@ export class RpcServer {
   // client that ignores it for 30 s. It counts as waiting until it's gone,
   // so refused sockets can't pile up past the cap.
   private refuseConn(conn: Conn): void {
-    clearTimeout(conn.authTimer);
+    conn.authTimer?.clear();
     conn.ws.close(4401, 'unauthorized');
     setTimeout(() => conn.ws.terminate(), 1000).unref();
   }
@@ -285,15 +298,16 @@ export class RpcServer {
   }
 
   private onConnection(ws: WebSocket, headerAuthed: boolean): void {
-    const conn: Conn = { id: this.nextId++, ws, authed: false, subs: new Set() };
+    const conn: Conn = { id: this.nextId++, ws, authed: false, subs: new Set(), since: Date.now() };
     this.conns.add(conn);
     if (headerAuthed) {
       this.unlock(conn);
     } else {
-      conn.authTimer = setTimeout(() => {
+      // Awake time only, as in client.ts: a stalled runner mustn't drop
+      // a client whose proof is already waiting in the socket.
+      conn.authTimer = awakeTimeout(this.opts.authTimeoutMs ?? AUTH_TIMEOUT_MS, () => {
         if (!conn.authed) this.refuseConn(conn);
-      }, this.opts.authTimeoutMs ?? AUTH_TIMEOUT_MS);
-      conn.authTimer.unref();
+      });
       conn.challenge = newNonce();
       this.send(conn, { jsonrpc: '2.0', method: 'auth.challenge', params: { version: AUTH_VERSION, nonce: conn.challenge, port: this.channel().port } });
     }
@@ -306,7 +320,7 @@ export class RpcServer {
       this.onMessage(conn, data.toString());
     });
     ws.on('close', () => {
-      clearTimeout(conn.authTimer);
+      conn.authTimer?.clear();
       this.conns.delete(conn);
     });
     // A protocol error (a frame over the limit, bad UTF-8): ws closes with
@@ -314,7 +328,7 @@ export class RpcServer {
     // off now; it stays counted (against the pending cap, if it hadn't
     // authenticated) until its 'close'.
     ws.on('error', () => {
-      clearTimeout(conn.authTimer);
+      conn.authTimer?.clear();
       ws.terminate();
     });
   }
@@ -326,7 +340,10 @@ export class RpcServer {
   private write(conn: Conn, msg: string, skippable: boolean): void {
     const buffered = conn.ws.bufferedAmount;
     if (buffered > (this.opts.closeBytes ?? CLOSE_BYTES)) {
-      this.opts.log.warn('client is not reading; closing it', { conn: conn.id, client: conn.client, buffered });
+      this.opts.log.warn('client is not reading; closing it', {
+        conn: conn.id, client: conn.client ?? 'no hello', version: conn.clientVersion, pid: conn.clientPid,
+        subs: conn.subs.size, connectedSecs: Math.round((Date.now() - conn.since) / 1000), buffered,
+      });
       conn.ws.close(4408, 'too far behind');
       this.conns.delete(conn);
       return;
@@ -475,6 +492,8 @@ export class RpcServer {
         return {};
       case 'hello': {
         conn.client = optString(p, 'client');
+        conn.clientVersion = typeof p.version === 'string' ? p.version : undefined;
+        conn.clientPid = typeof p.pid === 'number' ? p.pid : undefined;
         conn.browserPanel = p.browserPanel === true;
         // Only the Mac app's own builds: a dev build has none.
         const build = p.build as Record<string, unknown> | undefined;
@@ -490,8 +509,10 @@ export class RpcServer {
         for (const x of include ?? []) {
           if (x !== 'inbox' && x !== 'snoozed' && x !== 'archived') throw bad(`unknown include value ${x}`);
         }
-        const local = r.list(include as Bucket[] | undefined);
-        const remote = this.opts.remote?.summaries((include as Bucket[] | undefined) ?? ['inbox']);
+        const ids = p.ids === undefined ? undefined : stringArray(p, 'ids');
+        const local = r.list(include as Bucket[] | undefined, ids);
+        const only = ids && new Set(ids);
+        const remote = this.opts.remote?.summaries((include as Bucket[] | undefined) ?? ['inbox']).filter((t) => !only || only.has(t.id));
         return { threads: remote?.length ? mergeSummaries(local, remote) : local };
       }
       case 'threads.search': {
@@ -524,6 +545,9 @@ export class RpcServer {
           permissionMode: optMode(p),
           title: optString(p, 'title'),
           ...(p.worktree === false ? { worktree: false } : {}),
+          // Only ever narrows (a draining runner passing on a sandboxed
+          // agent's create_thread), so any client may ask for it.
+          ...(p.confined === true ? { confined: true } : {}),
           ...optStartedBy(p),
         });
         return { thread: res.thread, turnId: res.turnId };
@@ -542,12 +566,17 @@ export class RpcServer {
         return r.respondReview(reqString(p, 'threadId'), reqString(p, 'reviewId'), p.revision as number, p.draft as Parameters<Runner['respondReview']>[3]);
       case 'reviews.cancel':
         return r.cancelReview(reqString(p, 'threadId'), reqString(p, 'reviewId'), p.revision as number);
+      case 'buttons.list':
+        return r.listButtons(reqString(p, 'threadId'));
+      case 'buttons.press':
+        return r.pressButton(reqString(p, 'threadId'), reqString(p, 'buttonId'));
       case 'threads.send':
         return r.send(reqString(p, 'threadId'), optString(p, 'text') ?? '', optImages(p) ?? [], { ...optAnswers(p), ...optPhoneOrigin(p) });
       case 'threads.edit':
         return r.editMessage(reqString(p, 'threadId'), reqNumber(p, 'seq'), optString(p, 'text') ?? '', optImages(p) ?? [], { stopBackground: p.stopBackground === true });
       case 'threads.interrupt':
-        return r.interrupt(reqString(p, 'threadId'));
+        // Sent on for an agent's interrupt_thread (handover.ts), it isn't his Stop.
+        return r.interrupt(reqString(p, 'threadId'), { byMike: p.byAgent !== true });
       case 'threads.update': {
         const upd: Parameters<Runner['update']>[0] = { threadId: reqString(p, 'threadId') };
         if (p.title !== undefined) upd.title = reqString(p, 'title');
@@ -557,6 +586,10 @@ export class RpcServer {
         }
         if (p.cwd !== undefined) upd.cwd = reqString(p, 'cwd');
         if (p.accountId !== undefined) upd.accountId = reqString(p, 'accountId');
+        // From a client with the runner's token (the app, tb): its move may
+        // take a thread out of a sandbox, unless it says it mayn't (a
+        // draining runner passing on an agent's move: unconfine false).
+        if (p.cwd !== undefined || p.accountId !== undefined || p.poolId !== undefined) upd.unconfine = p.unconfine !== false;
         if (p.poolId !== undefined) upd.poolId = p.poolId === null ? null : reqString(p, 'poolId');
         if (p.model !== undefined) upd.model = p.model === null ? null : reqString(p, 'model');
         if (p.effort !== undefined) upd.effort = p.effort === null ? null : optEffort(p);
@@ -600,6 +633,9 @@ export class RpcServer {
         const threadId = reqString(p, 'threadId');
         const backlog = r.backlog(threadId, optInt(p, 'afterSeq') ?? 0);
         conn.subs.add(threadId);
+        // Opened: the done card's loose ends may have moved since (a land
+        // from a terminal, another thread's turn).
+        r.recheckLooseEnds(r.threads.get(threadId), true);
         return backlog;
       }
       case 'threads.unsubscribe':
@@ -623,6 +659,8 @@ export class RpcServer {
         }
         return r.explain({ threadId: reqString(p, 'threadId'), selection, message: p.message === undefined ? undefined : reqString(p, 'message'), question, earlier });
       }
+      case 'threads.commands':
+        return r.threadCommands(reqString(p, 'threadId'));
       case 'threads.hibernateWhen':
         return r.hibernateWhen({ threadId: reqString(p, 'threadId'), said: reqString(p, 'said') });
       case 'threads.removeHighlight':
@@ -657,8 +695,13 @@ export class RpcServer {
           decision,
           message: optString(p, 'message'),
           answers,
+          // A draining runner passing on the phone's answer (handover.ts):
+          // it only ever narrows what counts, so any client may say it.
+          ...(p.remote === true ? { remote: true } : {}),
         });
       }
+      case 'plans.approve':
+        return r.approvePlan({ threadId: reqString(p, 'threadId'), itemId: reqString(p, 'itemId') });
       case 'secrets.answer': {
         // docs/protocol.md, "Secrets". Nothing here logs params, and the
         // errors below never quote them.
@@ -797,7 +840,7 @@ function optStartedBy(p: Record<string, unknown>): { startedBy?: ThreadStartedBy
   if (typeof v !== 'object') throw bad('startedBy must be an object');
   const o = v as Record<string, unknown>;
   if (typeof o.kind !== 'string' || !STARTED_BY_KINDS.has(o.kind)) throw bad('startedBy.kind must be tool, thread, schedule, librarian or runner');
-  const words = (x: unknown, max: number) => (typeof x === 'string' ? x.replace(/\s+/g, ' ').trim().slice(0, max) : '');
+  const words = (x: unknown, max: number) => (typeof x === 'string' ? cutSafely(x.replace(/\s+/g, ' ').trim(), max) : '');
   const label = words(o.label, 40);
   if (!label) throw bad('startedBy.label required');
   const icon = words(o.icon, 60);
@@ -809,7 +852,7 @@ function optStartedBy(p: Record<string, unknown>): { startedBy?: ThreadStartedBy
 function optMode(p: Record<string, unknown>): PermissionMode | undefined {
   const v = p.permissionMode;
   if (v === undefined || v === null) return undefined;
-  if (v !== 'full' && v !== 'ask' && v !== 'auto') throw bad('permissionMode must be "full", "ask" or "auto"');
+  if (v !== 'full' && v !== 'ask' && v !== 'auto' && v !== 'plan') throw bad('permissionMode must be "full", "ask", "auto" or "plan"');
   return v;
 }
 

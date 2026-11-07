@@ -227,7 +227,9 @@ test("Bruce's key attaches and deletes only files it uploaded; a phone's photo i
   await s.bruce.upsert(thread('B', BRUCE));
   // A phone photo on its way to the M5, and one with no row at all.
   const photo = s.file('phone-photo');
-  await s.ctx.db.insert('commands', { runnerId: M5, kind: 'send', args: { text: 'x', images: [{ storageId: photo, url: 'u' }] }, state: 'pending', createdAt: 1 });
+  // As phone.ts queue writes them: the command, and the record of its photos.
+  const toM5 = await s.ctx.db.insert('commands', { runnerId: M5, kind: 'send', args: { text: 'x', images: [{ storageId: photo, url: 'u' }] }, state: 'pending', createdAt: 1 });
+  await s.ctx.db.insert('commandFiles', { storageId: photo, commandId: toM5 });
   const stray = s.file('stray');
   assert.equal(await outcome(s.bruce.shareImage('B', photo)), 'forbidden');
   assert.equal(await outcome(s.bruce.replyImage('NOROW', photo)), 'forbidden');
@@ -239,6 +241,7 @@ test("Bruce's key attaches and deletes only files it uploaded; a phone's photo i
   assert.equal(s.rows('shareImages').length, 1);
   // The same photo sent to Bruce and the M5: Bruce finishing its command leaves the M5's copy.
   const forBruce = await s.ctx.db.insert('commands', { runnerId: BRUCE, kind: 'send', args: { text: 'x', images: [{ storageId: photo, url: 'u' }] }, state: 'pending', createdAt: 2 });
+  await s.ctx.db.insert('commandFiles', { storageId: photo, commandId: forBruce });
   await call(s.ctx, sync.finishCommand, { key: BRUCE_KEY, commandId: forBruce, ok: true });
   assert.equal(s.hasFile(photo), true);
   // A picture row naming a file keeps it through a command finishing too.
@@ -262,8 +265,9 @@ test('upload URLs for a runner key are limited, and uploads never attached are c
   await upload(s2, BRUCE_KEY, 'orphan');
   const realNow = Date.now;
   Date.now = () => realNow() + 2 * 24 * 60 * 60_000;
+  await s2.ctx.db.insert('backendMarks', { name: 'limits-2026-11-07-done' });
   try {
-    await call(s2.ctx, sync.pruneOld, {});
+    await call(s2.ctx, sync.pruneFiles, {});
   } finally {
     Date.now = realNow;
   }
@@ -668,15 +672,19 @@ test("a busy runner key's newest threads and sidebar rows show, and nothing of t
   const token = 'phone-token';
   await s.ctx.db.insert('tokens', { hash: await sha256(token), name: 'phone', expiresAt: Date.now() + 100_000, createdAt: 1 });
   assert.equal((await call(s.ctx, phone.threadRow, { token, threadId: 'I0' })).view, 'inbox');
-  // Sidebar: tombstones give way before any live row; archived threads aren't listed.
-  const rows = Array.from({ length: CAP.indexRows }, (_, i) => indexRow(`S${i}`));
+  // Sidebar: tombstones give way first, then an old archived row, before
+  // any live one; archived threads are listed (API 54).
+  const rows = Array.from({ length: CAP.indexRows }, (_, i) => (i === 5 ? { ...indexRow(`S${i}`), archivedAt: 'x' } : indexRow(`S${i}`)));
   for (let i = 0; i < rows.length; i += 100) await call(s.ctx, sync.setThreadIndex, { key: BRUCE_KEY, runnerId: BRUCE, rows: rows.slice(i, i + 100), removed: [] });
   await call(s.ctx, sync.setThreadIndex, { key: BRUCE_KEY, runnerId: BRUCE, rows: [], removed: ['S0', 'S1'] });
   await call(s.ctx, sync.setThreadIndex, { key: BRUCE_KEY, runnerId: BRUCE, rows: [indexRow('NEW1'), indexRow('NEW2'), { ...indexRow('A1'), archivedAt: 'x' }], removed: [] });
   const all = s.rows('threadIndex').filter((r) => r.runnerId === BRUCE);
   assert.ok(all.length <= CAP.indexRows, String(all.length));
-  assert.equal(all.filter((r) => !r.deleted).length, CAP.indexRows, 'every live row kept, the two new ones in');
-  assert.ok(!all.some((r) => r.threadId === 'A1' && !r.deleted), 'archived not listed');
+  const listed = new Set(all.filter((r) => !r.deleted).map((r) => r.threadId));
+  assert.equal(listed.size, CAP.indexRows);
+  for (const id of ['NEW1', 'NEW2', 'A1']) assert.ok(listed.has(id), `${id} listed`);
+  assert.ok(!listed.has('S5'), 'the old archived row gave way');
+  assert.ok(listed.has('S2'), 'not a live one');
 });
 
 test("a waiting question keeps exactly what its answer is matched on; one too big to fit says to answer on the Mac", async () => {
@@ -814,7 +822,8 @@ test("past the message budget a runner key's oldest messages anywhere give way, 
   const { RUNNER_KEY_CAPS: CAP } = sync as { RUNNER_KEY_CAPS: { messageBytes: number } };
   assert.ok(CAP.messageBytes >= 2 * 21 * 1024 * 1024, "at least twice the M5's whole history (about 21 MB)");
   await s.bruce.upsert(thread('OLD', BRUCE));
-  await s.bruce.append('OLD', 'oldest', 1);
+  // Longer than the new one, so taking it out alone makes room.
+  await s.bruce.append('OLD', 'oldest '.padEnd(60, '.'), 1);
   await s.bruce.append('OLD', 'next', 2);
   const usage = s.rows('runnerStorage').find((r) => r.runnerId === BRUCE)!;
   await s.ctx.db.patch(usage._id, { messageBytes: CAP.messageBytes });
@@ -918,4 +927,37 @@ test('audit cards and pruneOld read few rows at a time, for old rows that could 
   const before = s.reads();
   await call(s.ctx, sync.pruneOld, {});
   assert.ok(s.reads() - before <= 60, String(s.reads() - before));
+});
+
+// Daybreak, 6 Nov 2026: Mike deletes one of the M5's schedules while the M5
+// has a run of it claimed, and Bruce's key saves one of its own under the
+// gone id, which the M5's subscription (every runner's rows) then has under
+// the id it claimed. While the id's tombstone lasts it stays the M5's.
+test("a schedule id gone from the M5 lately isn't Bruce's to take, nor to adopt", async () => {
+  const s = await setup();
+  await call(s.ctx, sync.saveSchedule, { key: OWNER, schedule: sched(UUID(31), M5, { check: 'news-check' }) });
+  assert.equal(await call(s.ctx, sync.deleteSchedule, { key: OWNER, scheduleId: UUID(31) }), true);
+  const evil = sched(UUID(31), BRUCE, { title: 'ATTACKER JOB', text: 'ATTACKER INSTRUCTIONS', check: 'news-check', permissionMode: 'full' });
+  assert.equal(await outcome(call(s.ctx, sync.saveSchedule, { key: BRUCE_KEY, schedule: evil })), 'forbidden');
+  const adopted = (await call(s.ctx, sync.adoptSchedules, { key: BRUCE_KEY, runnerId: BRUCE, schedules: [evil] })) as { held: { why: string }[] };
+  assert.equal(adopted.held.length, 1);
+  assert.equal(s.rows('schedules').length, 0);
+  // Bruce's own gone ids are still its own to use again, and one moved to
+  // Bruce by Mike is Bruce's to change, the M5's tombstone for it or not.
+  await call(s.ctx, sync.saveSchedule, { key: BRUCE_KEY, schedule: sched(UUID(32), BRUCE) });
+  await call(s.ctx, sync.deleteSchedule, { key: BRUCE_KEY, scheduleId: UUID(32) });
+  await call(s.ctx, sync.saveSchedule, { key: BRUCE_KEY, schedule: sched(UUID(32), BRUCE) });
+  await call(s.ctx, sync.saveSchedule, { key: OWNER, schedule: sched(UUID(33), M5) });
+  await call(s.ctx, sync.saveSchedule, { key: OWNER, schedule: sched(UUID(33), BRUCE) });
+  await call(s.ctx, sync.saveSchedule, { key: BRUCE_KEY, schedule: sched(UUID(33), BRUCE, { title: 'renamed' }) });
+  assert.equal(s.rows('schedules').find((r) => r.id === UUID(33))?.title, 'renamed');
+});
+
+test("sync:sharedThreads lists a runner's link-shared rows only, and a runner key only its own", async () => {
+  const s = await setup();
+  await s.owner.upsert(thread('ON', M5, { share: { access: 'link', slug: 'on-slug' } }), thread('OFF', M5, { share: { access: 'off', slug: 'off-slug' } }), thread('NEVER', M5));
+  await s.bruce.upsert(thread('BRUCE-ON', BRUCE, { share: { access: 'link', slug: 'b-slug' } }));
+  assert.deepEqual(await call(s.ctx, sync.sharedThreads, { key: OWNER, runnerId: M5 }), ['ON']);
+  assert.deepEqual(await call(s.ctx, sync.sharedThreads, { key: BRUCE_KEY, runnerId: BRUCE }), ['BRUCE-ON']);
+  assert.equal(await outcome(call(s.ctx, sync.sharedThreads, { key: BRUCE_KEY, runnerId: M5 })), 'forbidden');
 });

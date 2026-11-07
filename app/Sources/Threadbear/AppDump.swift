@@ -75,6 +75,8 @@ struct AppDump: Encodable {
         /// The model, or "default (...)" saying whose default.
         var model: String
         var ask: Bool
+        /// Its permission mode as the composer says it, past "asks".
+        var mode: PermissionMode = .full
         /// The effort level, or "default" for the model's own.
         var effort: String = "default"
         /// The pool that picks its login; nil when it's pinned to
@@ -91,6 +93,7 @@ struct AppDump: Encodable {
         var account: String
         var model: String
         var ask: Bool
+        var mode: PermissionMode = .full
         var effort: String = "default"
         var pool: String? = nil
     }
@@ -106,6 +109,16 @@ struct AppDump: Encodable {
         var status: String?
     }
 
+    /// A thread's permission mode as the dump says it.
+    static func modeText(_ mode: PermissionMode) -> String {
+        switch mode {
+        case .ask: "asks before edits"
+        case .auto: "auto"
+        case .plan: "plan first"
+        case .full: "full access"
+        }
+    }
+
     /// What a new thread sent from the composer would get, as the
     /// composer's menus show it (`ThreadSettings` in ComposerControls).
     @MainActor
@@ -113,7 +126,7 @@ struct AppDump: Encodable {
         let account = app.newThreadAccountId
         return Settings(cwd: app.newThreadCwd ?? app.draftLogins.defaults.cwd, account: account,
                         model: app.newThreadModel ?? defaultModel(app, account: account), ask: app.newThreadPermission == .ask,
-                        effort: app.newThreadEffort ?? "default", pool: app.newThreadPoolId)
+                        mode: app.newThreadPermission, effort: app.newThreadEffort ?? "default", pool: app.newThreadPoolId)
     }
 
     /// Whose default a new thread gets, and which model that is when known.
@@ -135,6 +148,9 @@ struct AppDump: Encodable {
         var seq: Int
         var turn: String?
         var text: String
+        /// The reply buttons its text links, as each pill reads with its
+        /// id ("✓ Fill in the form [b7k2abcd]"), or "unknown <id>".
+        var buttons: [String]? = nil
     }
 
     struct Transcript: Encodable {
@@ -152,6 +168,8 @@ struct AppDump: Encodable {
     var banner: BannerInfo?
     /// The Archived note with Undo at the top of the thread panel: its thread.
     var archivedNote: String?
+    /// The milestone note at the top of the thread panel: its first line.
+    var milestoneNote: String?
     var error: String?
     var window: Window?
     var sidebar: Sidebar
@@ -292,7 +310,8 @@ struct AppDump: Encodable {
                 let row = session.displayRow(index)
                 return Row(id: row.id, kind: row.kind.rawValue, height: Int(table.rect(ofRow: index).height.rounded()),
                            expanded: opens(row) ? app.transcript.isExpanded(row) : nil, inGroup: row.inGroup,
-                           onScreen: NSLocationInRange(index, visible), seq: row.seq, turn: row.turnId, text: RowDebug.excerpt(row))
+                           onScreen: NSLocationInRange(index, visible), seq: row.seq, turn: row.turnId, text: RowDebug.excerpt(row),
+                           buttons: Self.buttons(row))
             }
             let state: String
             switch session.state {
@@ -311,6 +330,7 @@ struct AppDump: Encodable {
             runnerVersion: app.runnerVersion,
             banner: app.banner.map { BannerInfo(style: $0.style.rawValue, text: $0.text, detail: $0.detail) },
             archivedNote: app.archivedNote?.threadId,
+            milestoneNote: app.milestoneNote.map { ThreadMilestones.title($0.tier) },
             error: app.errorMessage,
             window: window.map { Window(width: Int(contentSize($0).width), height: Int(contentSize($0).height), appearance: appearance) },
             sidebar: Sidebar(mode: String(describing: app.sidebarMode), sections: sections,
@@ -447,7 +467,7 @@ struct AppDump: Encodable {
     /// pick, its links and the answer picked.
     @MainActor
     static func decisions(_ thread: ThreadSummary, app: AppModel) -> [String]? {
-        guard Decisions.isOpen(thread) else { return nil }
+        guard Decisions.isOpen(thread, card: app.sessions[thread.id]?.openCard) else { return nil }
         let picks = app.picks(for: thread)
         let notes = app.notes(for: thread)
         var lines = ["\(picks.count) picked"]
@@ -469,7 +489,7 @@ struct AppDump: Encodable {
             // or the account's default.
             let model = thread.model ?? thread.modelInUse.map { "default (the account's, \($0))" } ?? defaultModel(app, account: thread.accountId)
             settings = Settings(cwd: thread.cwd, account: thread.accountId, model: model, ask: thread.permissionMode == .ask,
-                                effort: thread.effort ?? thread.effortInUse.map { "default (\($0))" } ?? "default",
+                                mode: thread.permissionMode, effort: thread.effort ?? thread.effortInUse.map { "default (\($0))" } ?? "default",
                                 pool: app.usesPools ? thread.poolId : nil)
         } else {
             settings = newThreadSettings(app)
@@ -477,7 +497,7 @@ struct AppDump: Encodable {
         // Chips as the [Picture N] markers they'll go as, not invisible marks.
         return Composer(draft: key, text: InlinePictures.messageText(app.drafts[key]?.normalized.text ?? ""), images: app.drafts[key]?.images.count ?? 0,
                         editing: app.editing[key]?.seq,
-                        cwd: settings.cwd, account: settings.account, model: settings.model, ask: settings.ask, effort: settings.effort,
+                        cwd: settings.cwd, account: settings.account, model: settings.model, ask: settings.ask, mode: settings.mode, effort: settings.effort,
                         pool: settings.pool, chip: ThreadSettings(app: app, thread: app.selectedThread).modelChipTitle,
                         runner: app.selectedThread.flatMap(app.runnerName(of:)) ?? (app.selectedThread == nil ? app.newThreadRunner?.name : nil))
     }
@@ -515,6 +535,7 @@ struct AppDump: Encodable {
         lines.append(head)
         if let banner { lines.append("banner (\(banner.style)): \(banner.text)" + (banner.detail.map { "  [\($0)]" } ?? "")) }
         if let archivedNote { lines.append("archived note: \(archivedNote), with Undo") }
+        if let milestoneNote { lines.append("milestone note: \(milestoneNote)") }
         if let error { lines.append("error banner: \(error)") }
         lines.append("")
         lines.append("sidebar, \(sidebar.mode) (\(sidebar.snoozed) snoozed, \(sidebar.archived) archived):")
@@ -570,7 +591,7 @@ struct AppDump: Encodable {
             + (composer.editing.map { ", editing the message at seq \($0)" } ?? ""))
         let on = composer.pool.map { "pool \($0) (now \(composer.account))" } ?? (pools.isEmpty || composer.runner != nil ? composer.account : "\(composer.account), pinned")
         lines.append("  \(composer.draft == "new" ? "starts" : "runs") in \(composer.cwd)\(composer.runner.map { " on \($0)" } ?? "") on \(on), model \(composer.model), "
-            + (composer.effort == "default" ? "" : "effort \(composer.effort), ") + (composer.ask ? "asks before edits" : "full access"))
+            + (composer.effort == "default" ? "" : "effort \(composer.effort), ") + Self.modeText(composer.mode))
         lines.append("  model chip: \(composer.chip)")
         lines.append("dock: \(dock)")
         if !pools.isEmpty {
@@ -593,9 +614,22 @@ struct AppDump: Encodable {
             for (row, id) in zip(transcript.rows, ids) {
                 let open = row.expanded.map { $0 ? "open" : "closed" } ?? ""
                 lines.append("\(row.onScreen ? ">" : " ") \(pad(id, rowWidth)) \(pad(row.kind, 10)) \(pad(String(row.height), 5)) \(pad(open, 7)) \(row.text)")
+                for button in row.buttons ?? [] { lines.append("  \(pad("", rowWidth)) button     \(button)") }
             }
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// The pills a reply's buttons show as, for `dump`.
+    static func buttons(_ row: TranscriptRow) -> [String]? {
+        guard case .assistant(let item) = row.content else { return nil }
+        let ids = ReplyButtons.ids(in: item.text)
+        guard !ids.isEmpty else { return nil }
+        return ids.map { id in
+            guard let known = ReplyButtons.shared.known(id) else { return "unknown \(id)" }
+            let look = ReplyButtons.look(known.button, pressing: ReplyButtons.shared.isPressing(id))
+            return "\(ReplyButtons.label(known.button, look: look)) [\(id), \(look.rawValue)]"
+        }
     }
 
     private func pad(_ text: String, _ width: Int) -> String {

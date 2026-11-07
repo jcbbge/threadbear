@@ -15,6 +15,8 @@ import type { AdapterOutput, BackgroundTask, TurnResult } from '../types.ts';
 import { truncateResultText, type NormalizerContext } from '../context.ts';
 import { displayPath, toolTitle, truncateInput } from '../../tools.ts';
 import type { Logger } from '../../log.ts';
+import { isSpace } from '../../linear-text.ts';
+import { cutSafely, firstLineSafely } from '../../safe-cut.ts';
 
 type AnyMsg = Record<string, any>;
 
@@ -38,8 +40,9 @@ export const MAPPED_ITEM_TYPES = [
   'exitedReviewMode',
   'contextCompaction',
   'sleep',
+  'plan',
 ] as const;
-export const IGNORED_ITEM_TYPES = ['userMessage', 'hookPrompt', 'functionCallOutput', 'plan'] as const;
+export const IGNORED_ITEM_TYPES = ['userMessage', 'hookPrompt', 'functionCallOutput'] as const;
 
 // Notification methods this handles, and the ones it ignores on purpose.
 // Any other method is ignored too, logged once at debug level.
@@ -599,6 +602,13 @@ export class CodexNormalizer {
       case 'contextCompaction':
         this.compacted(out);
         return;
+      // Plan mode's proposed plan ("Plan first"), a card for Mike to approve.
+      // A subagent's plan isn't his to approve.
+      case 'plan': {
+        const text = typeof item.text === 'string' ? item.text.trim() : '';
+        if (text && !prefix) out.push({ kind: 'planProposed', itemId: id, text });
+        return;
+      }
       case 'enteredReviewMode':
       case 'exitedReviewMode':
         if (!this.hidden.has(id)) {
@@ -857,10 +867,20 @@ export function planTitle(plan: unknown): string | undefined {
 
 // The command inside Codex's `/bin/zsh -lc '...'` wrapper, as the user
 // would have typed it. Anything else comes back as it was.
+//
+// The model writes the command, so this takes time in proportion to it: a
+// lazy `([\s\S]+?)\s*$` here tried `\s*$` again from every space of a long
+// run, and `printf '%s' '<300k spaces>x'` held the runner for minutes
+// (Gautam's scan, F27). The shell is the first word ("zsh", "/bin/bash");
+// the argument is the rest after "-c" or "-lc", without its trailing
+// whitespace.
 export function innerCommand(command: string): string {
-  const m = /^\s*(?:\S*\/)?(?:ba|z)?sh\s+-l?c\s+([\s\S]+?)\s*$/.exec(command);
-  if (!m) return command;
-  const arg = m[1];
+  const m = /^\s*(\S+)\s+-l?c\s+/.exec(command);
+  if (!m || !/^(?:.*\/)?(?:ba|z)?sh$/.test(m[1])) return command;
+  // Nothing after the -c but whitespace: the old pattern took one space of
+  // it as the argument, which isn't a command either.
+  const arg = command.slice(m[0].length).trimEnd();
+  if (!arg) return command;
   if (arg.startsWith("'") && arg.endsWith("'") && arg.length >= 2) {
     // zsh quotes a single quote inside one as '\''.
     const body = arg.slice(1, -1);
@@ -912,11 +932,30 @@ function diffEvents(itemId: string, changes: AnyMsg[]): AdapterOutput[] {
 // result and stray tokens in other scripts in a final answer, and Mike read
 // them all (28 Oct 2026). Never in backticks, so a message about such a
 // token keeps it.
-const LEAKED_TOOL_CALL = /(?:[^\S\n]*[^\s`]*[^\S\n]+|^)to=(?:functions|multi_tool_use|tools)\.\w[\s\S]*/m;
+//
+// The token counts at the start of a line, or after spaces (not a line
+// break) with the word before them, which can't hold a backtick or a
+// space. That was one regex, `(?:[^\S\n]*[^\s`]*[^\S\n]+|^)to=...`, whose
+// overlapping runs of spaces made it cubic in a run of spaces: a model
+// told to end its answer with 10,000 of them held the runner's event loop
+// for good (Gautam's scan, F24). Now the token is found first and the
+// word before it read backwards, once.
+const ROUTING_TOKEN = /to=(?:functions|multi_tool_use|tools)\.\w/g;
+const isRunSpace = (c: string | undefined) => c !== '\n' && isSpace(c);
 
 export function stripLeakedToolCall(text: string): string {
-  const m = LEAKED_TOOL_CALL.exec(text);
-  return m ? text.slice(0, m.index).trimEnd() : text;
+  for (const m of text.matchAll(ROUTING_TOKEN)) {
+    const at = m.index;
+    if (at === 0 || text[at - 1] === '\n') return text.slice(0, at).trimEnd();
+    if (!isRunSpace(text[at - 1])) continue;
+    // The spaces, the word before them and any spaces before that: all of
+    // it goes, and trimEnd takes the spaces anyway.
+    let start = at - 1;
+    while (start > 0 && isRunSpace(text[start - 1])) start--;
+    while (start > 0 && text[start - 1] !== '`' && !isSpace(text[start - 1])) start--;
+    return text.slice(0, start).trimEnd();
+  }
+  return text;
 }
 
 function splitText(s: string): string[] {
@@ -1005,7 +1044,7 @@ function mcpStartError(name: string, error: unknown): string {
   let s = error.replace(new RegExp(`^MCP client for \`${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\` failed to start:\\s*`), '');
   const clauses = s.split(/:\s+/).filter((c) => c && !/^(Send message error|Transport \[|\[)/.test(c));
   s = clauses.slice(0, 2).join(': ');
-  return s.length > 160 ? s.slice(0, 159).trimEnd() + '…' : s;
+  return cutSafely(s, 160, '…');
 }
 
 function usageWindow(kind: UsageWindow['kind'], title: string, w: AnyMsg): UsageWindow {
@@ -1057,9 +1096,7 @@ function diffTotals(a: Totals, b: Totals): Totals {
 }
 
 function firstLine(s: string, max = 100): string {
-  const line = s.split('\n').find((l) => l.trim() !== '') ?? '';
-  const t = line.trim();
-  return t.length > max ? t.slice(0, max - 1) + '…' : t;
+  return firstLineSafely(s, max, '…');
 }
 
 function ev(event: EventBody): AdapterOutput {

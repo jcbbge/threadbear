@@ -13,6 +13,7 @@ import type { Id } from '../../convex/_generated/dataModel';
 import { go, threadPath, useRoute } from './route';
 import { useToken } from './token';
 import { MessageText, Pictures, picturesByRow, ToolRun, Worked, type PageMessage } from './messages';
+import { ReplyButton } from './reply-button';
 import { CommandState } from './command-state';
 import { previewOf, ShareControl, SharePage } from './share';
 import { busy, Lists, ResizeHandle, type Row, useSidebarWidth } from './sidebar';
@@ -203,18 +204,26 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
   const lastReply = [...items].reverse().find((i) => i.kind === 'message');
   const meta = !busy(t) && lastReply?.kind === 'message' && lastReply.m.role === 'assistant' ? [lastTurn?.ms && lastTurn.ms >= 1000 ? duration(lastTurn.ms) : null, t.costUsd ? `$${t.costUsd.toFixed(2)}` : null].filter(Boolean).join(' · ') : '';
 
+  // A reply's [title](button:<id>) links, drawn from the row's buttons. An id
+  // the row doesn't carry (an older runner, a button the thread no longer
+  // keeps) is just its title.
+  const buttonFor = (m: PageMessage) => (id: string, title: ReactNode) => {
+    const b = m.buttons?.find((x) => x.id === id);
+    return b ? <ReplyButton key={id} token={token} threadId={threadId} button={b} title={title} threadPath={linkTo} /> : <>{title}</>;
+  };
+
   const renderItem = (item: Item<PageMessage>): ReactNode => {
     if (item.kind === 'worked') {
       return (
         <Worked key={`w${item.key}`} ms={item.ms}>
-          {item.items.map((w) => (w.kind === 'tools' ? <ToolRun key={w.items[0]!.seq} items={w.items} open /> : renderItem(w)))}
+          {item.items.map((w) => (w.kind === 'tools' ? <ToolRun key={w.items[0]!.seq} items={w.items} open source={{ token, threadId }} /> : renderItem(w)))}
         </Worked>
       );
     }
     if (item.kind === 'tools') {
       return (
         <div key={item.items[0]!.seq}>
-          <ToolRun items={item.items} />
+          <ToolRun items={item.items} source={{ token, threadId }} />
           <Pictures items={item.items.flatMap((m) => after.get(m.seq) ?? [])} />
         </div>
       );
@@ -224,7 +233,7 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
     return (
       <div key={m.seq} className={`msg ${m.role}`}>
         {from ? <div className="origin">{from.who}</div> : m.role === 'user' && m.origin && m.origin !== 'user' && m.origin !== 'phone' ? <div className="origin">{originLabel(m.origin)}</div> : null}
-        {from ? <MessageText text={from.body} pictures={inText} seq={m.seq} rows={messages} threadPath={linkTo} /> : <MessageText text={m.text} pictures={inText} seq={m.seq} rows={messages} threadPath={linkTo} pictureChips={m.role === 'user'} pasted={m.role === 'user' ? pastedOf(pictures, m.seq, m.text).byNumber : undefined} />}
+        {from ? <MessageText text={from.body} pictures={inText} seq={m.seq} rows={messages} threadPath={linkTo} /> : <MessageText text={m.text} pictures={inText} seq={m.seq} rows={messages} threadPath={linkTo} pictureChips={m.role === 'user'} pasted={m.role === 'user' ? pastedOf(pictures, m.seq, m.text).byNumber : undefined} button={m.role === 'assistant' ? buttonFor(m) : undefined} />}
         <Pictures items={[...(after.get(m.seq) ?? []), ...(m.role === 'user' ? pastedOf(pictures, m.seq, m.text).unplaced : [])]} />
       </div>
     );
@@ -280,7 +289,7 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
 
       <div className="dock">
         {pending ? <CommandState token={token} commandId={pending} onDone={() => setPending(null)} /> : null}
-        <Dock token={token} thread={t} lastSeq={lastSeq} onSent={setPending} onArchive={(verdict) => void act({ archive: true, ...(verdict ? { verdict } : {}) })} />
+        <Dock token={token} thread={t} lastSeq={lastSeq} onSent={setPending} onArchive={() => void act({ archive: true })} />
       </div>
     </article>
   );
@@ -314,20 +323,7 @@ function MoreMenu({ items }: { items: ({ label: string; icon: ReactNode; run: ()
 // What sits at the bottom, in one rounded box as on the Mac: an approval or
 // question the CLI is waiting on, else the end_turn card of asks, else the
 // done card's follow-ups, then the composer under it.
-// The done card's Archive asks how the thread went before archiving, so
-// later sweeps know it was archived on purpose (backend API 42; the website
-// ships with its backend, so it's always new enough).
-type Verdict = 'worked' | 'didntWork' | 'notNeeded';
-const verdicts: { verdict: Verdict | undefined; label: string; icon: ReactNode }[] = [
-  { verdict: 'worked', label: 'Worked', icon: <Icon.Check /> },
-  { verdict: 'didntWork', label: "Didn't work", icon: <Icon.Close /> },
-  { verdict: 'notNeeded', label: 'Not needed', icon: <Icon.Minus /> },
-  // No verdict: for threads that are just done and fit none of the three
-  // (Mike, 5 Nov), as on the Mac and iPhone.
-  { verdict: undefined, label: 'Okey-dokey', icon: <Icon.Archive /> },
-];
-
-function Dock({ token, thread: t, lastSeq, onSent, onArchive }: { token: string; thread: Row; lastSeq?: number; onSent: (id: Id<'commands'>) => void; onArchive: (verdict: Verdict | undefined) => void }) {
+function Dock({ token, thread: t, lastSeq, onSent, onArchive }: { token: string; thread: Row; lastSeq?: number; onSent: (id: Id<'commands'>) => void; onArchive: () => void }) {
   const send = useMutation(api.phone.send);
   const [text, setText] = useState('');
   // Picks on the card of asks: ask index to choice index, for one card.
@@ -396,22 +392,9 @@ function Dock({ token, thread: t, lastSeq, onSent, onArchive }: { token: string;
     <section className="card">
       <h2>
         Done
-        <Pop title="Archive" label="Archive" above>
-          {(close) =>
-            verdicts.map((v) => (
-              <button
-                key={v.label}
-                onClick={() => {
-                  onArchive(v.verdict);
-                  close();
-                }}
-              >
-                {v.icon}
-                {v.label}
-              </button>
-            ))
-          }
-        </Pop>
+        <button className="btn plain" style={{ marginLeft: 'auto' }} onClick={onArchive}>
+          Archive
+        </button>
       </h2>
       <div className="choices">
         {next.map((n, i) => {

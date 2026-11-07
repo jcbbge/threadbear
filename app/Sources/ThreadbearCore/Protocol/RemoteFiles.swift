@@ -37,8 +37,9 @@ public struct FileRead: Sendable, Equatable, Decodable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         path = (try? c.decodeIfPresent(String.self, forKey: .path)) ?? ""
-        // Sizes come as JSON numbers, which may decode as Double.
-        let size = (try? c.decodeIfPresent(Double.self, forKey: .size)).flatMap { $0 }.map { Int($0) } ?? 0
+        // Sizes come as JSON numbers, which may decode as Double, from
+        // another runner: one that isn't a whole number of bytes is 0.
+        let size = (try? c.decodeIfPresent(Double.self, forKey: .size)).flatMap { $0 }.flatMap { $0.wholeCount() } ?? 0
         stamp = FileStamp(size: size, modifiedAt: (try? c.decodeIfPresent(String.self, forKey: .modifiedAt)).flatMap { $0 } ?? "")
         unchanged = (try? c.decodeIfPresent(Bool.self, forKey: .unchanged)).flatMap { $0 } ?? false
         mediaType = (try? c.decodeIfPresent(String.self, forKey: .mediaType)).flatMap { $0 }
@@ -228,12 +229,17 @@ public final class RemoteFileCache: @unchecked Sendable {
     }
 
     /// `<runner>/<hash of the path>/<its name>`: the name kept so the
-    /// copy opens in the same viewer as the file would.
+    /// copy opens in the same viewer as the file would. Not one that runs
+    /// when it's opened (a `.command`, a `.terminal`, a `.webloc`): that
+    /// gets `.txt` after it, so what another Mac sent is never a program
+    /// here, whatever opens it (Daybreak, 7 Nov). OpenGate refuses to open
+    /// such a copy in an app anyway; this is the second lock.
     static func fileName(runnerId: String, path: String) -> String {
         let digest = SHA256.hash(data: Data(path.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
         let safeRunner = runnerId.map { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" ? $0 : "_" }
         var name = (path as NSString).lastPathComponent
         if name.isEmpty || name == "/" || name == "." || name == ".." { name = "file" }
+        if LinkPolicy.runsCode(path: name) { name += ".txt" }
         return String(safeRunner) + "/" + digest + "/" + name
     }
 

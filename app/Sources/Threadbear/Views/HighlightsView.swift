@@ -19,6 +19,7 @@ struct HighlightsView: View {
     @State private var allLinks = false
     @State private var allCommits = false
     @State private var allSubagents = false
+    @State private var allStarted = false
 
     var body: some View {
         if app.highlightsUnsupported {
@@ -26,7 +27,7 @@ struct HighlightsView: View {
         } else if let fetched = app.highlights[thread.id] {
             let sections = HighlightSections.build(fetched)
             let projects = HighlightProjects.build(thread: thread, project: app.project)
-            if sections.isEmpty && openAsks == nil && projects.isEmpty && toolPanels.isEmpty && schedules.isEmpty && thread.subagents.isEmpty {
+            if sections.isEmpty && openAsks == nil && projects.isEmpty && toolPanels.isEmpty && schedules.isEmpty && thread.subagents.isEmpty && startedThreads.isEmpty {
                 PaneNote(text: "Nothing here yet. Files, links and commits from this thread show up here as it works.")
             } else {
                 ScrollView {
@@ -130,6 +131,17 @@ struct HighlightsView: View {
                 if subagents.more > 0 { showAll(all.count) { allSubagents = true } }
             }
         }
+        // The threads it handed work to, or is waiting on, with where each
+        // is up to (StartedThreadRows says why it's here).
+        let started = startedThreads
+        if !started.isEmpty {
+            SectionHeading(title: "Threads it started", icon: "pawprint", fold: fold(HighlightFold.startedThreads, count: started.count))
+            if !isFolded(HighlightFold.startedThreads) {
+                let shown = HighlightSections.capped(started, limit: HighlightSections.subagentLimit, showAll: allStarted)
+                ForEach(shown.shown) { startedRow($0) }
+                if shown.more > 0 { showAll(started.count) { allStarted = true } }
+            }
+        }
         if !sections.pinned.isEmpty {
             SectionHeading(title: "Pinned", icon: "pin", fold: fold(HighlightFold.pinned, count: sections.pinned.count))
             if !isFolded(HighlightFold.pinned) {
@@ -207,6 +219,29 @@ struct HighlightsView: View {
         .tip("\(SubagentRows.statusText(subagent)). Click to read its transcript.")
     }
 
+    private var startedThreads: [StartedThreadRows.Row] {
+        StartedThreadRows.rows(for: thread, in: app.threads, now: app.now)
+    }
+
+    /// Opens the thread itself, as a thread chip in a reply does.
+    private func startedRow(_ row: StartedThreadRows.Row) -> some View {
+        let color: Color? = switch row.state {
+        case .needsYou: Color.accentColor
+        case .failed: Color(nsColor: Theme.failed)
+        default: nil
+        }
+        return PaneRow(icon: StartedThreadRows.icon(row.state), iconColor: color, title: row.thread.title,
+                       detail: StartedThreadRows.detail(row, now: app.now),
+                       titleTruncation: .tail, detailTruncation: .tail) {
+            app.openThread(row.thread.id)
+        }
+        .tip("Open this thread")
+        .iconContextMenu {
+            Button("Open", systemImage: "arrow.up.forward") { app.openThread(row.thread.id) }
+            Button("Open in New Panel", systemImage: "rectangle.split.2x1") { app.openThreadInPanel(row.thread.id) }
+        }
+    }
+
     /// The open card's seq, when the thread has asks on it.
     private var openAsks: Int? {
         thread.asks.isEmpty ? nil : thread.asksSeq
@@ -235,7 +270,7 @@ struct HighlightsView: View {
                        trailing: how.flatMap { $0.isEmpty ? nil : $0 }, note: item.note, detail: detail,
                        titleTruncation: item.path == nil ? .tail : .middle,
                        action: isCommit ? nil : { app.open(item, in: thread, external: false) })
-            .fileDrag(item.path.map(URL.init(fileURLWithPath:)) ?? item.link)
+            .fileDrag(item.path.map(URL.init(fileURLWithPath:)) ?? item.link, in: thread)
             .iconContextMenu {
                 if let path = item.path {
                     FileMenu(path: path, thread: thread, title: item.title)
@@ -278,7 +313,7 @@ struct HighlightsView: View {
                     }
                 }
                 .tip("Open in its app")
-                .fileDrag(URL(fileURLWithPath: path))
+                .fileDrag(URL(fileURLWithPath: path), in: thread)
                 .iconContextMenu { FileMenu(path: path, thread: thread, title: (path as NSString).lastPathComponent) }
             }
         }
@@ -349,12 +384,15 @@ private struct ProjectWhyButton: View {
 
 extension View {
     /// Drags a row's file or link out of the app (FileDrag): a file as the
-    /// file itself, for X or the Finder. Nothing for a file that's gone.
+    /// file itself, for X or the Finder. Nothing for a file that's gone,
+    /// and for another Mac's thread only this Mac's whole copy of it,
+    /// never the file here that has the same path (Daybreak, 7 Nov).
     @ViewBuilder
-    func fileDrag(_ url: URL?) -> some View {
+    func fileDrag(_ url: URL?, in thread: ThreadSummary) -> some View {
         if let url {
             onDrag {
-                guard FileDrag.writer(for: url) != nil else { return NSItemProvider() }
+                guard let url = MainActor.assumeIsolated({ AppModel.shared.localCopy(of: url, in: thread) }),
+                      FileDrag.writer(for: url) != nil else { return NSItemProvider() }
                 // A page's ?query isn't part of its file.
                 return NSItemProvider(object: (url.isFileURL ? URL(fileURLWithPath: url.path) : url) as NSURL)
             }
@@ -543,7 +581,20 @@ struct LinkMenu: View {
             Button("Preview here", systemImage: "sidebar.right") { app.preview(path: url.path, title: title, in: thread) }
             Button("Open", systemImage: "arrow.up.forward.app") { app.openLink(url, title: title, in: thread, external: true) }
         } else {
-            Button(WebLinkAction.browser.title, systemImage: WebLinkAction.browser.symbol) { app.openExternally(url) }
+            let profiles = ChromeProfiles.open()
+            if profiles.isEmpty {
+                Button(WebLinkAction.browser.title, systemImage: WebLinkAction.browser.symbol) { app.openExternally(url) }
+            }
+            // One per open Chrome profile, as in the transcript's WebLinkMenu.
+            ForEach(profiles, id: \.directory) { profile in
+                Button { ChromeProfiles.open(url, in: profile) } label: {
+                    Label {
+                        Text(ChromeProfiles.title(profile))
+                    } icon: {
+                        if let icon = ChromeProfiles.icon(profile) { Image(nsImage: icon) } else { Image(systemName: WebLinkAction.browser.symbol) }
+                    }
+                }
+            }
             if PreviewRules.isWebPage(url) {
                 Button(WebLinkAction.panel.title, systemImage: WebLinkAction.panel.symbol) { app.preview(page: url, title: title, in: thread) }
             }
@@ -573,6 +624,9 @@ struct PreviewBody: View {
 
     var body: some View {
         switch preview.target {
+        case .page(let url) where url.isFileURL:
+            LocalPagePreview(url: url, opened: preview.opened)
+                .id(url)
         case .page(let url):
             WebPanel(url: url)
         case .remote(_, let failed):
@@ -611,12 +665,72 @@ struct PreviewBody: View {
         if !FileManager.default.fileExists(atPath: path) {
             PaneNote(text: "This file isn't there any more.")
         } else if PreviewRules.viewer(forPath: path) == .web {
-            WebPanel(url: URL(fileURLWithPath: path))
-        } else if TextFileView.shows(path) {
-            TextFileView(url: URL(fileURLWithPath: path), opened: preview.opened, editing: preview.editing)
+            LocalPagePreview(url: URL(fileURLWithPath: path), opened: preview.opened)
                 .id(path)
+        } else if TextFileView.shows(path) {
+            TextFileView(url: URL(fileURLWithPath: path), opened: preview.opened, editing: preview.editing, threadId: thread.id,
+                         stayedEditing: { [thread] in app.setPreviewEditing(true, in: thread.id) })
+                // The thread too: its links are followed in that thread, and
+                // two threads on one runner can show the same copy.
+                .id("\(thread.id) \(path)")
         } else {
             QuickLookView(url: URL(fileURLWithPath: path), opened: preview.opened)
+        }
+    }
+}
+
+/// A local HTML file in the pane. Its scripts are off (WebPanelPool,
+/// Daybreak finding 6), so a page that draws itself would show as empty
+/// boxes with nothing to say why. One with scripts gets a bar over it
+/// asking: Run them reloads it in a view of its own with JavaScript on and
+/// every other guard kept, for those exact bytes only, remembered until the
+/// file changes (PreviewScriptConsent). Mike asked for it on 6 Nov 2026.
+struct LocalPagePreview: View {
+    let url: URL
+    let opened: Int
+    /// What the scan found, for the file it was of: the pane keeps this
+    /// view (and its state) when another file opens in it, so nothing here
+    /// counts unless it's this file's (Codex review: a page allowed first
+    /// handed its digest to the next file with the same bytes).
+    @State private var scan: (path: String, scripts: Bool, digest: String, allowed: Bool)?
+
+    private var current: (scripts: Bool, digest: String, allowed: Bool)? {
+        guard let scan, scan.path == url.path else { return nil }
+        return (scan.scripts, scan.digest, scan.allowed)
+    }
+
+    static let explanation = "Pages open here with their scripts off, as a script could read the files the page names. Run them turns them on for this version of the page, still with no network and nothing read but what it names. If the file changes, you'll be asked again."
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let scan = current, scan.scripts, !scan.allowed {
+                HStack(spacing: zoomed(6)) {
+                    Text("This page has scripts")
+                        .font(.system(size: TypeScale.small))
+                        .foregroundStyle(.secondary)
+                    InfoTip(Self.explanation)
+                    Spacer(minLength: 0)
+                    Button("Run them") {
+                        PreviewScriptConsent().allow(path: url.path, digest: scan.digest)
+                        self.scan?.allowed = true
+                    }
+                    .controlSize(.small)
+                    .tip("Reload this page with its scripts on")
+                }
+                .padding(.horizontal, zoomed(10))
+                .padding(.vertical, zoomed(6))
+                Divider()
+            }
+            WebPanel(url: url, scriptsFor: current.flatMap { $0.allowed ? $0.digest : nil })
+        }
+        .task(id: "\(url) \(opened)") {
+            let path = url.path
+            let found = await Task.detached(priority: .utility) {
+                LocalPreviewSite.scan(atPath: path)
+            }.value
+            // A scan for the page before can finish after this one's.
+            if Task.isCancelled { return }
+            scan = found.map { (path, $0.scripts, $0.digest, $0.scripts && PreviewScriptConsent().allows(path: path, digest: $0.digest)) }
         }
     }
 }
@@ -646,7 +760,8 @@ struct PreviewButtons: View {
         }
         if let url = preview.externalURL {
             PaneHeaderButton(symbol: "arrow.up.right", help: preview.folderPath != nil ? "Open in Finder" : preview.fileURL == nil ? "Open in browser" : "Open in its app") {
-                app.openExternally(url)
+                // Another Mac's copy is never opened as a program.
+                app.openExternally(url, from: preview.away == nil ? .thisMac : app.copyOrigin(of: thread))
             }
         }
     }

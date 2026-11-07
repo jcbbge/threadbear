@@ -200,7 +200,7 @@ private struct SetupRow: View {
         case .firstThread:
             if !noLogin {
                 Button("New thread") { app.newThread() }
-                    .tip("A new thread, in your threads folder unless you pick another (⌘N)")
+                    .tip(AppShortcuts.shared.tip("A new thread, in your threads folder unless you pick another", .newThread))
             }
         case .phone:
             Button("Open Phone & browser") {
@@ -216,7 +216,7 @@ private struct SetupRow: View {
                     opening = false
                 }
             }
-            .disabled(opening)
+            .busy(opening)
             .tip("Opens your Threadbear website in \(DefaultBrowser.current()?.name ?? "your browser"), signed in for 90 days")
         }
     }

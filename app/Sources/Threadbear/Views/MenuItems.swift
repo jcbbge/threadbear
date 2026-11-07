@@ -18,7 +18,17 @@ extension NSMenuItem {
     /// (MenuIconsTests checks).
     func setIcon(_ icon: NSImage?) {
         image = icon
+        // Only the macOS 27 SDK has it, and the README promises Xcode 26
+        // (SDK 26.x, AppKit 2685) builds the app. An Xcode 26 build can still
+        // run on macOS 27, so there it's set by name instead
+        // (NSMenuItemImageVisibilityVisible is 1).
+        #if canImport(AppKit, _version: 2700)
         if #available(macOS 27, *) { preferredImageVisibility = .visible }
+        #else
+        if #available(macOS 27, *), responds(to: NSSelectorFromString("setPreferredImageVisibility:")) {
+            setValue(1, forKey: "preferredImageVisibility")
+        }
+        #endif
     }
 }
 

@@ -153,6 +153,12 @@ test('the runner keeps a thread\'s highlights from its events, pins from the too
   const pin = tools.find((t) => t.name === 'pin')!;
   const res = await pin.handler({ path: 'mock.html', note: 'Pick a layout', show: true } as never, {} as never);
   assert.equal(res.isError, undefined, JSON.stringify(res));
+  assert.doesNotMatch(JSON.stringify(res), /has scripts/, 'a page without scripts gets no warning');
+  // One that draws itself is blank in the Mac app's static preview: say so.
+  fs.writeFileSync(path.join(dir, 'chart.html'), '<div id=c></div><SCRIPT>draw()</SCRIPT>');
+  const scripted = await pin.handler({ path: 'chart.html' } as never, {} as never);
+  assert.match(JSON.stringify(scripted), /has scripts.*Run them/);
+  h.runner.unpin(thread.id, `file:${path.join(dir, 'chart.html')}`);
   const bad = await pin.handler({ path: 'nope.html' } as never, {} as never);
   assert.equal(bad.isError, true);
   const after = h.runner.get(thread.id);
@@ -187,6 +193,20 @@ test('a quiet commit shown with git log --oneline, and a quiet push', () => {
     ev({ type: 'tool.result', itemId: 'l', ok: true, text: 'aaaaaaa Not a commit this thread made\n', truncated: false, images: [] }),
   ], ctx);
   assert.deepEqual(view(state).highlights.map((h) => [h.id, h.title, h.branch, h.pushed]), [['commit:456680b', 'Find one episode', 'single-episode', true]]);
+});
+
+test('pageHasScripts: handlers and javascript: links count, and a FIFO never blocks', async () => {
+  const { pageHasScripts } = await import('../../src/runner/highlights.ts');
+  const dir = tmpDir();
+  const page = (name: string, html: string) => (fs.writeFileSync(path.join(dir, name), html), path.join(dir, name));
+  assert.equal(pageHasScripts(page('a.html', '<body onload="draw()">')), true);
+  assert.equal(pageHasScripts(page('a2.html', '<body\n  onload = "draw()">')), true);
+  assert.equal(pageHasScripts(page('b.htm', '<a href="javascript:go()">go</a>')), true);
+  assert.equal(pageHasScripts(page('c.html', '<p>Just words, once = twice</p>')), false);
+  assert.equal(pageHasScripts(page('d.md', '<script>x</script>')), false, 'only pages');
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('mkfifo', [path.join(dir, 'pipe.html')]);
+  assert.equal(pageHasScripts(path.join(dir, 'pipe.html')), false);
 });
 
 test('git commands count only when they run, not when they are words in a message', async () => {

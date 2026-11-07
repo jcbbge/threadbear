@@ -11,6 +11,7 @@ import http2 from 'node:http2';
 import { v } from 'convex/values';
 import { internal } from './_generated/api';
 import { internalAction, type ActionCtx } from './_generated/server';
+import { failureText } from './pushHealth';
 import { pushText } from './pushText';
 import { API_VERSION } from './version';
 
@@ -31,7 +32,7 @@ export function seal(pushKey: string, text: string): string {
   return Buffer.concat([nonce, ct, cipher.getAuthTag()]).toString('base64');
 }
 
-async function relayInstall(ctx: ActionCtx, url: string): Promise<{ installId: string; installKey: string } | null> {
+async function relayInstall(ctx: ActionCtx, url: string): Promise<{ installId: string; installKey: string } | { failure: string }> {
   const known = await ctx.runQuery(internal.devices.relayInstall, { url });
   if (known) return known;
   // The relay checks a registration really comes from the deployment it
@@ -41,10 +42,12 @@ async function relayInstall(ctx: ActionCtx, url: string): Promise<{ installId: s
   const deployment = process.env.CONVEX_SITE_URL;
   const nonce = randomBytes(24).toString('hex');
   if (deployment) await ctx.runMutation(internal.devices.startRelayCheck, { nonce });
-  const res = await fetch(`${url}/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version: `api-${API_VERSION}`, ...(deployment ? { deployment, nonce } : {}) }) });
-  if (!res.ok) {
-    console.warn(`[relay] couldn't register: HTTP ${res.status}`);
-    return null;
+  const res = await fetch(`${url}/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version: `api-${API_VERSION}`, ...(deployment ? { deployment, nonce } : {}) }) }).catch((e: Error) => e);
+  if (res instanceof Error || !res.ok) {
+    const status = res instanceof Error ? 0 : res.status;
+    const reason = res instanceof Error ? res.message : ((await res.json().catch(() => ({}))) as { error?: string }).error;
+    console.warn(`[relay] couldn't register: ${failureText(status, reason)}`);
+    return { failure: `${failureText(status)} couldn't register with the relay` };
   }
   const install = (await res.json()) as { installId: string; installKey: string };
   await ctx.runMutation(internal.devices.saveRelayInstall, { ...install, url });
@@ -58,16 +61,18 @@ async function sendViaRelay(ctx: ActionCtx, alert: { title: string; body: string
   if (process.env.PUSH_RELAY === 'off') return { sent: 0, failed: 0, skipped: 'relayOff' };
   const url = process.env.PUSH_RELAY_URL || RELAY_URL;
   const install = await relayInstall(ctx, url);
-  if (!install) return { sent: 0, failed: targets.length };
+  if ('failure' in install) return { sent: 0, failed: targets.length, broken: targets.length, failure: install.failure };
   let sent = 0;
   let failed = 0;
+  let broken = 0;
+  let failure: string | undefined;
   for (const t of targets) {
     const res = await fetch(`${url}/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${install.installId}.${install.installKey}`, 'X-Threadbear-Version': `api-${API_VERSION}` },
       body: JSON.stringify({ deviceToken: t.apnsToken, environment: t.environment, threadId: alert.threadId, ...(t.pushKey ? { encrypted: seal(t.pushKey, JSON.stringify({ title: alert.title, body: alert.body })) } : {}) }),
     }).catch((e: Error) => ({ ok: false, status: 0, json: async () => ({ reason: e.message }) }) as unknown as Response);
-    const r = (await res.json().catch(() => ({}))) as { ok?: boolean; gone?: boolean; reason?: string };
+    const r = (await res.json().catch(() => ({}))) as { ok?: boolean; gone?: boolean; reason?: string; status?: number; error?: string };
     if (res.status === 401) {
       // The relay forgot this install: register again next time.
       await ctx.runMutation(internal.devices.clearRelayInstall, {});
@@ -75,11 +80,18 @@ async function sendViaRelay(ctx: ActionCtx, alert: { title: string; body: string
     if (r.ok) sent++;
     else {
       failed++;
-      console.warn(`[relay] ${res.status} ${r.reason ?? ''} for …${t.apnsToken.slice(-6)}`);
+      // Apple's status when the relay got that far (r.status), else the
+      // relay's own HTTP status and error.
+      const said = failureText(typeof r.status === 'number' ? r.status : res.status, r.reason ?? r.error);
+      console.warn(`[relay] ${said} for …${t.apnsToken.slice(-6)}`);
       if (r.gone) await ctx.runMutation(internal.devices.drop, { apnsToken: t.apnsToken });
+      else {
+        broken++;
+        failure ??= said;
+      }
     }
   }
-  return { sent, failed };
+  return { sent, failed, broken, ...(failure ? { failure } : {}) };
 }
 
 type ApnsConfig = { key: string; keyId: string; teamId: string; topic: string };
@@ -149,11 +161,31 @@ function sendOne(session: http2.ClientHttp2Session, cfg: ApnsConfig, jwt: string
   });
 }
 
-type SendSummary = { sent: number; failed: number; skipped?: string };
+// For pushOutcome (pushHealth.ts), never returned by the actions: broken,
+// the failures that weren't a phone Apple says is gone (that phone is
+// dropped, and isn't the backend's problem), and the first one's
+// "<status> <reason>".
+type SendSummary = { sent: number; failed: number; skipped?: string; broken?: number; failure?: string };
 const vSendResult = v.object({ sent: v.number(), failed: v.number(), skipped: v.optional(v.string()) });
 
 // The payload the phone app expects (docs/convex-backend.md, section 6).
 async function sendAlert(ctx: ActionCtx, alert: { title: string; body: string; threadId: string }, which: (notify: 'away' | 'always' | 'off') => boolean = (n) => n !== 'off'): Promise<SendSummary> {
+  const viaRelay = !apnsConfig() || process.env.PUSH_VIA === 'relay';
+  // A throw (a malformed APNS_KEY_P8 makes signing throw) counts as a
+  // failure too, or a broken key would never be reported.
+  let out: SendSummary;
+  try {
+    out = await deliver(ctx, alert, which);
+  } catch (e) {
+    console.error(`[push] send threw: ${(e as Error)?.name ?? 'Error'}`);
+    out = { sent: 0, failed: 1, broken: 1, failure: '0 send threw' };
+  }
+  const { failure, broken, ...r } = out;
+  await ctx.runMutation(internal.devices.pushOutcome, { sent: r.sent, failed: broken ?? 0, via: viaRelay ? 'relay' : 'apple', ...(failure ? { failure } : {}) });
+  return r;
+}
+
+async function deliver(ctx: ActionCtx, alert: { title: string; body: string; threadId: string }, which: (notify: 'away' | 'always' | 'off') => boolean): Promise<SendSummary> {
   const all: Target[] = await ctx.runQuery(internal.devices.targets, {});
   const targets = all.filter((t) => which(t.notify));
   if (!targets.length) return { sent: 0, failed: 0, skipped: 'noDevices' };
@@ -163,6 +195,8 @@ async function sendAlert(ctx: ActionCtx, alert: { title: string; body: string; t
   const jwt = providerToken(cfg);
   let sent = 0;
   let failed = 0;
+  let broken = 0;
+  let failure: string | undefined;
   for (const env of ['sandbox', 'production'] as const) {
     const tokens = targets.filter((t) => t.environment === env).map((t) => t.apnsToken);
     if (!tokens.length) continue;
@@ -178,6 +212,9 @@ async function sendAlert(ctx: ActionCtx, alert: { title: string; body: string; t
           console.warn(`[apns] ${r.status} ${r.reason ?? ''} for …${r.token.slice(-6)}`);
           if (r.status === 410 || r.reason === 'BadDeviceToken' || r.reason === 'Unregistered') {
             await ctx.runMutation(internal.devices.drop, { apnsToken: r.token });
+          } else {
+            broken++;
+            failure ??= failureText(r.status, r.reason);
           }
         }
       }
@@ -185,7 +222,7 @@ async function sendAlert(ctx: ActionCtx, alert: { title: string; body: string; t
       session.close();
     }
   }
-  return { sent, failed };
+  return { sent, failed, broken, ...(failure ? { failure } : {}) };
 }
 
 // Scheduled by sync:upsertThreads when a thread starts needing Mike, and by

@@ -28,9 +28,11 @@ export type SyncCacheFile = {
   heads: Record<string, number>;
   // Thread removals not confirmed yet: nothing else would retry them.
   removed?: string[];
-  projects?: Record<string, [string, string]>;
+  projects?: Record<string, [string, string, string?]>;
   accounts?: Record<string, string>;
-  index?: { at: number; rows: Record<string, string>; removed?: string[] };
+  index?: { at: number; rows: Record<string, string>; removed?: string[]; archived?: boolean };
+  // Full sync: where each thread's tool output had got to (sync.ts catchUpBodies).
+  bodies?: Record<string, number>;
 };
 
 export function digest(s: string): string {

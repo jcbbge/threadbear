@@ -58,7 +58,7 @@ enum DragSpace {
             }
         }
         center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
-            MainActor.assumeIsolated { repair("active") }
+            MainActor.assumeIsolated { _ = repair("active") }
         }
         center.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { soon("displays changed") }
@@ -68,7 +68,7 @@ enum DragSpace {
         }
         // A backstop for right-click menus, which open with no warning. One
         // window server call per window, so cheap.
-        let timer = Timer(timeInterval: 5, repeats: true) { _ in MainActor.assumeIsolated { repair("timer") } }
+        let timer = Timer(timeInterval: 5, repeats: true) { _ in MainActor.assumeIsolated { _ = repair("timer") } }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
         repair("launch")
@@ -80,7 +80,7 @@ enum DragSpace {
     /// it (he did within 3 seconds of a launch, 31 Oct).
     static func soon(_ reason: String) {
         moved?.cancel()
-        let work = DispatchWorkItem { MainActor.assumeIsolated { repair(reason) } }
+        let work = DispatchWorkItem { MainActor.assumeIsolated { _ = repair(reason) } }
         moved = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }

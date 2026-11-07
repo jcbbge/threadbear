@@ -197,4 +197,5 @@ Where things are:
 ## Licence
 
 MIT, see [LICENSE](LICENSE). The fonts and icons under `site/` keep their own
-licences, beside them.
+licences, beside them, as does [Pele](https://pele.run/) (MIT), the diagram
+library bundled in the Mac and iPhone apps (`Rich/pele-LICENSE.txt`).

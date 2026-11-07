@@ -12,6 +12,7 @@
 
 import fs from 'node:fs';
 import type { PersistedEvent } from './protocol.ts';
+import { credentialUrlProblem } from './secure-url.ts';
 
 // How often /health is asked when nobody's looking. A sign-in that lapses
 // shows within this; the panel opening asks straight away.
@@ -127,12 +128,13 @@ export function parseHealth(body: unknown, base: string): Pick<ConnectorsStatus,
   return out;
 }
 
-// The gateway's base URL from its MCP URL (https://host:8443/mcp).
+// The gateway's base URL from its MCP URL (https://host:8443/mcp). Only
+// https, or plain http to this Mac (a test's fake gateway): its MCP calls
+// carry the gateway's token (secure-url.ts).
 export function gatewayBase(url: string): string | undefined {
+  if (credentialUrlProblem(url)) return undefined;
   try {
-    const u = new URL(url);
-    if (u.protocol !== 'https:' && u.protocol !== 'http:') return undefined;
-    return u.origin;
+    return new URL(url.trim()).origin;
   } catch {
     return undefined;
   }
@@ -143,12 +145,19 @@ export function gatewayBase(url: string): string | undefined {
 // in the main Claude login's ~/.claude.json, which install-clients.sh
 // writes. Only that one field is read from it.
 export function findGateway(json: { url?: unknown; enabled?: unknown } | undefined, claudeJsonPath: string): string | undefined {
+  const found = gatewayUrlFrom(json, claudeJsonPath);
+  return found ? gatewayBase(found.url) : undefined;
+}
+
+// The gateway URL as configured, unchecked, and where it came from (for
+// saying why one is refused, config.ts).
+export function gatewayUrlFrom(json: { url?: unknown; enabled?: unknown } | undefined, claudeJsonPath: string): { url: string; from: string } | undefined {
   if (json?.enabled === false) return undefined;
-  if (typeof json?.url === 'string') return json.url.trim() ? gatewayBase(json.url.trim()) : undefined;
+  if (typeof json?.url === 'string') return json.url.trim() ? { url: json.url.trim(), from: 'connectors.url in runner.json' } : undefined;
   try {
     const parsed = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8')) as { mcpServers?: Record<string, { url?: unknown }> };
     const url = parsed?.mcpServers?.connectors?.url;
-    return typeof url === 'string' ? gatewayBase(url) : undefined;
+    return typeof url === 'string' && url.trim() ? { url: url.trim(), from: `the connectors MCP server in ${claudeJsonPath}` } : undefined;
   } catch {
     return undefined;
   }
@@ -160,6 +169,7 @@ type Timer = { cancel(): void };
 
 export type ConnectorsMonitorOptions = {
   url?: string; // the base; none means off
+  offReason?: string; // why it's off when a URL was refused (config.ts connectorsRefused)
   fetch?: typeof fetch;
   now?: () => number;
   setTimeout?: (fn: () => void, ms: number) => Timer;
@@ -181,7 +191,7 @@ export class ConnectorsMonitor {
 
   constructor(opts: ConnectorsMonitorOptions) {
     this.opts = opts;
-    this.current = opts.url ? { state: 'checking', url: opts.url, services: [] } : { state: 'off', services: [] };
+    this.current = opts.url ? { state: 'checking', url: opts.url, services: [] } : { state: 'off', ...(opts.offReason ? { error: opts.offReason } : {}), services: [] };
   }
 
   status(): ConnectorsStatus {
@@ -235,7 +245,9 @@ export class ConnectorsMonitor {
     const doFetch = this.opts.fetch ?? fetch;
     let next: ConnectorsStatus;
     try {
-      const res = await doFetch(`${base}/health`, { signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: 'application/json' } });
+      // No redirects: what /health says becomes sign-in links in front of
+      // Mike, so it has to come from the gateway itself.
+      const res = await doFetch(`${base}/health`, { signal: AbortSignal.timeout(TIMEOUT_MS), headers: { accept: 'application/json' }, redirect: 'error' });
       if (!res.ok) throw new Error(`the gateway answered ${res.status}`);
       let body: unknown;
       try {

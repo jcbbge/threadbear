@@ -15,7 +15,7 @@ public struct WorkedTurn: Hashable, Sendable {
     /// "Worked for 2m 13s", as the Mac says it.
     public var title: String {
         guard let duration, duration >= 1 else { return "Worked" }
-        let s = Int(duration)
+        let s = Int(saturating: duration)
         if s < 60 { return "Worked for \(s)s" }
         if s < 3600 { return s % 60 == 0 ? "Worked for \(s / 60)m" : "Worked for \(s / 60)m \(s % 60)s" }
         return (s % 3600) / 60 == 0 ? "Worked for \(s / 3600)h" : "Worked for \(s / 3600)h \((s % 3600) / 60)m"
@@ -215,8 +215,10 @@ public struct PhoneAsk: Codable, Sendable, Hashable {
     /// line, a full stop if it doesn't end a sentence, then the why with
     /// its own line breaks, so a list in it stays a list.
     public var paragraph: String {
-        let action = self.action.replacingOccurrences(of: #"\s*\n\s*"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Split by hand: `\s*\n\s*` tried every space as a start, quadratic
+        // on a long run of them.
+        let action = self.action.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.joined(separator: " ")
         let why = (self.why ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !why.isEmpty else { return action }
         let ends = action.last(where: { !"\"'”’)]*_`".contains($0) }).map { ".?!…:".contains($0) } ?? false
@@ -231,7 +233,9 @@ public struct PhoneAsk: Codable, Sendable, Hashable {
         return []
     }
 
-    public var suggestedIndex: Int? { suggested.map { Int($0) } }
+    /// The agent's pick, as a Convex number: one that isn't a whole index
+    /// is none (Int(_:) of 1e100 traps).
+    public var suggestedIndex: Int? { suggested.flatMap { $0.wholeCount() } }
 }
 
 public struct PhoneAskLink: Codable, Sendable, Hashable {

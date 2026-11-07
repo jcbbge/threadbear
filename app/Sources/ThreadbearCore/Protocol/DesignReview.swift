@@ -76,11 +76,27 @@ public struct ReviewDraft: Sendable, Hashable, Codable {
 /// One picture of an option: its first, or another screen or state of it.
 public struct ReviewShot: Sendable, Hashable, Codable {
     public var title: String?
+    /// The picture, or a video's or page's still for thumbnails.
     public var image: ImageRef
+    /// A video or an HTML page, shown in place of `image` on the stage.
+    public var media: ImageRef?
 
-    public init(title: String? = nil, image: ImageRef) {
+    public init(title: String? = nil, image: ImageRef, media: ImageRef? = nil) {
         self.title = title
         self.image = image
+        self.media = media
+    }
+
+    /// The video to play, when the shot is one.
+    public var video: URL? {
+        guard let media, media.mediaType.hasPrefix("video/") else { return nil }
+        return URL(fileURLWithPath: media.path)
+    }
+
+    /// The page to show, when the shot is one.
+    public var page: URL? {
+        guard let media, media.mediaType == "text/html" else { return nil }
+        return URL(fileURLWithPath: media.path)
     }
 }
 
@@ -118,7 +134,9 @@ public struct ReviewOption: Sendable, Hashable, Codable, Identifiable {
         reference = (try? c.decodeIfPresent(Bool.self, forKey: .reference)) ?? false
         image = try c.decode(ImageRef.self, forKey: .image)
         shots = c.lossyArray(ReviewShot.self, forKey: .shots)
-        url = (try? c.decodeIfPresent(String.self, forKey: .url)) ?? nil
+        // Only a web page: a runner (maybe another Mac's) sends this, and
+        // Open live hands it to the system. Anything else is no url at all.
+        url = LinkPolicy.web((try? c.decodeIfPresent(String.self, forKey: .url)) ?? nil)?.absoluteString
     }
 
     enum CodingKeys: String, CodingKey { case id, title, note, reference, image, shots, url }
@@ -131,6 +149,8 @@ public struct DesignReview: Sendable, Hashable, Codable, Identifiable {
     public var id: String
     public var title: String
     public var note: String?
+    /// The option id the agent would pick, marked "my pick" as on an asks card.
+    public var recommended: String?
     public var options: [ReviewOption]
     public var status: String
     public var revision: Int
@@ -140,12 +160,13 @@ public struct DesignReview: Sendable, Hashable, Codable, Identifiable {
     public var response: ReviewDraft?
     public var replyTurnId: String?
 
-    public init(id: String, title: String, note: String? = nil, options: [ReviewOption], status: String = "pending",
+    public init(id: String, title: String, note: String? = nil, recommended: String? = nil, options: [ReviewOption], status: String = "pending",
                 revision: Int = 1, createdAt: String = "", updatedAt: String = "", draft: ReviewDraft = ReviewDraft(),
                 response: ReviewDraft? = nil, replyTurnId: String? = nil) {
         self.id = id
         self.title = title
         self.note = note
+        self.recommended = recommended
         self.options = options
         self.status = status
         self.revision = revision
@@ -163,6 +184,7 @@ public struct DesignReview: Sendable, Hashable, Codable, Identifiable {
         id = try c.decode(String.self, forKey: .id)
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? "Design options"
         note = try c.decodeIfPresent(String.self, forKey: .note)
+        recommended = (try? c.decodeIfPresent(String.self, forKey: .recommended)) ?? nil
         options = c.lossyArray(ReviewOption.self, forKey: .options)
         status = try c.decodeIfPresent(String.self, forKey: .status) ?? "unknown"
         revision = c.lenientInt(forKey: .revision) ?? 0
@@ -173,7 +195,7 @@ public struct DesignReview: Sendable, Hashable, Codable, Identifiable {
         replyTurnId = try c.decodeIfPresent(String.self, forKey: .replyTurnId)
     }
 
-    enum CodingKeys: String, CodingKey { case id, title, note, options, status, revision, createdAt, updatedAt, draft, response, replyTurnId }
+    enum CodingKeys: String, CodingKey { case id, title, note, recommended, options, status, revision, createdAt, updatedAt, draft, response, replyTurnId }
 }
 
 /// Creation takes source paths; the runner replaces these with imported

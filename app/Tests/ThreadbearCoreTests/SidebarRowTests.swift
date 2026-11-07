@@ -214,6 +214,16 @@ final class SidebarRowTests: XCTestCase {
         XCTAssertEqual(SidebarOrder.neighbour(of: "gone", in: ids, step: -1), "c")
         XCTAssertNil(SidebarOrder.neighbour(of: "a", in: [], step: 1))
     }
+
+    func testNextInInbox() {
+        let inbox = ["a", "b", "c"]
+        XCTAssertEqual(SidebarOrder.nextInInbox(after: "a", inbox: inbox), "b")
+        XCTAssertNil(SidebarOrder.nextInInbox(after: "c", inbox: inbox), "the last one has nothing after it")
+        XCTAssertEqual(SidebarOrder.nextInInbox(after: "running", inbox: inbox), "a", "from another section, the first")
+        XCTAssertEqual(SidebarOrder.nextInInbox(after: nil, inbox: inbox), "a", "nothing open, the first")
+        XCTAssertNil(SidebarOrder.nextInInbox(after: nil, inbox: []), "an empty inbox")
+        XCTAssertNil(SidebarOrder.nextInInbox(after: "running", inbox: []))
+    }
 }
 
 final class ComposerPlacementTests: XCTestCase {
@@ -245,6 +255,78 @@ final class ComposerPlacementTests: XCTestCase {
 }
 
 final class DockBadgeTests: XCTestCase {
+    /// The badge's count is its own loop now, so it must keep agreeing with
+    /// the sections it stands in for, on every kind of thread.
+    func testCountAgreesWithTheSectionsOnEveryMixOfState() {
+        let now = Date()
+        let later = now.addingTimeInterval(3600)
+        var threads: [ThreadSummary] = []
+        for status in [ThreadStatus.idle, .running, .starting, .waiting, .error, .stopped] {
+            for needsYou in [false, true] {
+                for snoozed in [nil, later, now.addingTimeInterval(-3600)] as [Date?] {
+                    for starred in [nil, now] as [Date?] {
+                        for archived in [nil, now] as [Date?] {
+                            for needs in [nil, "you", "nothing"] as [String?] {
+                                for reviews in [nil, 1] as [Int?] {
+                                    var thread = ThreadSummary(id: "\(threads.count)", title: "t", status: status, needsYou: needsYou, snoozedUntil: snoozed, archivedAt: archived, needs: needs)
+                                    thread.starredAt = starred
+                                    thread.pendingReviews = reviews
+                                    threads.append(thread)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        XCTAssertEqual(ThreadSections.needsYouCount(threads, now: now), ThreadSections.build(threads, now: now).needsYou.count)
+        for thread in threads {
+            XCTAssertEqual(ThreadSections.needsYouCount([thread], now: now), ThreadSections.build([thread], now: now).needsYou.count, "\(thread)")
+        }
+    }
+
+    #if DEBUG
+    /// It runs on every thread update, on the main thread, so no sorting
+    /// every thread for a number (THREADBEAR-1B).
+    func testBadgeDoesNotBuildTheSections() {
+        let threads = [ThreadSummary(id: "a", title: "a", status: .waiting)]
+        let before = ThreadSections.buildCount
+        XCTAssertEqual(DockBadge.label(for: threads, now: Date()), "1")
+        XCTAssertEqual(ThreadSections.buildCount, before)
+    }
+    #endif
+
+    /// The sorts moved to pulled-out keys: the orders mustn't have changed.
+    func testSectionOrdersAreWhatTheyWere() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        func at(_ minutes: Double) -> Date { t0.addingTimeInterval(minutes * 60) }
+        var starA = ThreadSummary(id: "starA", title: "", lastActivityAt: at(9)); starA.starredAt = at(2)
+        var starB = ThreadSummary(id: "starB", title: "", lastActivityAt: at(1)); starB.starredAt = at(1)
+        let threads = [
+            starA, starB,
+            ThreadSummary(id: "read", title: "", status: .idle, lastActivityAt: at(30)),
+            ThreadSummary(id: "unread", title: "", needsYou: true, lastActivityAt: at(5)),
+            ThreadSummary(id: "unreadNewer", title: "", needsYou: true, lastActivityAt: at(6)),
+            ThreadSummary(id: "brokenUnread", title: "", status: .error, needsYou: true, lastActivityAt: at(1)),
+            ThreadSummary(id: "asks", title: "", status: .waiting, lastActivityAt: at(0)),
+            ThreadSummary(id: "tieB", title: "", status: .running, lastActivityAt: at(3)),
+            ThreadSummary(id: "tieA", title: "", status: .running, lastActivityAt: at(3)),
+            ThreadSummary(id: "runNew", title: "", status: .running, lastActivityAt: at(4)),
+            ThreadSummary(id: "snoozeLate", title: "", lastActivityAt: at(1), snoozedUntil: at(200)),
+            ThreadSummary(id: "snoozeSoon", title: "", lastActivityAt: at(1), snoozedUntil: at(100)),
+            ThreadSummary(id: "archOld", title: "", archivedAt: at(1)),
+            ThreadSummary(id: "archNew", title: "", archivedAt: at(2)),
+        ]
+        let needsFirst = ThreadSections.build(threads.shuffled(), now: at(50))
+        XCTAssertEqual(needsFirst.starred.map(\.id), ["starB", "starA"])
+        XCTAssertEqual(needsFirst.inbox.map(\.id), ["asks", "brokenUnread", "unreadNewer", "unread", "read"])
+        XCTAssertEqual(needsFirst.running.map(\.id), ["runNew", "tieA", "tieB"])
+        XCTAssertEqual(needsFirst.hibernating.map(\.id), ["snoozeSoon", "snoozeLate"])
+        XCTAssertEqual(needsFirst.archived.map(\.id), ["archNew", "archOld"])
+        XCTAssertEqual(ThreadSections.build(threads.shuffled(), now: at(50), order: .newest).inbox.map(\.id), ["read", "unreadNewer", "unread", "brokenUnread", "asks"])
+        XCTAssertEqual(ThreadSections.build(threads.shuffled(), now: at(50), order: .oldest).inbox.map(\.id), ["asks", "brokenUnread", "unread", "unreadNewer", "read"])
+    }
+
     func testBadgeCountsThreadsThatNeedYouAndNothingElse() {
         let now = Date()
         let waiting = ThreadSummary(id: "a", title: "a", status: .waiting)

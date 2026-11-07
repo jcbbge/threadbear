@@ -7,6 +7,7 @@ import path from 'node:path';
 import type { ImageRef } from '../protocol.ts';
 import { LIMITS } from '../protocol.ts';
 import { copyImageFileInto, saveBase64Image, saveDataUrl } from '../media.ts';
+import { safeEnd } from '../safe-cut.ts';
 
 export type NormalizerContext = {
   cwd: string;
@@ -78,6 +79,7 @@ export function truncateResultText(text: string, itemId: string, ctx: Normalizer
   // Back up over UTF-8 continuation bytes so the cut never splits a character.
   let end = LIMITS.toolResultText;
   while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
-  const cut = buf.subarray(0, end).toString('utf8');
+  const bytesCut = buf.subarray(0, end).toString('utf8');
+  const cut = bytesCut.slice(0, safeEnd(text, bytesCut.length));
   return blobPath ? { text: cut, truncated: true, blobPath } : { text: cut, truncated: true };
 }

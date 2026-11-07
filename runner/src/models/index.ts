@@ -18,6 +18,7 @@ import { pickInPool } from '../pools.ts';
 import { askCli, cliDir } from './claude-pool.ts';
 import type { AskCli, CliResponse } from './claude-pool.ts';
 import { Ledger } from './ledger.ts';
+import { outermostBraces } from '../linear-text.ts';
 import type { UsageLine } from './ledger.ts';
 
 export type ModelJob = 'classify' | 'extract' | 'summarize' | 'generate' | 'decide';
@@ -319,11 +320,12 @@ function skip(reason: ModelFailure, message: string): { ok: false; skipped: Fail
 }
 
 function parseObject(text: string): Record<string, unknown> | undefined {
-  // Models sometimes wrap JSON in a code fence.
-  const m = /\{[\s\S]*\}/.exec(text);
-  if (!m) return undefined;
+  // Models sometimes wrap JSON in a code fence. First "{" to last "}", by
+  // indexOf: `/\{[\s\S]*\}/` was quadratic in a reply of "{"s.
+  const json = outermostBraces(text);
+  if (json === undefined) return undefined;
   try {
-    const v = JSON.parse(m[0]);
+    const v = JSON.parse(json);
     return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
   } catch {
     return undefined;

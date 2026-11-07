@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { CONFINED_NO_SANDBOX, sandboxSpawner, type SandboxConfig } from '../../sandbox.ts';
 import os from 'node:os';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { HookInput, McpServerConfig, ModelInfo, Options, PermissionResult, Query, SDKUserMessage, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
@@ -7,16 +8,19 @@ import { isEffortLevel } from '../../protocol.ts';
 import fs from 'node:fs';
 import type { AgentAdapter, AgentSession, RewindRequest, RewindResult, SessionSink, StartSessionOptions, UserInput } from '../types.ts';
 import { RewindRefusedError } from '../types.ts';
+import type { SlashCommand } from '../../slash-commands.ts';
 import { cutPointBefore, sessionTranscriptPath } from '../../transcripts.ts';
 import type { Logger } from '../../log.ts';
 import { ClaudeNormalizer, fileContext } from './normalize.ts';
 import { groupSpawner, type ProcessRegistry } from '../../proc.ts';
 import { prepareImageForModel } from '../../media.ts';
 import { placePictures } from '../../pictures.ts';
-import { toolTitle, truncateInput } from '../../tools.ts';
+import { EDIT_TOOLS, cardInput, toolTitle, tooLongForCard } from '../../tools.ts';
+import { codeWriteNote, codeWriteReason, runsAsCodeByName, type CodeWrite } from '../../code-writes.ts';
+import path from 'node:path';
 import { RUNNER_VERSION } from '../../config.ts';
 import { stripModelSuffix } from '../../accounts.ts';
-import { END_TURN_FULL_NAME, END_TURN_NUDGE, endTurnMessageStands, ONE_REPLY_END_TURN_NUDGE, ONE_REPLY_WRITE_NUDGE } from '../../needs.ts';
+import { END_TURN_FULL_NAME, END_TURN_NUDGE, endTurnMessageStands, endTurnWantsReply, ONE_REPLY_END_TURN_NUDGE, ONE_REPLY_WRITE_NUDGE, owedReplyAfterCompact, WakeRead } from '../../needs.ts';
 
 // Variables a parent Claude Code session sets for its own children. If the
 // runner was started from inside one (tests, a terminal in T3), they would
@@ -65,8 +69,8 @@ export function terminalMcpTools(base: string | undefined, oneReply = false): st
   return names.join(',');
 }
 
-export function sdkPermissionMode(mode: PermissionMode): 'bypassPermissions' | 'default' | 'auto' {
-  if (mode === 'auto') return 'auto';
+export function sdkPermissionMode(mode: PermissionMode): 'bypassPermissions' | 'default' | 'auto' | 'plan' {
+  if (mode === 'auto' || mode === 'plan') return mode;
   return mode === 'full' ? 'bypassPermissions' : 'default';
 }
 
@@ -111,8 +115,14 @@ export type ClaudeAdapterDeps = {
   mcpServersFor?: (threadId: string) => Record<string, McpServerConfig>;
   // Tools that ask Mike even in a thread with full access.
   alwaysAsk?: Set<string>;
+  // Tools that never ask, whatever the mode (NEVER_ASK_TOOLS).
+  neverAsk?: Set<string>;
   // One reply (needs.ts), read when a session starts, as its end_turn is.
   oneReply?: () => boolean;
+  // The container a thread in this folder runs its CLI in, if any
+  // (sandbox.ts). Only a thread's own session; the model and command
+  // probes run as before.
+  sandboxFor?: (cwd: string) => SandboxConfig | undefined;
 };
 
 export class ClaudeAdapter implements AgentAdapter {
@@ -124,6 +134,9 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   start(opts: StartSessionOptions, sink: SessionSink): AgentSession {
+    // A thread shut in a sandbox never starts outside one, even if its
+    // folder has stopped being in one since (a link put in its place).
+    if (opts.confined && !this.deps.sandboxFor?.(opts.cwd)) throw new Error(CONFINED_NO_SANDBOX(opts.cwd));
     const s = new ClaudeSession(opts, sink, this.deps);
     s.start();
     return s;
@@ -150,6 +163,38 @@ export class ClaudeAdapter implements AgentAdapter {
     try {
       const init = await q.initializationResult();
       return modelChoices(init.models ?? []);
+    } finally {
+      try {
+        q.close();
+      } catch {
+        // already closed
+      }
+      abort.abort();
+    }
+  }
+
+  // The slash commands the CLI offers in a folder (its built-in ones, the
+  // folder's and Mike's commands and skills), for the picker. Like
+  // models(): a CLI with no prompt answers initialize without a turn.
+  // untrusted: as for a session (StartSessionOptions), so listing never
+  // runs what a folder's settings would that Mike hasn't trusted.
+  async commands(account: Account, cwd: string, untrusted?: Record<string, unknown>): Promise<SlashCommand[]> {
+    const { deps } = this;
+    const never = { async *[Symbol.asyncIterator]() { await new Promise<never>(() => {}); } } as AsyncIterable<SDKUserMessage>;
+    const abort = new AbortController();
+    const options: Options = {
+      cwd,
+      pathToClaudeCodeExecutable: deps.claudePath,
+      env: { ...cliEnv(account), ...(untrusted || isHome(cwd) ? { CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1' } : {}) },
+      ...(untrusted ? untrustedSettings(cwd, untrusted) : trustedSettings(cwd)),
+      tools: [],
+      abortController: abort,
+      spawnClaudeCodeProcess: groupSpawner(deps.registry, deps.log, () => {}, `commands:${account.id}`),
+    };
+    const queryFn = deps.queryFn ?? sdkQuery;
+    const q = queryFn({ prompt: never, options });
+    try {
+      return claudeCommands(await q.supportedCommands(), { cwd, configDir: account.configDir });
     } finally {
       try {
         q.close();
@@ -231,6 +276,28 @@ export function untrustedSettings(cwd: string, settings: Record<string, unknown>
   return { settingSources: ['user'], additionalDirectories: [cwd], ...(Object.keys(settings).length ? { settings } : {}) };
 }
 
+// A trusted folder's: all its settings. Except home, whose project
+// settings are Mike's own user ones already, but where the project source
+// would also have Claude pick up the .claude/skills of any folder under
+// home (a cloned repo's, hooks and all) as the agent works on a file
+// there, which folder trust can't look through all of home for
+// (claude-trust.ts). Its CLAUDE.md comes back as an extra directory's,
+// with CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD (set by the caller).
+export function trustedSettings(cwd: string, home: string = os.homedir()): Pick<Options, 'settingSources' | 'additionalDirectories'> {
+  return isHome(cwd, home) ? { settingSources: ['user', 'local'], additionalDirectories: [cwd] } : { settingSources: ['user', 'project', 'local'] };
+}
+
+function isHome(cwd: string, home: string = os.homedir()): boolean {
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  return real(cwd) === real(home);
+}
+
 // The CLI's rows as the protocol's ModelChoice. The "default" row stands
 // for whatever the CLI would pick, which the account's settings can
 // override, so it's left out: the runner works the default out itself.
@@ -253,6 +320,12 @@ export function modelChoices(rows: ModelInfo[]): ModelChoice[] {
   return out;
 }
 
+// What an agent is told when its permission request closes without an
+// answer from anyone. In its result, so it reads it at the call it made.
+export function cardClosedMessage(why: string | undefined): string {
+  return `Threadbear closed this permission request before anyone answered it${why ? ` (${why.replace(/\.$/, '')})` : ''}. The user did not decline it, so don't tell them they did. The tool didn't run.`;
+}
+
 class ClaudeSession implements AgentSession {
   private opts: StartSessionOptions;
   private sink: SessionSink;
@@ -262,6 +335,15 @@ class ClaudeSession implements AgentSession {
   private abort = new AbortController();
   private normalizer: ClaudeNormalizer;
   private mode: PermissionMode;
+  // The permission mode each Edit and Write call went through on, by tool
+  // use id, from its PreToolUse hook (and lowered by its approval card):
+  // 'full' only when the runner and the CLI were both on Full access then.
+  // Sent with the call's 'wrote', so a switch to Full access after an
+  // edit was let through in Ask or Auto doesn't make it trusted.
+  private writeModes = new Map<string, PermissionMode>();
+  // Edit and Write calls outside Full access to a file that runs as code,
+  // which the hook made ask (code-writes.ts).
+  private codeWrites = new Set<string>();
   private exited = false;
   private exitPromise: Promise<void>;
   private resolveExit!: () => void;
@@ -272,6 +354,8 @@ class ClaudeSession implements AgentSession {
   // the turn now ending called it (a taken call, from the PostToolUse hook).
   private hasEndTurn = false;
   private endTurnTaken = false;
+  // askBeforeEveryTool was called.
+  private askEvery = false;
   // One reply: whether this session's end_turn is that kind, and whether
   // the agent has written words since the turn's end_turn.
   private oneReply = false;
@@ -281,6 +365,19 @@ class ClaudeSession implements AgentSession {
   private messageStands = false;
   private pastEndTurn = false;
   private endTurnCall?: string;
+  // Whether the agent has read a background task's notification that came
+  // into the turn: from then its end_turn is behind it, so the Stop hook
+  // asks for another (needs.ts, WakeRead).
+  private wake = new WakeRead();
+  // Each end_turn call's card questions, by item id, until its result.
+  private endTurnAsks = new Map<string, string[]>();
+  // A reply owed after an accepted one-reply end_turn, with its card's
+  // questions, for a compaction to be reminded of (onCompact). Its own
+  // state, not pastEndTurn's: a Stop that sends the turn back for its reply
+  // clears that, and a compaction can still come before the reply. A reply,
+  // a new message from the user (the agent goes on to that) or the turn's
+  // result ends it.
+  private owedReply?: string[];
 
   constructor(opts: StartSessionOptions, sink: SessionSink, deps: ClaudeAdapterDeps) {
     this.opts = opts;
@@ -303,9 +400,9 @@ class ClaudeSession implements AgentSession {
         ...env,
         CLAUDE_CODE_TERMINAL_MCP_TOOLS: terminalMcpTools(env.CLAUDE_CODE_TERMINAL_MCP_TOOLS, this.oneReply),
         ...opts.env,
-        ...(untrusted ? { CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1' } : {}),
+        ...(untrusted || isHome(opts.cwd) ? { CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1' } : {}),
       },
-      ...(untrusted ? untrustedSettings(opts.cwd, untrusted) : { settingSources: ['user', 'project', 'local'] }),
+      ...(untrusted ? untrustedSettings(opts.cwd, untrusted) : trustedSettings(opts.cwd)),
       systemPrompt: { type: 'preset', preset: 'claude_code', ...(opts.instructions ? { append: opts.instructions } : {}) },
       includePartialMessages: true,
       thinking: { type: 'adaptive', display: 'summarized' },
@@ -325,9 +422,23 @@ class ClaudeSession implements AgentSession {
       hooks: {
         Stop: [{ hooks: [(input) => this.onStop(input)] }],
         PostToolUse: [{ matcher: END_TURN_FULL_NAME, hooks: [async (input) => this.onEndTurn(input)] }],
+        // Every Edit and Write, in every mode, a sub-agent's too: where the
+        // mode it ran on is recorded, and where one that writes code is
+        // made to ask outside Full access (onEditCall).
+        PreToolUse: [
+          { matcher: [...EDIT_TOOLS].join('|'), hooks: [async (input) => this.onEditCall(input)] },
+          // A hook's ask comes before allow rules, so it's how a folder's
+          // untrusted ones stop applying once the thread leaves Full
+          // (askBeforeEveryTool). Only on a session that may need it.
+          ...(opts.heldGrants ? [{ hooks: [async () => (this.askEvery ? { hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'ask' as const, permissionDecisionReason: "The folder's permission rules aren't trusted for this thread." } } : {})] }] : []),
+        ],
+        SessionStart: [{ hooks: [async (input) => this.onCompact(input)] }],
       },
       abortController: this.abort,
-      spawnClaudeCodeProcess: groupSpawner(deps.registry, deps.log, (line) => this.stderr(line), opts.threadId),
+      spawnClaudeCodeProcess: ((spawn, sb) => (sb ? sandboxSpawner(spawn, sb, opts.threadId) : opts.confined ? () => { throw new Error(CONFINED_NO_SANDBOX(opts.cwd)); } : spawn))(
+        groupSpawner(deps.registry, deps.log, (line) => this.stderr(line), opts.threadId),
+        deps.sandboxFor?.(opts.cwd),
+      ),
     };
     const servers = deps.mcpServersFor?.(opts.threadId);
     if (servers && Object.keys(servers).length) options.mcpServers = servers;
@@ -335,7 +446,12 @@ class ClaudeSession implements AgentSession {
     if (opts.model) options.model = opts.model;
     const effort = claudeEffort(opts.effort);
     if (effort) options.effort = effort;
-    if (opts.allowRules?.length) options.allowedTools = [...opts.allowRules];
+    // The never-ask tools go in as allow rules too, so the CLI lets them
+    // through before its own checks (Auto's classifier included) rather
+    // than relying on canUseTool being reached. They're not the thread's
+    // rules, so they're never saved with them.
+    const allowed = [...(opts.allowRules ?? []), ...[...(deps.neverAsk ?? [])].filter((n) => !deps.alwaysAsk?.has(n))];
+    if (allowed.length) options.allowedTools = [...new Set(allowed)];
     if (opts.resume) {
       options.resume = opts.sessionId;
       if (opts.resumeAt) options.resumeSessionAt = opts.resumeAt;
@@ -368,6 +484,20 @@ class ClaudeSession implements AgentSession {
     return { decision: 'block', reason: this.oneReply ? ONE_REPLY_END_TURN_NUDGE : END_TURN_NUDGE };
   }
 
+  // A compaction between an accepted end_turn and its reply. On 5 Nov 2026
+  // (thread 1b770c6a) the context filled up just as one-reply end_turn
+  // answered "Now write your reply"; the summary that replaced the
+  // conversation didn't say a reply was owed, so the agent went back to
+  // work and never wrote the launcher plan its card asked about. Nor did
+  // the Stop hook ask, as status lines written while working counted as
+  // words after end_turn. SessionStart runs with source "compact" right
+  // after a compaction, and what it adds is the first thing the agent reads.
+  private onCompact(input: HookInput): { hookSpecificOutput?: { hookEventName: 'SessionStart'; additionalContext: string } } {
+    if ((input as { source?: string }).source !== 'compact') return {};
+    if (!this.oneReply || !this.owedReply) return {};
+    return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: owedReplyAfterCompact(this.owedReply) } };
+  }
+
   private forgetEndTurn(): void {
     this.endTurnTaken = false;
     this.wroteAfterEnd = false;
@@ -380,6 +510,46 @@ class ClaudeSession implements AgentSession {
     // A sub-agent's call never reaches the thread (threadbear-mcp.ts).
     if (!(input as { agent_id?: string }).agent_id) this.endTurnTaken = true;
     return {};
+  }
+
+  // Before the CLI decides on an Edit or Write's permission. A hook's
+  // "ask" goes to canUseTool whatever allow rule ("Always allow", the
+  // user's settings) or auto classifier would have let it through, so an
+  // edit of a file that runs as code gets a card in Ask and Auto.
+  private onEditCall(input: HookInput): { hookSpecificOutput?: { hookEventName: 'PreToolUse'; permissionDecision: 'ask'; permissionDecisionReason: string } } {
+    const call = input as { tool_name?: string; tool_use_id?: string; tool_input?: unknown; permission_mode?: string };
+    if (typeof call.tool_name !== 'string' || !EDIT_TOOLS.has(call.tool_name) || typeof call.tool_use_id !== 'string') return {};
+    const id = call.tool_use_id;
+    // Both sides on Full access: the runner's mode, and the CLI's own for
+    // this call (it says, from this CLI on; one that doesn't is taken as
+    // not, so nothing it writes is trusted unasked).
+    const full = this.mode === 'full' && call.permission_mode === 'bypassPermissions';
+    this.noteWriteMode(id, full ? 'full' : this.mode === 'full' ? 'ask' : this.mode);
+    if (this.mode === 'full') return {};
+    const file = this.editTarget(call.tool_input);
+    const kind = file ? this.runsAsCode(file) : false;
+    if (!kind) return {};
+    this.codeWrites.add(id);
+    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: codeWriteReason(kind) } };
+  }
+
+  // Keeps the strictest mode a call was seen on.
+  private noteWriteMode(id: string, mode: PermissionMode): void {
+    const was = this.writeModes.get(id);
+    this.writeModes.set(id, was && was !== 'full' ? was : mode);
+    // Calls whose result never came (a turn stopped mid-call) aren't kept
+    // for ever.
+    while (this.writeModes.size > 500) this.writeModes.delete(this.writeModes.keys().next().value!);
+    while (this.codeWrites.size > 500) this.codeWrites.delete(this.codeWrites.values().next().value!);
+  }
+
+  private editTarget(input: unknown): string | undefined {
+    const file = (input as { file_path?: unknown } | undefined)?.file_path;
+    return typeof file === 'string' && file ? path.resolve(this.opts.cwd, file) : undefined;
+  }
+
+  private runsAsCode(file: string): CodeWrite {
+    return runsAsCodeByName(file) || (this.opts.runsAsCode?.(file) ?? false);
   }
 
   private stderr(line: string): void {
@@ -398,20 +568,44 @@ class ClaudeSession implements AgentSession {
         // a message sent during a turn lands before the Stop that turn still
         // has coming, and that sent a turn which had called end_turn back
         // to call it (1 Nov 2026, thread cdfccbc3).
-        if ((msg as { type?: string }).type === 'result') this.forgetEndTurn();
-        for (const out of this.normalizer.handle(msg as Record<string, unknown>)) {
+        if ((msg as { type?: string }).type === 'result') {
+          this.forgetEndTurn();
+          this.wake.reset();
+          this.owedReply = undefined;
+          this.endTurnAsks.clear();
+        }
+        for (let out of this.normalizer.handle(msg as Record<string, unknown>)) {
+          // The mode the call went through on, recorded at the call.
+          if (out.kind === 'wrote') {
+            const mode = this.writeModes.get(out.itemId);
+            out = { ...out, ...(mode ? { mode } : {}) };
+          } else if (out.kind === 'event' && out.event.type === 'tool.result') {
+            this.writeModes.delete(out.event.itemId);
+            this.codeWrites.delete(out.event.itemId);
+          }
           this.sink.output(out);
           // Words after end_turn's result, by the events' own order: the
           // hook that sets endTurnTaken can run before the text written
           // ahead of the call comes through.
           if (out.kind === 'event') {
             const ev = out.event;
-            if (ev.type === 'tool.call' && ev.name === END_TURN_FULL_NAME) this.endTurnCall = ev.itemId;
+            if (this.wake.see(ev)) this.forgetEndTurn();
+            if (ev.type === 'tool.call' && ev.name === END_TURN_FULL_NAME) {
+              this.endTurnCall = ev.itemId;
+              const asks = Array.isArray(ev.input.asks) ? (ev.input.asks as { question?: unknown; action?: unknown }[]) : [];
+              this.endTurnAsks.set(ev.itemId, asks.map((a) => String(a?.question ?? a?.action ?? '')).filter(Boolean));
+            }
             else if (ev.type === 'tool.result' && ev.itemId === this.endTurnCall && ev.ok) {
               this.pastEndTurn = true;
               this.messageStands = endTurnMessageStands(ev);
+              // Only an accepted call's own card: a refused repeat's result
+              // isn't ok, and its questions never showed.
+              if (endTurnWantsReply(ev)) this.owedReply = this.endTurnAsks.get(ev.itemId) ?? [];
             }
-            else if (this.pastEndTurn && ev.type === 'assistant.text' && !ev.itemId.includes('/') && ev.text.trim()) this.wroteAfterEnd = true;
+            else if (ev.type === 'assistant.text' && !ev.itemId.includes('/') && ev.text.trim()) {
+              if (this.pastEndTurn) this.wroteAfterEnd = true;
+              this.owedReply = undefined;
+            }
           }
           if (out.kind === 'event' && out.event.type === 'tool.call') this.markToolSeen(out.event.itemId);
         }
@@ -468,21 +662,54 @@ class ClaudeSession implements AgentSession {
       const questions = normaliseQuestions(input.questions);
       const ans = await this.sink.requestQuestion({ toolUseId: itemId, questions, signal: o.signal });
       if (ans.answers) return { behavior: 'allow', updatedInput: { ...input, answers: ans.answers }, toolUseID: o.toolUseID };
+      // Stop stops whoever's asking, as with a tool's card below.
+      if (ans.stopped) return { behavior: 'deny', message: ans.message || 'Interrupted.', interrupt: true, toolUseID: o.toolUseID };
       return { behavior: 'deny', message: ans.message || 'The user dismissed the question without answering.', toolUseID: o.toolUseID };
     }
+    if (this.deps.neverAsk?.has(name) && !this.deps.alwaysAsk?.has(name)) return { behavior: 'allow', updatedInput: input, toolUseID: o.toolUseID };
     if (this.mode === 'full' && !this.deps.alwaysAsk?.has(name)) return { behavior: 'allow', updatedInput: input, toolUseID: o.toolUseID };
+    // "Plan first": the plan goes to Mike as a plan card, and this call
+    // waits on it like any approval. Approving it answers with the mode to
+    // leave plan mode for (setMode below), as the CLI's own prompt does.
+    const plan = name === 'ExitPlanMode' && this.mode === 'plan' && !sub;
+    if (plan) this.sink.output({ kind: 'planProposed', itemId: o.toolUseID, text: typeof input.plan === 'string' ? input.plan : '' });
+    // Approved outside Full access, whatever the hook saw.
+    if (EDIT_TOOLS.has(name)) this.noteWriteMode(o.toolUseID, this.mode);
+    // An edit that writes code Threadbear runs: asked about every time, and
+    // the card says why (code-writes.ts).
+    const target = EDIT_TOOLS.has(name) ? this.editTarget(input) : undefined;
+    const code: CodeWrite = (target !== undefined && this.runsAsCode(target)) || this.codeWrites.has(o.toolUseID);
+    // The card shows the whole command, or every argument of an MCP tool
+    // (what it does elsewhere is in them); one too long for that is refused
+    // rather than allowed from its start (tools.ts, cardInput).
+    // An edit of a file that runs as code shows all it writes, too (Codex review).
+    const card = cardInput(input, name.startsWith('mcp__') || code ? 'all' : ['command']);
+    if (card.tooLong) return { behavior: 'deny', message: tooLongForCard(card.tooLong), toolUseID: o.toolUseID };
     if (!sub) for (const out of this.normalizer.beforeApproval(o.toolUseID, name, input)) this.sink.output(out);
+    const title = toolTitle(name, input, this.opts.cwd);
     const ans = await this.sink.requestApproval({
       toolUseId: itemId,
       name,
-      title: toolTitle(name, input, this.opts.cwd),
-      input: truncateInput(input),
+      title: code ? `${title} (${codeWriteNote(code)})` : title,
+      input: card.input,
       // "Always allow" would defeat a tool that's meant to ask every time.
-      canAlwaysAllow: !o.suppressAlwaysAllowRule && !this.deps.alwaysAsk?.has(name),
+      canAlwaysAllow: !plan && !code && !o.suppressAlwaysAllowRule && !this.deps.alwaysAsk?.has(name),
       signal: o.signal,
     });
-    switch (ans.decision) {
+    // A client that offers it anyway gets this once, never a rule.
+    const decision = code && ans.decision === 'allowAlways' ? 'allow' : ans.decision;
+    switch (decision) {
       case 'allow':
+        if (plan && ans.mode) {
+          this.mode = ans.mode;
+          return {
+            behavior: 'allow',
+            updatedInput: input,
+            updatedPermissions: [{ type: 'setMode', mode: sdkPermissionMode(ans.mode), destination: 'session' }],
+            toolUseID: o.toolUseID,
+            decisionClassification: 'user_temporary',
+          };
+        }
         return { behavior: 'allow', updatedInput: input, toolUseID: o.toolUseID, decisionClassification: 'user_temporary' };
       case 'allowAlways': {
         const { updates, rules } = alwaysAllow(name, o.suggestions);
@@ -496,7 +723,12 @@ class ClaudeSession implements AgentSession {
         };
       }
       case 'expired':
-        return { behavior: 'deny', message: ans.message || 'The request expired.', interrupt: true, toolUseID: o.toolUseID };
+        // `interrupt` makes the CLI say "The user doesn't want to proceed"
+        // and "stopped by user", whatever message goes with it, and kill a
+        // subagent. So it's only for Stop: anything else closing a card isn't
+        // Mike's decision, and agents repeat those words to him as if it were.
+        if (ans.stopped) return { behavior: 'deny', message: ans.message || 'Interrupted.', interrupt: true, toolUseID: o.toolUseID };
+        return { behavior: 'deny', message: cardClosedMessage(ans.message), toolUseID: o.toolUseID };
       default:
         return {
           behavior: 'deny',
@@ -509,6 +741,8 @@ class ClaudeSession implements AgentSession {
 
   send(input: UserInput): void {
     this.normalizer.sent();
+    // A new message takes over from a reply owed to the last one (onCompact).
+    this.owedReply = undefined;
     // Each picture where its [Picture N] marker is in the words, or before
     // them when nothing places it (pictures.ts).
     const content: Record<string, unknown>[] = placePictures(input.text, input.images).map((part) => {
@@ -539,6 +773,11 @@ class ClaudeSession implements AgentSession {
     await (this.q.interrupt as (opts?: { cancelQueued?: boolean }) => Promise<unknown>)({ cancelQueued: true });
   }
 
+  async commands(): Promise<SlashCommand[]> {
+    if (this.exited) return [];
+    return claudeCommands(await this.q.supportedCommands(), { cwd: this.opts.cwd, configDir: this.opts.account.configDir });
+  }
+
   async setModel(model: string | undefined): Promise<void> {
     if (this.exited) return;
     await this.q.setModel(model);
@@ -552,10 +791,21 @@ class ClaudeSession implements AgentSession {
     await this.q.applyFlagSettings({ effortLevel: claudeEffort(effort) ?? null });
   }
 
+  // Leaving Full access counts at once and coming to it only once the CLI
+  // has, so between the two the stricter mode is the one in force here.
+  // Only the newest switch's ending sets it: a switch to Full finishing
+  // after a later one away from it would bring Full back (Codex review).
+  private modeSwitch = 0;
+  askBeforeEveryTool(): void {
+    this.askEvery = true;
+  }
+
   async setPermissionMode(mode: PermissionMode): Promise<void> {
     if (this.exited) return;
+    const n = ++this.modeSwitch;
+    if (mode !== 'full') this.mode = mode;
     await this.q.setPermissionMode(sdkPermissionMode(mode));
-    this.mode = mode;
+    if (n === this.modeSwitch) this.mode = mode;
   }
 
   async end(opts: { hard?: boolean } = {}): Promise<void> {
@@ -581,6 +831,56 @@ class ClaudeSession implements AgentSession {
     }
     this.abort.abort();
   }
+}
+
+// The SDK's list, as the picker's. Claude Code's own are marked builtin;
+// the rest are Mike's or the folder's commands and skills. Rows can share
+// a name, and a builtin one is what /name runs, so that one is kept.
+export function claudeCommands(
+  list: { name: string; description?: string; argumentHint?: string; builtin?: boolean; aliases?: string[] }[],
+  where?: { cwd: string; configDir: string },
+): SlashCommand[] {
+  const byName = new Map<string, SlashCommand>();
+  for (const c of list) {
+    if (typeof c?.name !== 'string' || !c.name) continue;
+    const name = c.name.replace(/^\//, '');
+    if (byName.get(name)?.source === 'cli') continue;
+    const out: SlashCommand = { name, source: c.builtin ? 'cli' : 'skill' };
+    const { text, scope, plugin } = c.builtin ? { text: c.description, scope: 'system', plugin: undefined } : commandScope(c.description);
+    if (text) out.description = text;
+    if (c.argumentHint) out.argumentHint = c.argumentHint;
+    const aliases = (c.aliases ?? []).filter((a) => typeof a === 'string' && a && a !== name);
+    if (aliases.length) out.aliases = aliases;
+    if (scope) out.scope = scope;
+    if (plugin) out.plugin = plugin;
+    const file = where && (scope === 'user' || scope === 'project') ? commandFile(name, scope === 'user' ? where.configDir : path.join(where.cwd, '.claude')) : undefined;
+    if (file) out.path = file;
+    byName.set(name, out);
+  }
+  return [...byName.values()];
+}
+
+// The CLI says where a command came from only as a tag at the end of its
+// description: "(user)", "(project)", "(claude.ai sync)", or a plugin's
+// name. The tag comes off the description, as the palette says it itself.
+export function commandScope(description: string | undefined): { text?: string; scope?: string; plugin?: string } {
+  const m = description ? /^([\s\S]*?)\s*\(([^()]+)\)\s*$/.exec(description) : null;
+  if (!m) return { text: description };
+  const tag = m[2].trim();
+  const text = m[1] || undefined;
+  if (tag === 'user' || tag === 'project') return { text, scope: tag };
+  if (/^claude\.ai/.test(tag)) return { text, scope: 'claude.ai' };
+  // A plugin's commands are tagged with its name, which never has a space;
+  // words in brackets that end a sentence ("(see below)") stay put.
+  if (/^[\w.@-]+(:[\w.@-]+)?$/.test(tag)) return { text, scope: 'plugin', plugin: tag.replace(/^plugin:/, '') };
+  return { text: description };
+}
+
+// A user or project command's file: its skill, else its command (a ":"
+// in the name is a folder, as the CLI reads them).
+export function commandFile(name: string, base: string): string | undefined {
+  const tries = [path.join(base, 'skills', name, 'SKILL.md'), path.join(base, 'commands', ...name.split(':')) + '.md'];
+  return tries.find((f) => fs.existsSync(f));
 }
 
 // "Always allow" keeps the CLI's suggested allow rules for this thread

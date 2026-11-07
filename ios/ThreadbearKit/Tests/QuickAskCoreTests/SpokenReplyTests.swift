@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import QuickAskCore
 
@@ -27,4 +28,16 @@ struct SpokenReplyTests {
     @Test func emptyStaysEmpty() {
         #expect(SpokenReply.text(from: "  \n ") == "")
     }
+
+    @Test func manyOpenBracketsAreQuick() {
+        // Each `[` was tried to the end of the line: 4.5 s for 8,000 of them.
+        // This thread's CPU time: other tests run alongside.
+        func now() -> Double { Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)) / 1e9 }
+        let start = now()
+        _ = SpokenReply.text(from: String(repeating: "[", count: 8_000), limit: 100_000)
+        _ = SpokenReply.text(from: String(repeating: "[a](", count: 2_000), limit: 100_000)
+        #expect(now() - start < 0.1)
+        #expect(SpokenReply.text(from: "See [the docs](https://x.dev/a) and [b] [c](d") == "See the docs and [b] [c](d.")
+    }
 }
+

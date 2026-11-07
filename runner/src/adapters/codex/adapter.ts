@@ -25,10 +25,12 @@ import {
   type AppServerTimings,
   type OversizedLine,
 } from './appserver.ts';
+import { runsAsCodeByName } from '../../code-writes.ts';
 import { CodexApprovals } from './approvals.ts';
 import { CodexTools, dynamicToolSpecs, toolGuidance, type ToolDefinition } from './tools.ts';
 import { CodexNormalizer, limitsFromAccount } from './normalize.ts';
 import { placePictures } from '../../pictures.ts';
+import { parseCommand, type SlashCommand } from '../../slash-commands.ts';
 import type {
   CodexNormalizerLike,
   GetAccountRateLimitsResponse,
@@ -36,6 +38,7 @@ import type {
   ModelListResponse,
   RequestId,
   SandboxPolicy,
+  SkillsListResponse,
   ThreadResumeParams,
   ThreadStartParams,
   ThreadStartResponse,
@@ -81,6 +84,9 @@ export type CodexAdapterDeps = {
   normalizer?: NormalizerFactory;
   // A runner.notice warning (configWarning: a broken config.toml).
   onNotice?: (text: string) => void;
+  // More developer instructions for a new thread with tools, read at its
+  // start (an experiment's line, RICH_BLOCKS_LINE).
+  extraGuidance?: () => string;
   timings?: Partial<CodexTimings>;
   maxLineBytes?: number;
   now?: () => number;
@@ -103,6 +109,8 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   start(opts: StartSessionOptions, sink: SessionSink): AgentSession {
+    // Codex never runs in the sandbox (sandbox.ts), so a thread shut in one can't run here.
+    if (opts.confined) throw new Error("This thread runs in a sandbox, and Codex can't, so it wasn't started. Move it to a Claude login.");
     const s = new CodexSession(opts, sink, this.deps, {
       track: (p, live) => this.track(p, live),
       child: (parent, child) => {
@@ -144,6 +152,16 @@ export class CodexAdapter implements AgentAdapter {
       maxLineBytes: deps.maxLineBytes,
       timings: deps.timings,
     };
+  }
+
+  // The folder's skills, as the picker's commands (Codex's own commands
+  // are slash-commands.ts's list).
+  async commands(account: Account, cwd: string): Promise<SlashCommand[]> {
+    return withShortLivedProcess(
+      { ...this.shortLived(account, `commands:${account.id}`), cwd },
+      async (p) => codexSkillCommands(await p.request<SkillsListResponse>('skills/list', { cwds: [cwd] })),
+      (p, live) => this.track(p, live),
+    );
   }
 
   // model/list without hidden models, in Codex's order. With no thread
@@ -287,6 +305,28 @@ export function threadConfig(threadId: string): Record<string, unknown> {
   };
 }
 
+function enabledSkills(r: SkillsListResponse | undefined) {
+  return (r?.data ?? []).flatMap((e) => e.skills ?? []).filter((s) => s.enabled !== false && typeof s.name === 'string' && s.name && typeof s.path === 'string');
+}
+
+export function skillMap(r: SkillsListResponse | undefined): Map<string, string> {
+  return new Map(enabledSkills(r).map((s) => [s.name!, s.path!]));
+}
+
+export function codexSkillCommands(r: SkillsListResponse | undefined): SlashCommand[] {
+  const seen = new Set<string>();
+  const out: SlashCommand[] = [];
+  for (const s of enabledSkills(r)) {
+    if (seen.has(s.name!)) continue;
+    seen.add(s.name!);
+    const description = s.shortDescription || s.description;
+    // Codex's "repo" is the folder's, as Claude's "project".
+    const scope = s.scope === 'repo' ? 'project' : s.scope;
+    out.push({ name: s.name!, source: 'skill', ...(description ? { description } : {}), ...(scope ? { scope } : {}), path: s.path! });
+  }
+  return out;
+}
+
 function inputItems(input: UserInput): UserInputItem[] {
   // Images as the paths the runner already copied into media/, each where
   // its [Picture N] marker is in the words, or before them when nothing
@@ -378,6 +418,11 @@ export class CodexSession implements AgentSession {
   private mode: PermissionMode;
   private cwd: string;
   private sentCwd: string;
+  // The model Codex said it runs, and whether the thread is in Codex's plan
+  // mode: it keeps a collaboration mode for the turns after, so leaving
+  // "Plan first" has to send default once.
+  private liveModel?: string;
+  private inPlan = false;
 
   constructor(opts: StartSessionOptions, sink: SessionSink, deps: CodexAdapterDeps, hooks: SessionHooks) {
     this.opts = opts;
@@ -430,6 +475,7 @@ export class CodexSession implements AgentSession {
       note: (text) => this.sink.output({ kind: 'event', event: { type: 'system.note', text } }),
       cwd: () => this.cwd,
       itemPaths: (id) => this.itemPaths.get(id),
+      runsAsCode: (file) => runsAsCodeByName(file) || (opts.runsAsCode?.(file) ?? false),
       callTool: (params, o) => this.tools.call(params, o),
       now: this.now,
     });
@@ -485,7 +531,7 @@ export class CodexSession implements AgentSession {
       const tools = dynamicToolSpecs(defs);
       // With tools, the guidance on using them leads the developer
       // instructions (the namespace description is too short to hold it).
-      const developer = [tools.length ? toolGuidance(defs) : '', opts.instructions ?? ''].filter(Boolean).join('\n\n');
+      const developer = [tools.length ? toolGuidance(defs) : '', tools.length ? (this.deps.extraGuidance?.() ?? '') : '', opts.instructions ?? ''].filter(Boolean).join('\n\n');
       const config = { ...common.config, ...(developer ? { developer_instructions: developer } : {}) };
       const params: ThreadStartParams = { ...common, config, ...(tools.length ? { dynamicTools: tools } : {}) };
       res = await this.proc.request<ThreadStartResponse>('thread/start', params);
@@ -496,6 +542,8 @@ export class CodexSession implements AgentSession {
     this.threadId = thread.id;
     this.sentCwd = opts.cwd;
     this.normalizer.setThread?.(thread.id, typeof res.model === 'string' ? res.model : undefined);
+    if (typeof res.model === 'string') this.liveModel = res.model;
+    this.inPlan = res.collaborationMode?.mode === 'plan';
     this.sink.output({ kind: 'session', nativeSessionId: thread.id, ...(typeof res.model === 'string' ? { model: res.model } : {}) });
     if (this.proc.version) this.sink.output({ kind: 'cliVersion', version: this.proc.version });
     if (isEffortLevel(res.reasoningEffort)) this.sink.output({ kind: 'effort', level: res.reasoningEffort });
@@ -693,13 +741,15 @@ export class CodexSession implements AgentSession {
   // (for the approval card's title).
   private trackItem(method: string, p: Record<string, unknown>): void {
     if (method !== 'item/started' && method !== 'item/completed') return;
-    const item = p.item as { type?: string; id?: string; changes?: { path?: unknown }[] } | undefined;
+    const item = p.item as { type?: string; id?: string; changes?: { path?: unknown; kind?: { move_path?: unknown } }[] } | undefined;
     if (!item || typeof item.id !== 'string') return;
     if (item.type === 'commandExecution') {
       if (method === 'item/started') this.turn?.openCommands.add(item.id);
       else this.turn?.openCommands.delete(item.id);
     } else if (item.type === 'fileChange' && method === 'item/started' && Array.isArray(item.changes)) {
-      this.itemPaths.set(item.id, item.changes.map((c) => c?.path).filter((x): x is string => typeof x === 'string'));
+      // A rename's new name too: a file moved to .threadbear/patches is
+      // written there (code-writes.ts).
+      this.itemPaths.set(item.id, item.changes.flatMap((c) => [c?.path, c?.kind?.move_path]).filter((x): x is string => typeof x === 'string' && x !== ''));
       if (this.itemPaths.size > 200) this.itemPaths.delete(this.itemPaths.keys().next().value!);
     }
   }
@@ -801,6 +851,14 @@ export class CodexSession implements AgentSession {
     if (model) params.model = model;
     const effort = this.effort ?? (this.effortChanged ? this.ownEffort(model) : undefined);
     if (effort) params.effort = effort;
+    // "Plan first" is Codex's plan collaboration mode (with the read-only
+    // sandbox turnPolicy gives it); its settings need a model by name.
+    const plan = this.mode === 'plan';
+    const collabModel = model ?? this.liveModel ?? this.opts.account.defaultModel;
+    if ((plan || this.inPlan) && collabModel) {
+      params.collaborationMode = { mode: plan ? 'plan' : 'default', settings: { model: collabModel, reasoning_effort: effort ?? null, developer_instructions: null } };
+      this.inPlan = plan;
+    }
     return params;
   }
 
@@ -819,11 +877,64 @@ export class CodexSession implements AgentSession {
     this.turn = turn;
     this.state = 'turnPending';
     const params = this.turnParams(input);
+    const sentBefore = this.sentCwd;
     if (params.cwd) this.sentCwd = params.cwd;
     this.normalizer.startingTurn?.(input.id);
-    this.turnStart(params)
+    this.commandOrTurn(input, params, sentBefore)
       .then((res) => this.enqueue(() => this.turnStartAnswered(turn, res)))
       .catch((e: unknown) => this.enqueue(() => this.turnStartFailed(turn, e)));
+  }
+
+  // A slash command Codex's terminal app would run, as the app-server call
+  // that does it (docs/protocol.md, "Slash commands"). Each still runs as a
+  // turn: Codex sends turn/started and turn/completed for it. Anything else
+  // is a turn/start, with the skill a /<skill> names added to it.
+  // sentBefore: a folder move this turn would have carried isn't carried
+  // by a compaction or review, so the next turn/start sends it.
+  private async commandOrTurn(input: UserInput, params: TurnStartParams, sentBefore: string): Promise<TurnStartResponse> {
+    const cmd = parseCommand(input.text);
+    if (!cmd || !this.threadId) return this.turnStart(params);
+    const name = cmd.name.toLowerCase();
+    if (name === 'compact' && params.cwd) this.sentCwd = sentBefore;
+    if (name === 'compact') {
+      await this.proc.request('thread/compact/start', { threadId: this.threadId });
+      // No turn in the answer; turn/started brings its id (turnStarted).
+      return {} as TurnStartResponse;
+    }
+    // A review/start runs where Codex last was, so with a move still to
+    // send it's a turn instead, which carries the move, and Codex reviews
+    // as asked in words.
+    if (name === 'review' && !params.cwd) {
+      const target = cmd.args ? { type: 'custom', instructions: cmd.args } : { type: 'uncommittedChanges' };
+      return this.proc.request<TurnStartResponse>('review/start', { threadId: this.threadId, target, delivery: 'inline' });
+    }
+    if (name === 'review') return this.turnStart(params);
+    const skill = (await this.skillPaths()).get(cmd.name);
+    if (skill) params.input = [{ type: 'skill', name: cmd.name, path: skill }, ...params.input];
+    return this.turnStart(params);
+  }
+
+  // The folder's skills by name, asked for once per folder.
+  private skills?: { cwd: string; paths: Promise<Map<string, string>> };
+  private skillPaths(): Promise<Map<string, string>> {
+    if (this.skills?.cwd !== this.cwd) {
+      const paths = this.proc
+        .request<SkillsListResponse>('skills/list', { cwds: [this.cwd] }, 10_000)
+        .then((r) => skillMap(r))
+        .catch(() => {
+          // Asked again next time rather than going without for good.
+          this.skills = undefined;
+          return new Map<string, string>();
+        });
+      this.skills = { cwd: this.cwd, paths };
+    }
+    return this.skills.paths;
+  }
+
+  async commands(): Promise<SlashCommand[]> {
+    if (this.state === 'closing' || this.state === 'closed') return [];
+    const r = await this.proc.request<SkillsListResponse>('skills/list', { cwds: [this.cwd] }, 10_000);
+    return codexSkillCommands(r);
   }
 
   // turn/start, retried on "is closing" (defensive, as for resume).
@@ -851,6 +962,10 @@ export class CodexSession implements AgentSession {
       if (!turn.codexTurnId) turn.codexTurnId = id;
       this.normalizer.turnAccepted?.(id);
     }
+    // A /compact's answer has no turn: it stays pending until turn/started
+    // brings the id (turnStarted), so a Stop or words sent meanwhile wait
+    // for it rather than going nowhere.
+    else if (!turn.codexTurnId) return;
     this.activate(turn);
   }
 
@@ -890,6 +1005,7 @@ export class CodexSession implements AgentSession {
         // Our turn/start hasn't answered yet, but this is its turn.
         turn.codexTurnId = id;
         this.activate(turn);
+
       } else if (!turn) {
         // Codex started a turn by itself (a goal, background work).
         this.turn = this.newTurn({ ids: [], own: true, codexTurnId: id });

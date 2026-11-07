@@ -51,6 +51,7 @@ public enum ThreadRefs {
 
     public static func status(_ thread: ThreadSummary, now: Date) -> String {
         if thread.isArchived { return "Archived" }
+        if thread.snoozedUntilRelease { return "Hibernating until the runner updates" }
         if thread.snoozedUntilRestart { return "Hibernating until the runner restarts" }
         if thread.isSnoozed(at: now), let words = WakeWords.status(thread, now: now) { return words }
         if let until = thread.snoozedUntil, until > now { return "Hibernating until " + RelativeTime.until(until, now: now) }

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeHarness, tmpDir } from '../helpers/fakes.ts';
+import { loadConfig } from '../../src/config.ts';
+import { downgradeFetch } from '../helpers/redirect-trap.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
 import {
   CLAUDE_AI_CONNECTORS_URL,
@@ -91,6 +93,53 @@ test('the gateway is found in runner.json, else the connectors MCP server in ~/.
   assert.equal(gatewayBase('ftp://x'), undefined);
 });
 
+// Daybreak, 7 Nov: the gateway's MCP calls carry its token, and every
+// source of its URL took plain http (src/secure-url.ts).
+const CLEARTEXT = ['http://bruce.tail9ef766.ts.net:8443/mcp', 'HTTP://bruce.example.ts.net:8443/mcp', 'http://127.0.0.1.evil.example/mcp', 'http://localhost.evil.example/mcp', 'http://127.0.0.1@evil.example/mcp', 'http://[::ffff:127.0.0.1]:8443/mcp'];
+
+test('the gateway has to be https, or plain http to this Mac', () => {
+  const dir = tmpDir();
+  const claudeJson = path.join(dir, '.claude.json');
+  assert.equal(gatewayBase('https://bruce.tail9ef766.ts.net:8443/mcp'), 'https://bruce.tail9ef766.ts.net:8443');
+  assert.equal(gatewayBase('http://127.0.0.1:8443/mcp'), 'http://127.0.0.1:8443');
+  assert.equal(gatewayBase('http://localhost:8443/mcp'), 'http://localhost:8443');
+  assert.equal(gatewayBase('http://[::1]:8443/mcp'), 'http://[::1]:8443');
+  for (const bad of CLEARTEXT) {
+    assert.equal(gatewayBase(bad), undefined, bad);
+    assert.equal(findGateway({ url: bad }, claudeJson), undefined, bad);
+    fs.writeFileSync(claudeJson, JSON.stringify({ mcpServers: { connectors: { type: 'http', url: bad } } }));
+    assert.equal(findGateway(undefined, claudeJson), undefined, bad);
+  }
+});
+
+test('a cleartext gateway URL from the env, runner.json or ~/.claude.json leaves the gateway off, and says why', () => {
+  const home = tmpDir();
+  const claudeJson = path.join(home, 'claude.json');
+  const cfgWith = (o: { runner?: unknown; claude?: string; env?: string }) => {
+    fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify(o.runner ? { connectors: o.runner } : {}));
+    fs.writeFileSync(claudeJson, JSON.stringify({ mcpServers: o.claude ? { connectors: { type: 'http', url: o.claude, headersHelper: '/x/h.sh' } } : {} }));
+    const c = loadConfig({ THREADBEAR_HOME: home, THREADBEAR_PORT: '0', THREADBEAR_CLAUDE_MAIN_JSON: claudeJson, ...(o.env !== undefined ? { THREADBEAR_CONNECTORS_URL: o.env } : {}) });
+    return { url: c.connectorsUrl, client: c.connectorsClient, refused: c.connectorsRefused };
+  };
+  // Mike's own, and a test's fake gateway on this Mac.
+  assert.deepEqual(cfgWith({ claude: 'https://bruce.tail9ef766.ts.net:8443/mcp' }), { url: 'https://bruce.tail9ef766.ts.net:8443', client: { mcpUrl: 'https://bruce.tail9ef766.ts.net:8443/mcp', headersHelper: '/x/h.sh' }, refused: undefined });
+  assert.deepEqual(cfgWith({ env: 'http://127.0.0.1:9/mcp' }), { url: 'http://127.0.0.1:9', client: undefined, refused: undefined });
+  assert.deepEqual(cfgWith({ runner: { url: 'http://localhost:9/mcp' } }), { url: 'http://localhost:9', client: undefined, refused: undefined });
+  for (const bad of CLEARTEXT) {
+    const env = cfgWith({ env: bad, claude: 'https://bruce.tail9ef766.ts.net:8443/mcp' });
+    assert.deepEqual([env.url, env.client], [undefined, undefined], bad);
+    assert.match(env.refused ?? '', /^THREADBEAR_CONNECTORS_URL /, bad);
+    // runner.json's wins over ~/.claude.json, and a bad one doesn't fall back on it.
+    const json = cfgWith({ runner: { url: bad }, claude: 'https://bruce.tail9ef766.ts.net:8443/mcp' });
+    assert.deepEqual([json.url, json.client], [undefined, undefined], bad);
+    assert.match(json.refused ?? '', /^connectors\.url in runner\.json /, bad);
+    const claude = cfgWith({ claude: bad });
+    assert.deepEqual([claude.url, claude.client], [undefined, undefined], bad);
+    assert.match(claude.refused ?? '', /connectors MCP server/, bad);
+    assert.ok(claude.refused?.includes(claudeJson), bad);
+  }
+});
+
 // ---------------------------------------------------------------- monitor
 
 function fakeFetch(answers: (() => Response | Promise<Response>)[]) {
@@ -103,6 +152,19 @@ function fakeFetch(answers: (() => Response | Promise<Response>)[]) {
   }) as unknown as typeof fetch;
   return { fn, calls };
 }
+
+test("the monitor says why a refused gateway is off, and doesn't follow /health somewhere else", async () => {
+  const off = new ConnectorsMonitor({ offReason: 'connectors.url in runner.json is plain http to bruce:8443, so its keys would go in the clear' });
+  assert.deepEqual(off.status(), { state: 'off', error: 'connectors.url in runner.json is plain http to bruce:8443, so its keys would go in the clear', services: [] });
+  assert.deepEqual(new ConnectorsMonitor({}).status(), { state: 'off', services: [] });
+  // /health's answer becomes sign-in links in front of Mike, so a redirect
+  // to another host can't be where they come from.
+  const down = downgradeFetch(`${BASE}/health`);
+  const s = await new ConnectorsMonitor({ url: BASE, fetch: down.fetch, setTimeout: () => ({ cancel() {} }) }).refresh();
+  assert.equal(down.inits[0]!.redirect, 'error');
+  assert.deepEqual(down.leaked, []);
+  assert.equal(s.state, 'unreachable');
+});
 
 test('the monitor asks /health, says when what it shows changes, and keeps asking every few minutes', async () => {
   let now = Date.parse('2026-10-29T10:00:00Z');

@@ -217,21 +217,37 @@ function githubCorner() {
  * Anything here that isn't built yet has a NOT BUILT note beside it, like the page.
  */
 const FAQ = [
-  // NOT BUILT: the installer that makes your Convex deployment. The free plan line is a guess
-  // from what the mirror sends (docs/convex-backend.md, "A for now"), not measured for anyone
-  // but Mike.
+  // The free plan numbers are docs/convex-backend.md, "Usage and the free plan": worked out from
+  // what Mike's real deployment used, not measured on anyone else's.
   ["What does it cost?",
-    "Threadbear is free. You need Claude Code or Codex, so a Claude or ChatGPT plan, which you're probably paying for already, and a Convex account for your deployment. Convex has a free plan and Threadbear only puts the small stuff up there, so I'd expect most people to fit in it."],
+    "Threadbear is free. You need Claude Code or Codex, so a Claude or ChatGPT plan, which you're probably paying for already, and a Convex account for your deployment. With one Mac and a few threads a day that should fit on Convex's <a href=\"https://www.convex.dev/pricing\">free plan</a> very comfortably. If you use it as much as I do you'll go over, but on Starter that only comes to about US$1.50 a month."],
   ["Which Macs does it run on?",
-    "Macs with Apple silicon, on macOS 26 or later. There's no Windows or Linux version, but you'll have the source, so I don't think it would be that hard to get an agent to have a go."],
+    "Macs with Apple silicon, on macOS 26 or later."],
+  // A Linux runner still needs a Mac set up first (INSTALL.md, section 6), hence "second". Taylor's
+  // fork isn't Mike's and he hasn't run it, hence "check it over"; he asked for the link on 6 Nov 2026.
+  ["Is there a Windows or Linux version?",
+    "Not of the app, it's Mac only. A Linux server can be a second, always-on machine though (<a href=\"https://github.com/mikecann/threadbear/blob/main/INSTALL.md#6-a-runner-on-linux-optional\">section 6 of INSTALL.md</a> has how), so your threads can run there while you drive them from your Mac, your phone or the website. If you want a proper Windows or Linux version then I thoroughly encourage you to spend some tokens and build it, I'd personally love to see it. Taylor Rupe has already got one going on Windows through WSL in <a href=\"https://github.com/t-rupe/threadbear/blob/main/wsl/README.md\">their own fork</a>, with no Mac needed (you use the website and the iPhone app instead). I haven't tried it myself, so get your agent to check it over first."],
+  // The 5-hour meter and the Agent SDK: docs/guide.md, "Accounts, pools and Usage".
   ["Does it use my subscription or an API key?",
-    "Your subscription. Threadbear runs the official <code>claude</code> and <code>codex</code> command line tools, logged in as you, the same as running them in a terminal. It never reads or copies your login tokens."],
-  // Built: runner/src/sync.ts mirrors exactly this (docs/protocol.md, "Sync"). NOT BUILT: it
-  // being the user's own deployment (today it's Mike's).
-  ["What goes up to Convex?",
-    "Each thread's title and status, its newest 20 messages, anything waiting on you, and your projects and schedules. Full transcripts, tool output and images stay on your Mac. It's your deployment in your own Convex account, so none of it comes to me."],
+    "Your subscription. Threadbear runs the official <code>claude</code> and <code>codex</code> command line tools, logged in as you, and it never reads or copies your login tokens. Claude threads go through Claude Code's Agent SDK though, and Anthropic's 5-hour limit seems to charge that more per token than typing into a terminal (people have measured anywhere from about 1.6 to 2.9x, while weekly limits look about the same). <a href=\"/docs/accounts\">The docs on accounts</a> have more."],
+  // docs/guide.md, "Accounts, pools and Usage".
+  ["Can I use more than one Claude or Codex account?",
+    "Yes, I've got a few myself. <a href=\"/docs/accounts\">Sign each login in to a folder of its own</a> and Threadbear groups them into pools. A new thread starts on the login whose weekly limit resets soonest, so you use up what would otherwise go to waste. When that login gets close to its limit the thread moves to another one with room and carries on from where it was, and if they're all full it waits and carries on by itself once a limit resets."],
+  // The Mac sleeps as its settings say unless the keepAwake experiment is on (runner/src/
+  // keep-awake.ts, off by default). If that goes on for everyone, this answer has to change.
+  // A new thread from the phone waits for the first Mac unless you pick another (docs/guide.md).
+  ["What happens when my Mac's asleep?",
+    "You can still read all your threads on your phone and the website, because they're synced to your Convex deployment. The agents run on your Mac though, so they can't do anything while it's asleep (Threadbear won't keep it awake unless you turn on <a href=\"/docs/experiments\">that experiment</a>), and anything you send from your phone waits for it to wake up. If you want work to keep going, a second Mac or a Linux server can be an always-on machine, and you can pick it when you start a thread from your phone."],
   ["Do I need the iPhone app?",
     "No, the Mac app does everything on its own. The iPhone app and the browser links are for when you're away from your desk."],
+  // runner/src/sync.ts mirrors this; docs/on-your-mac.md has the full list. When full sync goes on
+  // by default (docs/full-convex.md, step 6) tool output goes up too, and this has to change.
+  ["What goes up to Convex?",
+    "The thread list, the text of every message, one line for each thing an agent did, anything waiting on you, your projects and schedules, your logins' emails and usage, and any pictures you paste in. Tool output stays on your Mac. Anything that looks like a secret gets scrubbed out of the text on the way up, but that's not a guarantee, and nothing can scrub a picture. It's your deployment in your own Convex account, so none of it comes to me. The <a href=\"/docs/privacy\">privacy docs</a> have the rest, including the switch that keeps pictures on your Mac."],
+  // Self-hosting is step 8 of docs/setup-and-updates.md and isn't built, so setup can't do it. With
+  // sync off the Mac app still works, since it talks to the runner (docs/protocol.md, "Sync").
+  ["Do I have to use Convex?",
+    "Pretty much, yes (and by the way I work at Convex, so I'm a bit biased). Setup makes a deployment in your own Convex account, and that's how your phone, the website and your other machines see your threads. You can turn the syncing off with <code>\"sync\": { \"enabled\": false }</code> in <code>runner.json</code> and the Mac app carries on by itself, but you'd lose all of that. If you'd rather keep it on your own server, <a href=\"https://docs.convex.dev/self-hosting\">Convex's backend is open source</a> and you can run it yourself, but setup won't do that for you, so that one's up to you and your agent."],
   ["What can a patch do?",
     "Add buttons above the message box that run a command or send a prompt, add panels beside the thread (a web page, or a list Threadbear draws itself), and run a command after each turn, like a typecheck, telling the agent when it fails. A patch is a plain file in your repo, so it gets reviewed and committed like anything else."],
   ["Why would I want my own copy of the code?",

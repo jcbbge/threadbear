@@ -116,20 +116,21 @@ enum WindowDock {
         switch panel {
         case PaneSection.highlightsId: return "Highlights"
         case AgentBrowser.panelId: return "Browser"
+        case BuiltinPanels.files: return "Files"
         case PaneSection.patchesId: return "Patches"
         default:
             // The selected thread's panel by that id, else any thread's, as
             // a panel stays in the layout when Mike moves to a thread
             // without it.
             if let hit = app.paneThread?.panels.first(where: { $0.id == panel }) { return hit.title }
-            return app.threads.values.lazy.flatMap(\.panels).first { $0.id == panel }?.title ?? panel
+            return app.threadOwning(panel: panel)?.panels.first { $0.id == panel }?.title ?? panel
         }
     }
 
     /// A patch panel's picture (its tool's icon), when it has one.
     @MainActor
     static func image(of panel: PanelID, app: AppModel) -> NSImage? {
-        let hit = app.paneThread?.panels.first { $0.id == panel } ?? app.threads.values.lazy.flatMap(\.panels).first { $0.id == panel }
+        let hit = app.paneThread?.panels.first { $0.id == panel } ?? app.threadOwning(panel: panel)?.panels.first { $0.id == panel }
         return PatchImage.image(hit?.iconFile)
     }
 
@@ -138,7 +139,7 @@ enum WindowDock {
     @MainActor
     static func badge(of panel: PanelID, app: AppModel) -> AnyView? {
         let owner = app.selectedThread.flatMap { $0.panels.contains { $0.id == panel } ? $0 : nil }
-            ?? app.threads.values.first { $0.panels.contains { $0.id == panel } }
+            ?? app.threadOwning(panel: panel)
         guard let owner, let hit = owner.panels.first(where: { $0.id == panel }) else { return nil }
         return AnyView(PanelOriginBadge(panel: hit, thread: owner, app: app, side: 10))
     }
@@ -155,10 +156,11 @@ enum WindowDock {
         case runners: return runnersSymbol
         case PaneSection.highlightsId: return "pin"
         case AgentBrowser.panelId: return "globe"
+        case BuiltinPanels.files: return "folder"
         case PaneSection.patchesId: return "square.dashed"
         default:
             if pinnedThread(panel) != nil { return "text.alignleft" }
-            let hit = app.paneThread?.panels.first { $0.id == panel } ?? app.threads.values.lazy.flatMap(\.panels).first { $0.id == panel }
+            let hit = app.paneThread?.panels.first { $0.id == panel } ?? app.threadOwning(panel: panel)?.panels.first { $0.id == panel }
             return hit.map(PanelIcon.symbol(for:))
         }
     }
@@ -250,6 +252,8 @@ struct RootView: View {
         }
         // The tour's frames are in this space, and its overlay covers it.
         .coordinateSpace(.named(Tour.space))
+        // Back and forward's arrow while a trackpad swipe is under way.
+        .overlay { SwipeNavigationArrow() }
         .overlay { TourOverlay().animation(.easeOut(duration: 0.2), value: Tour.shared.step == nil) }
         // Up under where the title bar was: the panels' bars take its place.
         .ignoresSafeArea(.container, edges: .top)
@@ -343,6 +347,7 @@ struct RootView: View {
                 switch WindowDock.section(panel) {
                 case .highlights: return app.openProject == nil
                 case .panel(AgentBrowser.panelId): return true
+                case .panel(BuiltinPanels.files): return app.openProject == nil
                 case .panel(let id): return thread.panels.contains { $0.id == id }
                 case .patches: return !thread.patches.isEmpty
                 default: return true

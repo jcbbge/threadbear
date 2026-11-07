@@ -22,6 +22,7 @@ export type ThreadRow = {
   archivedAt?: string;
   snoozedUntil?: string;
   snoozedUntilRestart?: boolean;
+  wakeNote?: string;
   needs?: 'you' | 'nothing';
   pendingReviews?: number;
   pendingApproval?: unknown;
@@ -43,6 +44,13 @@ function waitingOnMike(r: ThreadRow): boolean {
   if (r.needs !== 'you' || isBusy(r)) return false;
   const asks = r.asks ?? [];
   return asks.length === 0 || asks.some((a) => a.ticked !== true);
+}
+
+// The sub line of a hibernating row that waits for more than a time:
+// "Until "Convex I/O" finishes · misc". Undefined otherwise.
+export function wakeLine(r: ThreadRow, places: string[], now: number): string | undefined {
+  if (!r.wakeNote || !isSnoozed(r, now)) return undefined;
+  return [`Until ${r.wakeNote}`, ...places].join(' · ');
 }
 
 export function isSnoozed(r: ThreadRow, now: number): boolean {

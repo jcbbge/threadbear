@@ -417,11 +417,40 @@ export function scrubDoc<T>(
 // Every string in parsed JSON, whatever its field is called. For a call's answer,
 // which isn't a row: NOT_TEXT's field names mean nothing in it, and could hide a
 // value under `key` or `cwd`.
+//
+// Text scrubbed a string at a time loses what a field's name says about it, so a
+// value under a name that holds a secret goes whatever it looks like: the rules
+// only know `password: "..."` when they can see both.
 export function scrubEveryString(value: unknown, scrub: (text: string) => string): unknown {
   if (typeof value === "string") return scrub(value);
   if (Array.isArray(value)) return value.map((item) => scrubEveryString(item, scrub));
   if (value !== null && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([k, item]) => [scrub(k), scrubEveryString(item, scrub)]));
+    return Object.fromEntries(
+      Object.entries(value).map(([k, item]) => [
+        scrub(k),
+        nameHoldsSecret(k) ? secretField(item, scrub) : scrubEveryString(item, scrub),
+      ]),
+    );
   }
+  return value;
+}
+
+// A value under a name like `password`. Only what plainly points elsewhere stays:
+// $VAR, {{var}}, <placeholder>, a masked value, process.env.X and the like, or a
+// variable's NAME. Numbers go too, as a PIN is one.
+function secretField(value: unknown, scrub: (text: string) => string): unknown {
+  if (typeof value === "number") return REDACTED;
+  if (typeof value === "string") {
+    if (!value) return value;
+    const pointsElsewhere =
+      /^(?:\$|\{\{|\[REDACTED|<[^>]*>$)/.test(value) ||
+      /\*{4,}/.test(value) ||
+      /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(value) ||
+      /^(?:process\.env|import\.meta\.env|env|config|settings|args|opts|options|ctx|this|self)(?:\??\.[A-Za-z_$][\w$]*)+$/.test(value);
+    // Scrubbed even so: a known value can look like one of those.
+    return pointsElsewhere ? scrub(value) : REDACTED;
+  }
+  if (Array.isArray(value)) return value.map((v) => secretField(v, scrub));
+  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [scrub(k), secretField(v, scrub)]));
   return value;
 }

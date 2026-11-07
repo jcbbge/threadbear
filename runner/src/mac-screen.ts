@@ -42,8 +42,10 @@ type Host = {
   // Says it in the given thread, or in a new one if that's gone or put away,
   // in Needs you either way. Returns the thread's id.
   noticeOnMac(threadId: string | undefined, title: string, text: string): string;
-  // Says it's over. With archive, also puts the thread away, unless someone
-  // has written in it, as then it's a conversation and not just a notice.
+  // Says it's over. With archive, nothing else is left to do: it leaves
+  // Needs you and the thread is put away, unless someone has written in it,
+  // as then it's a conversation and not just a notice. Without, it stays in
+  // Needs you.
   noticeOverOnMac(threadId: string, text: string, archive: boolean): void;
 };
 
@@ -136,8 +138,9 @@ export class MacScreen {
         try {
           // Mike keeps his inbox at zero, and nothing's left to do here. The
           // Full Disk Access note shares this thread and is still to do while
-          // the access is missing, so that keeps it.
-          host.noticeOverOnMac(this.state.threadId, goneText(machine), !(this.state.accessTold && this.access === false));
+          // the access isn't known to be there, so that keeps it (a look
+          // that couldn't tell isn't a grant).
+          host.noticeOverOnMac(this.state.threadId, goneText(machine), !(this.state.accessTold && this.access !== true));
         } catch {
           // Deleted since: nobody to tell.
         }

@@ -91,7 +91,7 @@ public struct ThreadRowLook: Sendable, Equatable {
     /// when a turn starts (and when it ends or a message is sent), not on
     /// every event, so for a running thread it's the turn's start.
     public static func workingLabel(since start: Date, now: Date) -> String {
-        let seconds = max(0, Int(now.timeIntervalSince(start)))
+        let seconds = max(0, Int(saturating: now.timeIntervalSince(start)))
         if seconds < 60 { return "\(seconds)s" }
         let minutes = seconds / 60
         if minutes < 60 { return "\(minutes)m" }
@@ -111,11 +111,11 @@ public enum WokeWords {
     /// Rounded, as the runner's note has it (awayFor in wake-when.ts):
     /// "5 minutes", "an hour", "3 hours", "a day", "12 days".
     public static func away(_ seconds: TimeInterval) -> String {
-        let minutes = max(1, Int((seconds / 60).rounded()))
+        let minutes = max(1, Int(saturating: (seconds / 60).rounded()))
         if minutes < 60 { return minutes == 1 ? "a minute" : "\(minutes) minutes" }
-        let hours = Int((seconds / 3600).rounded())
+        let hours = Int(saturating: (seconds / 3600).rounded())
         if hours < 24 { return hours == 1 ? "an hour" : "\(hours) hours" }
-        let days = Int((seconds / 86_400).rounded())
+        let days = Int(saturating: (seconds / 86_400).rounded())
         return days == 1 ? "a day" : "\(days) days"
     }
 }
@@ -337,5 +337,14 @@ public enum SidebarOrder {
             return step >= 0 ? ids.first : ids.last
         }
         return ids[min(max(index + step, 0), ids.count - 1)]
+    }
+
+    /// Next Inbox Thread (⌥⌘↓). From a thread in the Inbox section, the one
+    /// below it; from anywhere else (another section, a project, nothing
+    /// open), the Inbox's first. Nil when there's nothing further: the
+    /// open thread is the Inbox's last, or the Inbox is empty.
+    public static func nextInInbox(after current: String?, inbox: [String]) -> String? {
+        guard let current, let index = inbox.firstIndex(of: current) else { return inbox.first }
+        return index + 1 < inbox.count ? inbox[index + 1] : nil
     }
 }

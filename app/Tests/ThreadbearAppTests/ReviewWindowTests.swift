@@ -187,7 +187,7 @@ final class ReviewWindowTests: XCTestCase {
         defer { window.close() }
         let image = stage(in: host)
         XCTAssertTrue(image.isFittedForTests)
-        XCTAssertEqual(image.pictureSizeForTests.height, 10426, "a point for every two pixels")
+        XCTAssertEqual(image.pictureSizeForTests.height, 20852 / window.backingScaleFactor, "a point per screen pixel (two pixels on Retina)")
         let fit = image.magnification
         XCTAssertLessThan(fit, 0.1, "the whole page fits")
 
@@ -225,7 +225,8 @@ final class ReviewWindowTests: XCTestCase {
     }
 
     func testDraggingMovesAroundAndTheImageFollowsTheHand() {
-        let (session, host, window) = make(tall())
+        // Narrow enough to stay centred on a 1x display as well as Retina.
+        let (session, host, window) = make(tall(width: 300))
         defer { window.close() }
         let image = stage(in: host)
         session.zoom(.actual)
@@ -233,6 +234,7 @@ final class ReviewWindowTests: XCTestCase {
         XCTAssertEqual(image.magnification, 1, accuracy: 0.0001)
         XCTAssertEqual(image.visibleForTests.minY, 0, accuracy: 1, "full size starts at the top of the page")
         XCTAssertLessThan(image.visibleForTests.minX, 0, "narrower than the stage, so it's in the middle")
+        XCTAssertEqual(image.visibleForTests.midX, image.pictureSizeForTests.width / 2, accuracy: 1)
 
         let from = image.convert(NSPoint(x: image.bounds.midX, y: image.bounds.midY), to: nil)
         press(.leftMouseDown, from, window)
@@ -341,8 +343,8 @@ final class ReviewWindowTests: XCTestCase {
 
     /// A page as long as the phone shots that prompted zooming, with today's
     /// version of the same size to flick to, and a shot after it to move to.
-    private func tall() -> DesignReview {
-        func image(_ name: String) -> ImageRef { ImageRef(path: "/tmp/\(name).png", mediaType: "image/png", width: 780, height: 20852) }
+    private func tall(width: Int = 780) -> DesignReview {
+        func image(_ name: String) -> ImageRef { ImageRef(path: "/tmp/\(name).png", mediaType: "image/png", width: width, height: 20852) }
         var page = ReviewOption(id: "A", title: "Option A", image: image("A"))
         page.shots = [ReviewShot(title: "Phone", image: image("A")), ReviewShot(title: "Top", image: image("A2"))]
         return DesignReview(id: "review", title: "Page", options: [
@@ -427,7 +429,13 @@ final class ReviewWindowTests: XCTestCase {
         window.isReleasedWhenClosed = false
         window.contentView = host
         // SwiftUI's Buttons ignore clicks in a window that was never
-        // ordered in, so it's ordered in off screen, out of Mike's way.
+        // ordered in, so it's ordered in, but where nobody sees it. Off
+        // screen alone didn't do it: macOS pulls a titled window back on
+        // screen as it's ordered in, and on 6 Nov this one came up over
+        // Mike's browser during a thread's swift test. So it's also clear
+        // and under every app's windows (tuckBehind's level).
+        window.alphaValue = 0
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.normal.rawValue - 1)
         window.setFrameOrigin(NSPoint(x: -20000, y: -20000))
         window.orderFrontRegardless()
         window.makeKey()

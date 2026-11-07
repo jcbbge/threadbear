@@ -78,6 +78,19 @@ extension AppModel {
         }
     }
 
+    /// The Runners panel's refresh button: its icon spins, and it says if
+    /// the runners couldn't be read.
+    func refreshRunners() {
+        guard let client else { return }
+        whileBusy(BusyKey.refreshRunners) { [self] in
+            do {
+                runners = try await client.listRunners()
+            } catch {
+                show(error)
+            }
+        }
+    }
+
     /// Every runner's latest figures, for the Runners panel's details.
     func loadRunnerStats() {
         guard let client else { return }
@@ -261,10 +274,11 @@ extension AppModel {
     // MARK: Row actions
 
     /// Another runner's schedule comes back queued, with `runRequestedAt`
-    /// set, which its row shows until that runner has run it.
+    /// set, which its row shows until that runner has run it. The row spins
+    /// until the reply.
     func runSchedule(_ id: String) {
         guard let client else { return }
-        Task {
+        whileBusy(BusyKey.runSchedule(id)) { [self] in
             do {
                 replace(try await client.runSchedule(id).schedule)
             } catch {
@@ -273,12 +287,21 @@ extension AppModel {
         }
     }
 
+    /// Shows at once, and goes back if the runner refuses. The control waits
+    /// for one to land before taking another, so two can't overlap: if both
+    /// failed, the second's rollback would leave the first's guess showing.
     func setSchedulePaused(_ id: String, _ paused: Bool) {
-        guard let client else { return }
-        Task {
+        let key = BusyKey.pauseSchedule(id)
+        guard let client, !isBusy(key) else { return }
+        let before = schedule(id)
+        var guess = before
+        guess?.paused = paused
+        if let guess { replace(guess) }
+        whileBusy(key) { [self] in
             do {
                 replace(try await client.updateSchedule(id, ScheduleUpdate(paused: paused)))
             } catch {
+                if let before, schedule(id) == guess { replace(before) }
                 show(error)
             }
         }
@@ -294,12 +317,23 @@ extension AppModel {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         if scheduleEditor?.scheduleId == id { scheduleEditor = nil }
+        confirmedDeleteSchedule(id, client: client)
+    }
+
+    /// Gone at once, and back where it was if the runner refuses.
+    func confirmedDeleteSchedule(_ id: String, client: RPCClient) {
+        guard let schedule = schedule(id) else { return }
+        let index = schedules.firstIndex { $0.id == id } ?? 0
+        schedules.removeAll { $0.id == id }
         Task {
             do {
                 try await client.deleteSchedule(id)
                 schedules.removeAll { $0.id == id }
             } catch {
+                if self.schedule(id) == nil { schedules.insert(schedule, at: min(index, schedules.count)) }
                 show(error)
+                // It may have gone through and only the reply been lost.
+                loadSchedules()
             }
         }
     }

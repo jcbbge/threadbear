@@ -130,7 +130,9 @@ public enum ToolPresentation {
             }
         case .read:
             if let path = input["file_path"]?.stringValue ?? input["path"]?.stringValue, tool.result.map({ $0.ok }) ?? true {
-                let offset = input["offset"]?.doubleValue.map { max(1, Int($0)) } ?? 1
+                // The model writes the offset: Int(_:) of 1e300 would stop the app,
+                // and the line numbers are added to it.
+                let offset = input["offset"]?.doubleValue.flatMap { Int(checked: $0) }.map { min(max(1, $0), 1_000_000_000) } ?? 1
                 return .file(path: shortTitle(path, limit: 400), lines: numberedLines(output, from: offset))
             }
         case .search:
@@ -145,8 +147,9 @@ public enum ToolPresentation {
     }
 
     /// The input as `key: value` lines: strings as they are, other values as
-    /// compact JSON, long values cut to a few lines.
-    public static func fields(_ input: JSONValue) -> [Field] {
+    /// compact JSON, long values cut to a few lines unless `whole` (an
+    /// approval card, which shows all of what Allow allows).
+    public static func fields(_ input: JSONValue, whole: Bool = false) -> [Field] {
         guard let object = input.objectValue else {
             let text = input.compactText
             return text.isEmpty || text == "null" ? [] : [Field(key: "input", value: text)]
@@ -159,6 +162,7 @@ public enum ToolPresentation {
             case .null: return nil
             default: text = value.compactText
             }
+            guard !whole else { return Field(key: key, value: text) }
             let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
             if lines.count > 6 { text = lines.prefix(6).joined(separator: "\n") + "\n…" }
             if text.count > 600 { text = String(text.prefix(599)) + "…" }

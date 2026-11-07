@@ -10,7 +10,7 @@ struct LibrarianHome: View {
     @Environment(AppModel.self) private var app
 
     var body: some View {
-        HomePage(picture: Art.librarian, pictureLabel: "The librarian bear, filing a card in a card catalogue",
+        HomePage(picture: Art.librarian, pictureLabel: "The librarian bear, filing a card in a card catalogue", pokes: PokeLines.librarian,
                  stats: app.librarian.map { LibrarianStats.tiles($0, projects: app.projects, threads: Array(app.threads.values)) } ?? []) {
             LibrarianAbout(status: app.librarian)
         } below: {
@@ -60,6 +60,7 @@ private struct LibrarianSettings: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                         .controlSize(.small)
+                        .disabled(app.isBusy(BusyKey.pauseLibrarian))
                         .tip(status.paused ? "Paused: what's queued waits. Turn it on to carry on" : "Turn it off to pause; what's queued waits")
                 }
                 if let settings = app.runnerSettings, settings.models.poolSupported {

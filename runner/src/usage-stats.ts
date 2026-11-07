@@ -3,7 +3,7 @@
 import type { Clock } from './clock.ts';
 import { ErrorCode, RpcError } from './protocol.ts';
 import type { HourRow, TokenTally } from './token-tally.ts';
-import type { HistoryKind, Sample, UsageHistory } from './usage-history.ts';
+import type { HistoryRow, UsageHistory } from './usage-history.ts';
 
 export const DEFAULT_DAYS = 8;
 export const MAX_DAYS = 14;
@@ -12,7 +12,7 @@ export type UsageStats = {
   generatedAt: string;
   ready: boolean;
   tokens: { accountId: string; hours: HourRow[] }[];
-  limits: { accountId: string; kind: HistoryKind; samples: Sample[] }[];
+  limits: HistoryRow[];
 };
 
 export function usageStats(tally: TokenTally, history: UsageHistory, now: number, days = DEFAULT_DAYS): UsageStats {
